@@ -12,6 +12,8 @@ add_library(ClassicNotepadCore STATIC
     src/encoding.h
     src/line_endings.cpp
     src/line_endings.h
+    src/spell_text_utils.cpp
+    src/spell_text_utils.h
 )
 
 target_compile_features(ClassicNotepadCore PUBLIC cxx_std_17)
@@ -39,6 +41,8 @@ add_executable(ClassicNotepad WIN32
     src/app.cpp
     src/app.h
     src/main.cpp
+    src/spell_check.cpp
+    src/spell_check.h
     src/resource.h
     src/resources.rc
 )
@@ -50,6 +54,7 @@ target_link_libraries(ClassicNotepad PRIVATE
     shell32
     user32
     gdi32
+    ole32
 )
 
 if(MSVC)
