@@ -626,7 +626,8 @@ void ClassicNotepadApp::DrawSpellingUnderlines(HWND editorWindow)
     GetTextMetricsW(deviceContext, &textMetrics);
     const int lineHeight = std::max(1, static_cast<int>(textMetrics.tmHeight + textMetrics.tmExternalLeading));
     const int firstVisibleLine = static_cast<int>(SendMessageW(editorWindow, EM_GETFIRSTVISIBLELINE, 0, 0));
-    const int visibleLineCount = std::max(1, (clientRect.bottom - clientRect.top + lineHeight - 1) / lineHeight + 1);
+    const int clientHeight = static_cast<int>(clientRect.bottom - clientRect.top);
+    const int visibleLineCount = std::max(1, (clientHeight + lineHeight - 1) / lineHeight + 1);
     const int lastVisibleLine = firstVisibleLine + visibleLineCount;
 
     for (const SpellingErrorRange& error : spellingErrors_) {
@@ -663,7 +664,8 @@ void ClassicNotepadApp::DrawSpellingUnderlines(HWND editorWindow)
                 continue;
             }
 
-            const int y = startPoint.y + std::max(1, textMetrics.tmAscent + 1);
+            const int baselineOffset = std::max(1, static_cast<int>(textMetrics.tmAscent + 1));
+            const int y = startPoint.y + baselineOffset;
             int x = startPoint.x;
             const int endX = std::max(startPoint.x + 1, endPoint.x);
             bool up = true;
@@ -839,7 +841,7 @@ void ClassicNotepadApp::ShowAboutDialog()
     constexpr wchar_t message[] =
         L"Classic Notepad\n\n"
         L"Phase 6 native Win32 build.\n"
-        L"Single editor window, classic menu bar, file open/save, classic edit commands, word wrap, font selection, status bar, page setup, print, and no modern extras.";
+        L"Single editor window, classic menu bar, file open/save, classic edit commands, word wrap, font selection, status bar, page setup, print, and no modern extras apart from spell checking.";
 
     MessageBoxW(mainWindow_, message, L"About Classic Notepad", MB_OK | MB_ICONINFORMATION);
 }
