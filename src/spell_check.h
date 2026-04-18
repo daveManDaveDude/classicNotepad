@@ -22,6 +22,7 @@ public:
     std::vector<std::wstring> Suggest(const std::wstring& word, std::size_t limit) const;
     void Ignore(const std::wstring& word);
     void Add(const std::wstring& word);
+    void Reset();
 
 private:
     std::wstring languageTag_;

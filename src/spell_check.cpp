@@ -23,6 +23,13 @@ std::wstring CopyCoTaskMemString(wchar_t* value)
 
 SpellCheckService::~SpellCheckService()
 {
+    Reset();
+}
+
+void SpellCheckService::Reset()
+{
+    available_ = false;
+
     if (checker_ != nullptr) {
         checker_->Release();
         checker_ = nullptr;
@@ -36,18 +43,8 @@ SpellCheckService::~SpellCheckService()
 
 bool SpellCheckService::Initialize(const wchar_t* languageTag)
 {
-    available_ = false;
+    Reset();
     languageTag_ = languageTag == nullptr ? L"" : languageTag;
-
-    if (checker_ != nullptr) {
-        checker_->Release();
-        checker_ = nullptr;
-    }
-
-    if (factory_ != nullptr) {
-        factory_->Release();
-        factory_ = nullptr;
-    }
 
     HRESULT hr = CoCreateInstance(
         __uuidof(SpellCheckerFactory),

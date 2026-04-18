@@ -285,6 +285,8 @@ ClassicNotepadApp::~ClassicNotepadApp()
     DestroyOwnedEditorFont();
     DestroyPrintDialogHandles();
 
+    spellChecker_.Reset();
+
     if (comInitialized_) {
         CoUninitialize();
         comInitialized_ = false;
