@@ -615,6 +615,13 @@ void ClassicNotepadApp::HandlePageSetup()
     pageSetup.rtMargin = pageMarginsThousandths_;
 
     if (PageSetupDlgW(&pageSetup)) {
+        if (pageSetupDevMode_ != nullptr && pageSetupDevMode_ != pageSetup.hDevMode) {
+            GlobalFree(pageSetupDevMode_);
+        }
+        if (pageSetupDevNames_ != nullptr && pageSetupDevNames_ != pageSetup.hDevNames) {
+            GlobalFree(pageSetupDevNames_);
+        }
+
         pageSetupDevMode_ = pageSetup.hDevMode;
         pageSetupDevNames_ = pageSetup.hDevNames;
         pageMarginsThousandths_ = pageSetup.rtMargin;
@@ -662,6 +669,13 @@ void ClassicNotepadApp::HandlePrint()
 
         SetFocus(editor_);
         return;
+    }
+
+    if (pageSetupDevMode_ != nullptr && pageSetupDevMode_ != printDialog.hDevMode) {
+        GlobalFree(pageSetupDevMode_);
+    }
+    if (pageSetupDevNames_ != nullptr && pageSetupDevNames_ != printDialog.hDevNames) {
+        GlobalFree(pageSetupDevNames_);
     }
 
     pageSetupDevMode_ = printDialog.hDevMode;
@@ -1228,7 +1242,7 @@ bool ClassicNotepadApp::PrintEditorText(HDC printerDc, std::wstring& errorMessag
     }
 
     HGDIOBJ previousFont = SelectObject(printerDc, printFont);
-    if (previousFont == nullptr) {
+    if (previousFont == nullptr || previousFont == HGDI_ERROR) {
         DeleteObject(printFont);
         errorMessage = L"Printing failed.\n\nThe printer could not select the editor font.";
         return false;
