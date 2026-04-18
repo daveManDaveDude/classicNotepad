@@ -1,12 +1,14 @@
 #pragma once
 
 #include "document.h"
+#include "spell_check.h"
 
 #include <windows.h>
 #include <commdlg.h>
 
 #include <array>
 #include <string>
+#include <vector>
 
 class ClassicNotepadApp {
 public:
@@ -24,6 +26,12 @@ private:
     void UpdateTitle();
     void UpdateMenuState(HMENU menu);
     void UpdateStatusBar();
+    void RefreshSpellCheck(bool immediate);
+    void ScheduleSpellCheck();
+    void RunSpellCheckNow();
+    void DrawSpellingUnderlines(HWND editorWindow);
+    bool HandleEditorContextMenu(HWND editorWindow, LPARAM lParam);
+    void ShowSpellingUnavailableMessage();
     void ShowAboutDialog();
 
     void HandleEditorChanged();
@@ -102,4 +110,13 @@ private:
     bool wordWrap_ = false;
     bool statusBarVisible_ = true;
     bool suppressEditorChange_ = false;
+    bool comInitialized_ = false;
+    SpellCheckService spellChecker_;
+    std::vector<SpellingErrorRange> spellingErrors_;
+    bool spellCheckAvailable_ = false;
+    bool spellCheckMessageShown_ = false;
+    UINT_PTR spellCheckTimerId_ = 0;
+    std::wstring contextMenuWord_;
+    DWORD contextMenuWordStart_ = 0;
+    DWORD contextMenuWordLength_ = 0;
 };
