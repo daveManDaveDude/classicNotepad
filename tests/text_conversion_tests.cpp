@@ -1,6 +1,7 @@
 #include "document.h"
 #include "encoding.h"
 #include "line_endings.h"
+#include "spell_text_utils.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -212,6 +213,32 @@ void TestDocumentRoundTrips()
     std::filesystem::remove_all(testRoot);
 }
 
+void TestSpellWordExpansion()
+{
+    using classic_notepad::ExpandWordRangeAt;
+    using classic_notepad::TextRange;
+
+    const std::wstring text = L"can't re-enter foo_bar end-";
+    TextRange range{};
+
+    Expect(ExpandWordRangeAt(text, 1, range), "Word expansion works in plain word");
+    Expect(range.start == 0U && range.length == 5U, "Word expansion includes apostrophe inside a word");
+
+    Expect(ExpandWordRangeAt(text, 8, range), "Word expansion works for hyphenated words");
+    Expect(range.start == 6U && range.length == 8U, "Word expansion includes internal hyphen");
+
+    Expect(!ExpandWordRangeAt(text, text.size() - 1U, range), "Trailing hyphen is not treated as a word");
+}
+
+void TestSpellRangeOverlap()
+{
+    using classic_notepad::RangesOverlap;
+
+    Expect(RangesOverlap(10U, 5U, 12U, 4U), "Overlapping ranges are detected");
+    Expect(!RangesOverlap(10U, 2U, 12U, 4U), "Adjacent ranges are not overlapping");
+    Expect(!RangesOverlap(0U, 0U, 5U, 3U), "Empty range does not overlap");
+}
+
 } // namespace
 
 int main()
@@ -221,6 +248,8 @@ int main()
     TestLineEndingAnalysis();
     TestLineEndingConversion();
     TestDocumentRoundTrips();
+    TestSpellWordExpansion();
+    TestSpellRangeOverlap();
 
     if (g_failureCount != 0) {
         std::cerr << g_failureCount << " test failure(s).\n";

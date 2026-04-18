@@ -1,10 +1,12 @@
 #include "app.h"
 
 #include "resource.h"
+#include "spell_text_utils.h"
 
 #include <cderr.h>
 #include <commdlg.h>
 #include <commctrl.h>
+#include <objbase.h>
 
 #include <algorithm>
 #include <array>
@@ -22,6 +24,13 @@ constexpr wchar_t kFileDialogFilter[] = L"Text Documents (*.txt)\0*.txt\0All Fil
 constexpr wchar_t kFindReplaceMessageName[] = L"commdlg_FindReplace";
 constexpr DWORD kFindOptionFlags = FR_DOWN | FR_MATCHCASE | FR_WHOLEWORD;
 constexpr int kTabWidthSpaces = 8;
+constexpr UINT_PTR kSpellCheckTimerId = 1;
+constexpr UINT kSpellCheckDelayMs = 300;
+constexpr UINT kSpellMenuSuggestionBase = 50000;
+constexpr UINT kSpellMenuSuggestionMax = 50004;
+constexpr UINT kSpellMenuNoSuggestions = 50005;
+constexpr UINT kSpellMenuIgnoreOnce = 50006;
+constexpr UINT kSpellMenuAddToDictionary = 50007;
 
 struct GoToDialogState {
     int currentLine = 1;
@@ -32,6 +41,15 @@ struct GoToDialogState {
 bool IsWordCharacter(wchar_t character)
 {
     return std::iswalnum(static_cast<wint_t>(character)) != 0 || character == L'_';
+}
+
+POINT PointFromEditorCharPosition(HWND editor, DWORD charIndex)
+{
+    const LRESULT packedPosition = SendMessageW(editor, EM_POSFROMCHAR, static_cast<WPARAM>(charIndex), 0);
+    POINT point{};
+    point.x = static_cast<short>(LOWORD(packedPosition));
+    point.y = static_cast<short>(HIWORD(packedPosition));
+    return point;
 }
 
 bool HasWordBoundaryAt(const std::wstring& text, std::size_t position)
@@ -253,12 +271,26 @@ ClassicNotepadApp::ClassicNotepadApp(HINSTANCE instance)
     : instance_(instance)
     , findReplaceMessage_(RegisterWindowMessageW(kFindReplaceMessageName))
 {
+    const HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    comInitialized_ = SUCCEEDED(hr);
 }
 
 ClassicNotepadApp::~ClassicNotepadApp()
 {
+    if (mainWindow_ != nullptr && spellCheckTimerId_ != 0) {
+        KillTimer(mainWindow_, spellCheckTimerId_);
+        spellCheckTimerId_ = 0;
+    }
+
     DestroyOwnedEditorFont();
     DestroyPrintDialogHandles();
+
+    spellChecker_.Reset();
+
+    if (comInitialized_) {
+        CoUninitialize();
+        comInitialized_ = false;
+    }
 }
 
 int ClassicNotepadApp::Run(int showCommand, const std::wstring& initialFilePath)
@@ -519,12 +551,299 @@ void ClassicNotepadApp::UpdateStatusBar()
     SendMessageW(statusBar_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(text.c_str()));
 }
 
+void ClassicNotepadApp::RefreshSpellCheck(bool immediate)
+{
+    if (!spellCheckAvailable_) {
+        spellingErrors_.clear();
+        if (editor_ != nullptr) {
+            InvalidateRect(editor_, nullptr, FALSE);
+        }
+        return;
+    }
+
+    if (immediate) {
+        RunSpellCheckNow();
+        return;
+    }
+
+    ScheduleSpellCheck();
+}
+
+void ClassicNotepadApp::ScheduleSpellCheck()
+{
+    if (!spellCheckAvailable_ || mainWindow_ == nullptr) {
+        return;
+    }
+
+    if (spellCheckTimerId_ != 0) {
+        KillTimer(mainWindow_, spellCheckTimerId_);
+    }
+
+    spellCheckTimerId_ = SetTimer(mainWindow_, kSpellCheckTimerId, kSpellCheckDelayMs, nullptr);
+}
+
+void ClassicNotepadApp::RunSpellCheckNow()
+{
+    if (mainWindow_ != nullptr && spellCheckTimerId_ != 0) {
+        KillTimer(mainWindow_, spellCheckTimerId_);
+        spellCheckTimerId_ = 0;
+    }
+
+    if (!spellCheckAvailable_) {
+        spellingErrors_.clear();
+        if (editor_ != nullptr) {
+            InvalidateRect(editor_, nullptr, FALSE);
+        }
+        return;
+    }
+
+    spellingErrors_ = spellChecker_.Check(GetEditorText());
+    InvalidateRect(editor_, nullptr, FALSE);
+}
+
+void ClassicNotepadApp::DrawSpellingUnderlines(HWND editorWindow)
+{
+    if (!spellCheckAvailable_ || spellingErrors_.empty() || editorWindow == nullptr) {
+        return;
+    }
+
+    HDC deviceContext = GetDC(editorWindow);
+    if (deviceContext == nullptr) {
+        return;
+    }
+
+    HGDIOBJ previousFont = nullptr;
+    if (editorFont_ != nullptr) {
+        previousFont = SelectObject(deviceContext, editorFont_);
+    }
+
+    SetBkMode(deviceContext, TRANSPARENT);
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(220, 0, 0));
+    HGDIOBJ previousPen = pen != nullptr ? SelectObject(deviceContext, pen) : nullptr;
+
+    RECT clientRect{};
+    GetClientRect(editorWindow, &clientRect);
+
+    TEXTMETRICW textMetrics{};
+    GetTextMetricsW(deviceContext, &textMetrics);
+    const int lineHeight = std::max(1, static_cast<int>(textMetrics.tmHeight + textMetrics.tmExternalLeading));
+    const int firstVisibleLine = static_cast<int>(SendMessageW(editorWindow, EM_GETFIRSTVISIBLELINE, 0, 0));
+    const int clientHeight = static_cast<int>(clientRect.bottom - clientRect.top);
+    const int visibleLineCount = std::max(1, (clientHeight + lineHeight - 1) / lineHeight + 1);
+    const int lastVisibleLine = firstVisibleLine + visibleLineCount;
+
+    for (const SpellingErrorRange& error : spellingErrors_) {
+        if (error.length == 0) {
+            continue;
+        }
+
+        const DWORD errorEnd = error.start + error.length;
+        const int startLine = static_cast<int>(SendMessageW(editorWindow, EM_LINEFROMCHAR, error.start, 0));
+        const int endLine = static_cast<int>(SendMessageW(editorWindow, EM_LINEFROMCHAR, errorEnd, 0));
+        if (endLine < firstVisibleLine || startLine > lastVisibleLine) {
+            continue;
+        }
+
+        for (int line = std::max(startLine, firstVisibleLine); line <= std::min(endLine, lastVisibleLine); ++line) {
+            const LRESULT lineStartResult = SendMessageW(editorWindow, EM_LINEINDEX, static_cast<WPARAM>(line), 0);
+            if (lineStartResult < 0) {
+                continue;
+            }
+
+            const DWORD lineStart = static_cast<DWORD>(lineStartResult);
+            const WORD lineLength = static_cast<WORD>(SendMessageW(editorWindow, EM_LINELENGTH, lineStart, 0));
+            const DWORD lineEnd = lineStart + lineLength;
+
+            const DWORD segmentStart = std::max(lineStart, error.start);
+            const DWORD segmentEnd = std::min(lineEnd, errorEnd);
+            if (segmentEnd <= segmentStart) {
+                continue;
+            }
+
+            const POINT startPoint = PointFromEditorCharPosition(editorWindow, segmentStart);
+            const POINT endPoint = PointFromEditorCharPosition(editorWindow, segmentEnd);
+            if (startPoint.x < 0 || startPoint.y < 0 || endPoint.x < 0 || endPoint.y < 0) {
+                continue;
+            }
+
+            const int baselineOffset = std::max(1, static_cast<int>(textMetrics.tmAscent + 1));
+            const int y = startPoint.y + baselineOffset;
+            int x = startPoint.x;
+            const int endX = std::max(startPoint.x + 1, endPoint.x);
+            bool up = true;
+            while (x < endX) {
+                const int nextX = std::min(x + 4, endX);
+                MoveToEx(deviceContext, x, y + (up ? 1 : -1), nullptr);
+                LineTo(deviceContext, nextX, y + (up ? -1 : 1));
+                up = !up;
+                x = nextX;
+            }
+        }
+    }
+
+    if (previousPen != nullptr) {
+        SelectObject(deviceContext, previousPen);
+    }
+    if (pen != nullptr) {
+        DeleteObject(pen);
+    }
+    if (previousFont != nullptr) {
+        SelectObject(deviceContext, previousFont);
+    }
+
+    ReleaseDC(editorWindow, deviceContext);
+}
+
+void ClassicNotepadApp::ShowSpellingUnavailableMessage()
+{
+    if (spellCheckMessageShown_) {
+        return;
+    }
+
+    spellCheckMessageShown_ = true;
+    MessageBoxW(
+        mainWindow_,
+        L"British English spell checking is not installed for Windows.",
+        L"Classic Notepad",
+        MB_OK | MB_ICONINFORMATION);
+}
+
+bool ClassicNotepadApp::HandleEditorContextMenu(HWND editorWindow, LPARAM lParam)
+{
+    if (editorWindow == nullptr) {
+        return false;
+    }
+
+    POINT screenPoint{};
+    if (lParam == -1) {
+        DWORD start = 0;
+        DWORD end = 0;
+        GetSelectionRange(start, end);
+        const POINT caret = PointFromEditorCharPosition(editorWindow, end);
+        screenPoint = caret;
+        ClientToScreen(editorWindow, &screenPoint);
+    } else {
+        screenPoint.x = static_cast<short>(LOWORD(lParam));
+        screenPoint.y = static_cast<short>(HIWORD(lParam));
+    }
+
+    POINT clientPoint = screenPoint;
+    ScreenToClient(editorWindow, &clientPoint);
+    const LRESULT charResult = SendMessageW(
+        editorWindow,
+        EM_CHARFROMPOS,
+        0,
+        MAKELPARAM(clientPoint.x, clientPoint.y));
+    const DWORD charIndex = LOWORD(charResult);
+
+    const std::wstring text = GetEditorText();
+    classic_notepad::TextRange wordRange{};
+    const bool hasWord = charIndex < text.size() &&
+        classic_notepad::ExpandWordRangeAt(text, charIndex, wordRange);
+
+    bool wordMisspelled = false;
+    if (hasWord) {
+        for (const SpellingErrorRange& error : spellingErrors_) {
+            if (classic_notepad::RangesOverlap(
+                    wordRange.start,
+                    wordRange.length,
+                    error.start,
+                    error.length)) {
+                wordMisspelled = true;
+                break;
+            }
+        }
+    }
+
+    HMENU popup = CreatePopupMenu();
+    if (popup == nullptr) {
+        return true;
+    }
+
+    contextMenuWord_.clear();
+    contextMenuWordStart_ = 0;
+    contextMenuWordLength_ = 0;
+
+    if (spellCheckAvailable_ && wordMisspelled) {
+        contextMenuWord_ = text.substr(wordRange.start, wordRange.length);
+        contextMenuWordStart_ = static_cast<DWORD>(wordRange.start);
+        contextMenuWordLength_ = static_cast<DWORD>(wordRange.length);
+
+        const std::vector<std::wstring> suggestions = spellChecker_.Suggest(contextMenuWord_, 5);
+        if (suggestions.empty()) {
+            AppendMenuW(popup, MF_STRING | MF_GRAYED, kSpellMenuNoSuggestions, L"No spelling suggestions");
+        } else {
+            UINT commandId = kSpellMenuSuggestionBase;
+            for (const std::wstring& suggestion : suggestions) {
+                AppendMenuW(popup, MF_STRING, commandId, suggestion.c_str());
+                ++commandId;
+            }
+        }
+
+        AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(popup, MF_STRING, kSpellMenuIgnoreOnce, L"Ignore Once");
+        AppendMenuW(popup, MF_STRING, kSpellMenuAddToDictionary, L"Add to Dictionary");
+        AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+    } else if (!spellCheckAvailable_) {
+        AppendMenuW(
+            popup,
+            MF_STRING | MF_GRAYED,
+            kSpellMenuNoSuggestions,
+            L"British English spell checking is not installed");
+        AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+    }
+
+    const bool hasSelection = HasSelection();
+    const bool hasText = !text.empty();
+    AppendMenuW(popup, MF_STRING | (SendMessageW(editor_, EM_CANUNDO, 0, 0) != 0 ? MF_ENABLED : MF_GRAYED), ID_EDIT_UNDO, L"Undo");
+    AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(popup, MF_STRING | (hasSelection ? MF_ENABLED : MF_GRAYED), ID_EDIT_CUT, L"Cut");
+    AppendMenuW(popup, MF_STRING | (hasSelection ? MF_ENABLED : MF_GRAYED), ID_EDIT_COPY, L"Copy");
+    AppendMenuW(popup, MF_STRING | (CanPasteText() ? MF_ENABLED : MF_GRAYED), ID_EDIT_PASTE, L"Paste");
+    AppendMenuW(popup, MF_STRING | (hasSelection ? MF_ENABLED : MF_GRAYED), ID_EDIT_DELETE, L"Delete");
+    AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(popup, MF_STRING | (hasText ? MF_ENABLED : MF_GRAYED), ID_EDIT_SELECT_ALL, L"Select All");
+
+    const UINT selected = TrackPopupMenu(
+        popup,
+        TPM_RETURNCMD | TPM_RIGHTBUTTON,
+        screenPoint.x,
+        screenPoint.y,
+        0,
+        mainWindow_,
+        nullptr);
+
+    if (selected >= kSpellMenuSuggestionBase && selected <= kSpellMenuSuggestionMax) {
+        MENUITEMINFOW itemInfo{};
+        std::array<wchar_t, 256> suggestionBuffer{};
+        itemInfo.cbSize = sizeof(itemInfo);
+        itemInfo.fMask = MIIM_STRING;
+        itemInfo.dwTypeData = suggestionBuffer.data();
+        itemInfo.cch = static_cast<UINT>(suggestionBuffer.size() - 1);
+        if (GetMenuItemInfoW(popup, selected, FALSE, &itemInfo)) {
+            SendMessageW(editor_, EM_SETSEL, contextMenuWordStart_, contextMenuWordStart_ + contextMenuWordLength_);
+            SendMessageW(editor_, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(suggestionBuffer.data()));
+        }
+    } else if (selected == kSpellMenuIgnoreOnce) {
+        spellChecker_.Ignore(contextMenuWord_);
+        RunSpellCheckNow();
+    } else if (selected == kSpellMenuAddToDictionary) {
+        spellChecker_.Add(contextMenuWord_);
+        RunSpellCheckNow();
+    } else if (selected != 0) {
+        SendMessageW(mainWindow_, WM_COMMAND, MAKEWPARAM(selected, 0), 0);
+    }
+
+    DestroyMenu(popup);
+    return true;
+}
+
 void ClassicNotepadApp::ShowAboutDialog()
 {
     constexpr wchar_t message[] =
         L"Classic Notepad\n\n"
         L"Phase 6 native Win32 build.\n"
-        L"Single editor window, classic menu bar, file open/save, classic edit commands, word wrap, font selection, status bar, page setup, print, and no modern extras.";
+        L"Single editor window, classic menu bar, file open/save, classic edit commands, word wrap, font selection, status bar, page setup, print, and no modern extras apart from spell checking.";
 
     MessageBoxW(mainWindow_, message, L"About Classic Notepad", MB_OK | MB_ICONINFORMATION);
 }
@@ -536,6 +855,7 @@ void ClassicNotepadApp::HandleEditorChanged()
     }
 
     UpdateStatusBar();
+    RefreshSpellCheck(false);
 
     if (!document_.IsModified()) {
         document_.SetModified(true);
@@ -868,6 +1188,7 @@ void ClassicNotepadApp::HandleToggleWordWrap()
 
     ResizeEditor();
     UpdateStatusBar();
+    RefreshSpellCheck(true);
     UpdateTitle();
     UpdateMenuState(GetMenu(mainWindow_));
     DrawMenuBar(mainWindow_);
@@ -914,6 +1235,7 @@ void ClassicNotepadApp::HandleChooseFont()
 
     ResizeEditor();
     UpdateStatusBar();
+    InvalidateRect(editor_, nullptr, FALSE);
     SetFocus(editor_);
 }
 
@@ -1014,6 +1336,7 @@ void ClassicNotepadApp::SetEditorText(const std::wstring& text)
     SendMessageW(editor_, EM_SETMODIFY, FALSE, 0);
     suppressEditorChange_ = false;
     UpdateStatusBar();
+    RefreshSpellCheck(true);
 }
 
 void ClassicNotepadApp::ReplaceEditorTextFromCommand(const std::wstring& text)
@@ -1027,6 +1350,7 @@ void ClassicNotepadApp::ReplaceEditorTextFromCommand(const std::wstring& text)
     document_.SetModified(true);
     UpdateTitle();
     UpdateStatusBar();
+    RefreshSpellCheck(true);
 }
 
 void ClassicNotepadApp::ReplaceSelection(const std::wstring& text)
@@ -1563,13 +1887,19 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
             return -1;
         }
         document_.ResetUntitled();
+        spellCheckAvailable_ = comInitialized_ && spellChecker_.Initialize(L"en-GB");
+        if (!spellCheckAvailable_) {
+            ShowSpellingUnavailableMessage();
+        }
         ResizeEditor();
         UpdateStatusBar();
+        RefreshSpellCheck(true);
         SetFocus(editor_);
         return 0;
 
     case WM_SIZE:
         ResizeEditor();
+        InvalidateRect(editor_, nullptr, FALSE);
         return 0;
 
     case WM_SETFOCUS:
@@ -1692,8 +2022,19 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
 
     case WM_DESTROY:
         CloseFindReplaceDialogs();
+        if (spellCheckTimerId_ != 0) {
+            KillTimer(mainWindow_, spellCheckTimerId_);
+            spellCheckTimerId_ = 0;
+        }
         PostQuitMessage(0);
         return 0;
+
+    case WM_TIMER:
+        if (wParam == kSpellCheckTimerId) {
+            RunSpellCheckNow();
+            return 0;
+        }
+        break;
 
     default:
         break;
@@ -1776,6 +2117,12 @@ LRESULT CALLBACK ClassicNotepadApp::WindowProc(HWND window, UINT message, WPARAM
 LRESULT CALLBACK ClassicNotepadApp::EditorWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
     ClassicNotepadApp* app = reinterpret_cast<ClassicNotepadApp*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (app != nullptr && message == WM_CONTEXTMENU) {
+        if (app->HandleEditorContextMenu(window, lParam)) {
+            return 0;
+        }
+    }
+
     WNDPROC originalProc = app != nullptr ? app->originalEditorProc_ : nullptr;
     const LRESULT result = originalProc != nullptr
         ? CallWindowProcW(originalProc, window, message, wParam, lParam)
@@ -1786,6 +2133,10 @@ LRESULT CALLBACK ClassicNotepadApp::EditorWindowProc(HWND window, UINT message, 
     }
 
     switch (message) {
+    case WM_PAINT:
+        app->DrawSpellingUnderlines(window);
+        break;
+
     case WM_CHAR:
     case WM_KEYDOWN:
     case WM_KEYUP:
@@ -1796,7 +2147,9 @@ LRESULT CALLBACK ClassicNotepadApp::EditorWindowProc(HWND window, UINT message, 
     case WM_HSCROLL:
     case WM_VSCROLL:
     case WM_SETFOCUS:
+    case WM_SIZE:
         app->UpdateStatusBar();
+        InvalidateRect(window, nullptr, FALSE);
         break;
 
     case WM_MOUSEMOVE:
