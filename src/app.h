@@ -7,6 +7,7 @@
 #include <commdlg.h>
 
 #include <array>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,12 @@ private:
         int maximum = 0;
         int page = 1;
         int position = 0;
+    };
+
+    struct OwnerDrawMenuItem {
+        std::wstring text;
+        bool separator = false;
+        bool reserveIconSpace = false;
     };
 
     bool RegisterMainWindowClass();
@@ -63,6 +70,27 @@ private:
     bool ActivateMenuBarFromKeyboard();
     bool ActivateMenuMnemonic(wchar_t mnemonic);
     void UpdateMenuChrome();
+    OwnerDrawMenuItem* StoreOwnerDrawMenuItem(
+        std::vector<std::unique_ptr<OwnerDrawMenuItem>>& storage,
+        const std::wstring& text,
+        bool separator,
+        bool reserveIconSpace) const;
+    bool AppendOwnerDrawMenuItem(
+        HMENU menu,
+        UINT flags,
+        UINT_PTR itemId,
+        const std::wstring& text,
+        std::vector<std::unique_ptr<OwnerDrawMenuItem>>& storage,
+        bool reserveIconSpace = false) const;
+    bool AppendOwnerDrawMenuSeparator(
+        HMENU menu,
+        std::vector<std::unique_ptr<OwnerDrawMenuItem>>& storage,
+        bool reserveIconSpace = false) const;
+    void ApplyOwnerDrawToPopupMenu(
+        HMENU menu,
+        std::vector<std::unique_ptr<OwnerDrawMenuItem>>& storage) const;
+    void ApplyOwnerDrawToMainMenu();
+    void ApplyMenuBackground(HMENU menu) const;
     void UpdateTitle();
     void UpdateMenuState(HMENU menu);
     void UpdateStatusBar();
@@ -157,6 +185,7 @@ private:
     bool PrintEditorText(HDC printerDc, std::wstring& errorMessage) const;
     void CloseFindReplaceDialogs();
     void DestroyOwnedEditorFont();
+    void DestroyOwnedMenuFont();
     void DestroyPrintDialogHandles();
     void HandleFindReplaceMessage(LPARAM lParam);
     int ShowGoToDialog(int currentLine, int maxLine);
@@ -167,6 +196,7 @@ private:
     void ShowError(const std::wstring& message);
 
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
+    LRESULT HandleMeasureItem(WPARAM controlId, LPARAM lParam) const;
 
     static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK MenuBarWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
@@ -194,13 +224,17 @@ private:
     HWND replaceDialog_ = nullptr;
     HACCEL accelerator_ = nullptr;
     HMENU mainMenu_ = nullptr;
+    HFONT menuFont_ = nullptr;
     HFONT editorFont_ = nullptr;
     HBRUSH darkEditorBackgroundBrush_ = nullptr;
     HBRUSH darkStatusBackgroundBrush_ = nullptr;
+    HBRUSH darkMenuBackgroundBrush_ = nullptr;
     HGLOBAL pageSetupDevMode_ = nullptr;
     HGLOBAL pageSetupDevNames_ = nullptr;
     RECT pageMarginsThousandths_ {750, 750, 750, 750};
+    bool ownsMenuFont_ = false;
     bool ownsEditorFont_ = false;
+    bool mainMenuOwnerDrawApplied_ = false;
     WNDPROC originalEditorProc_ = nullptr;
     UINT findReplaceMessage_ = 0;
     Document document_;
@@ -208,6 +242,7 @@ private:
     std::wstring statusBarText_;
     std::array<wchar_t, 512> findBuffer_ {};
     std::array<wchar_t, 512> replaceBuffer_ {};
+    std::vector<std::unique_ptr<OwnerDrawMenuItem>> mainOwnerDrawMenuItems_;
     DWORD findFlags_ = FR_DOWN;
     bool wordWrap_ = false;
     bool statusBarVisible_ = true;

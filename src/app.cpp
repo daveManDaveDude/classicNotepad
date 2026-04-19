@@ -53,10 +53,20 @@ constexpr COLORREF kDarkMenuBackground = RGB(38, 38, 38);
 constexpr COLORREF kDarkMenuHotBackground = RGB(58, 58, 58);
 constexpr COLORREF kDarkMenuActiveBackground = RGB(70, 70, 70);
 constexpr COLORREF kDarkMenuText = RGB(245, 245, 245);
+constexpr COLORREF kDarkMenuDisabledText = RGB(150, 150, 150);
+constexpr COLORREF kDarkMenuSeparator = RGB(82, 82, 82);
 constexpr COLORREF kDarkScrollTrack = RGB(32, 32, 32);
 constexpr COLORREF kDarkScrollThumb = RGB(78, 78, 78);
 constexpr COLORREF kDarkScrollThumbActive = RGB(96, 96, 96);
+constexpr int kWindows11MenuFontPixelSize = 14;
+constexpr wchar_t kWindows11MenuFontFace[] = L"Segoe UI Variable";
+constexpr wchar_t kFallbackMenuFontFace[] = L"Segoe UI";
 constexpr int kMenuHorizontalPadding = 12;
+constexpr int kPopupMenuHorizontalPadding = 12;
+constexpr int kPopupMenuCheckWidth = 28;
+constexpr int kPopupMenuAcceleratorGap = 24;
+constexpr int kPopupMenuItemHeight = 32;
+constexpr int kPopupMenuSeparatorHeight = 9;
 constexpr int kMinimumScrollThumbLength = 28;
 constexpr DWORD kDwmUseImmersiveDarkMode = 20;
 constexpr DWORD kDwmUseImmersiveDarkModeBefore20H1 = 19;
@@ -75,6 +85,26 @@ struct AboutDialogState {
     HICON largeIcon = nullptr;
     bool ownsLargeIcon = false;
 };
+
+struct FontFamilySearch {
+    const wchar_t* faceName = nullptr;
+    bool found = false;
+};
+
+int CALLBACK EnumFontFamilyMatchProc(const LOGFONTW* logFont, const TEXTMETRICW*, DWORD, LPARAM lParam)
+{
+    auto* search = reinterpret_cast<FontFamilySearch*>(lParam);
+    if (search == nullptr || search->faceName == nullptr || logFont == nullptr) {
+        return 0;
+    }
+
+    if (CompareStringOrdinal(logFont->lfFaceName, -1, search->faceName, -1, TRUE) == CSTR_EQUAL) {
+        search->found = true;
+        return 0;
+    }
+
+    return 1;
+}
 
 bool IsWordCharacter(wchar_t character)
 {
@@ -464,6 +494,40 @@ wchar_t FindMenuMnemonic(const std::wstring& text)
     return L'\0';
 }
 
+void SplitMenuItemText(const std::wstring& text, std::wstring& label, std::wstring& accelerator)
+{
+    const std::size_t separator = text.find(L'\t');
+    if (separator == std::wstring::npos) {
+        label = StripMenuMnemonics(text);
+        accelerator.clear();
+        return;
+    }
+
+    label = StripMenuMnemonics(text.substr(0, separator));
+    accelerator = StripMenuMnemonics(text.substr(separator + 1U));
+}
+
+int ScalePixelsForWindow(HWND window, int pixels)
+{
+    HDC deviceContext = GetDC(window);
+    const int dpiY = deviceContext != nullptr ? std::max(1, GetDeviceCaps(deviceContext, LOGPIXELSY)) : 96;
+    if (deviceContext != nullptr) {
+        ReleaseDC(window, deviceContext);
+    }
+
+    return std::max(1, MulDiv(pixels, dpiY, 96));
+}
+
+SIZE MeasureText(HDC deviceContext, const std::wstring& text)
+{
+    SIZE textSize{};
+    if (deviceContext != nullptr && !text.empty()) {
+        GetTextExtentPoint32W(deviceContext, text.c_str(), static_cast<int>(text.size()), &textSize);
+    }
+
+    return textSize;
+}
+
 std::size_t FindWrapBreakLength(const std::wstring& text, std::size_t start, std::size_t maxLength)
 {
     if (start + maxLength >= text.size()) {
@@ -535,6 +599,52 @@ HFONT CreateDefaultEditorFont(HWND ownerWindow)
     return CreateFontIndirectW(&logFont);
 }
 
+bool IsFontFamilyAvailable(HDC deviceContext, const wchar_t* faceName)
+{
+    if (deviceContext == nullptr || faceName == nullptr || faceName[0] == L'\0') {
+        return false;
+    }
+
+    LOGFONTW logFont{};
+    logFont.lfCharSet = DEFAULT_CHARSET;
+    wcscpy_s(logFont.lfFaceName, faceName);
+
+    FontFamilySearch search{ faceName, false };
+    EnumFontFamiliesExW(
+        deviceContext,
+        &logFont,
+        EnumFontFamilyMatchProc,
+        reinterpret_cast<LPARAM>(&search),
+        0);
+
+    return search.found;
+}
+
+HFONT CreateMenuFont(HWND ownerWindow)
+{
+    HDC deviceContext = GetDC(ownerWindow);
+    const int dpiY = deviceContext != nullptr ? std::max(1, GetDeviceCaps(deviceContext, LOGPIXELSY)) : 96;
+    const wchar_t* faceName = deviceContext != nullptr && IsFontFamilyAvailable(deviceContext, kWindows11MenuFontFace)
+        ? kWindows11MenuFontFace
+        : kFallbackMenuFontFace;
+
+    if (deviceContext != nullptr) {
+        ReleaseDC(ownerWindow, deviceContext);
+    }
+
+    LOGFONTW logFont{};
+    logFont.lfHeight = -MulDiv(kWindows11MenuFontPixelSize, dpiY, 96);
+    logFont.lfWeight = FW_NORMAL;
+    logFont.lfCharSet = DEFAULT_CHARSET;
+    logFont.lfOutPrecision = OUT_DEFAULT_PRECIS;
+    logFont.lfClipPrecision = CLIP_DEFAULT_PRECIS;
+    logFont.lfQuality = CLEARTYPE_QUALITY;
+    logFont.lfPitchAndFamily = DEFAULT_PITCH | FF_SWISS;
+    wcscpy_s(logFont.lfFaceName, faceName);
+
+    return CreateFontIndirectW(&logFont);
+}
+
 HFONT CreatePrinterFont(HDC printerDc, HFONT sourceFont, HWND ownerWindow)
 {
     LOGFONTW logFont{};
@@ -576,6 +686,7 @@ ClassicNotepadApp::~ClassicNotepadApp()
     }
 
     DestroyOwnedEditorFont();
+    DestroyOwnedMenuFont();
     DestroyPrintDialogHandles();
     DestroyThemeBrushes();
 
@@ -705,6 +816,15 @@ bool ClassicNotepadApp::CreateMainWindow(int showCommand)
         return false;
     }
 
+    if (menuFont_ == nullptr) {
+        menuFont_ = CreateMenuFont(mainWindow_);
+        ownsMenuFont_ = menuFont_ != nullptr;
+        if (menuFont_ == nullptr) {
+            menuFont_ = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+            ownsMenuFont_ = false;
+        }
+    }
+
     ApplyThemeToWindows();
     ShowWindow(mainWindow_, showCommand);
     UpdateWindow(mainWindow_);
@@ -717,7 +837,7 @@ HWND ClassicNotepadApp::CreateMenuBar()
         0,
         kMenuBarClass,
         nullptr,
-        WS_CHILD | (darkModeEnabled_ ? WS_VISIBLE : 0),
+        WS_CHILD | WS_VISIBLE,
         0,
         0,
         0,
@@ -897,7 +1017,9 @@ RECT ClassicNotepadApp::GetMenuBarItemRect(int index) const
         return itemRect;
     }
 
-    HGDIOBJ previousFont = SelectObject(deviceContext, GetStockObject(DEFAULT_GUI_FONT));
+    HGDIOBJ previousFont = SelectObject(
+        deviceContext,
+        menuFont_ != nullptr ? menuFont_ : GetStockObject(DEFAULT_GUI_FONT));
     int x = clientRect.left;
     for (int itemIndex = 0; itemIndex <= index; ++itemIndex) {
         const std::wstring text = StripMenuMnemonics(GetTopLevelMenuText(itemIndex));
@@ -945,18 +1067,25 @@ void ClassicNotepadApp::PaintMenuBar(HDC deviceContext) const
     RECT clientRect{};
     GetClientRect(menuBar_, &clientRect);
 
-    HBRUSH backgroundBrush = CreateSolidBrush(kDarkMenuBackground);
+    const COLORREF backgroundColor = darkModeEnabled_ ? kDarkMenuBackground : GetSysColor(COLOR_MENU);
+    const COLORREF hotBackgroundColor = darkModeEnabled_ ? kDarkMenuHotBackground : GetSysColor(COLOR_MENUHILIGHT);
+    const COLORREF activeBackgroundColor = darkModeEnabled_ ? kDarkMenuActiveBackground : hotBackgroundColor;
+    const COLORREF textColor = darkModeEnabled_ ? kDarkMenuText : GetSysColor(COLOR_MENUTEXT);
+
+    HBRUSH backgroundBrush = CreateSolidBrush(backgroundColor);
     if (backgroundBrush != nullptr) {
         FillRect(deviceContext, &clientRect, backgroundBrush);
         DeleteObject(backgroundBrush);
     }
 
-    HGDIOBJ previousFont = SelectObject(deviceContext, GetStockObject(DEFAULT_GUI_FONT));
+    HGDIOBJ previousFont = SelectObject(
+        deviceContext,
+        menuFont_ != nullptr ? menuFont_ : GetStockObject(DEFAULT_GUI_FONT));
     SetBkMode(deviceContext, TRANSPARENT);
-    SetTextColor(deviceContext, kDarkMenuText);
+    SetTextColor(deviceContext, textColor);
 
-    HBRUSH hotBrush = CreateSolidBrush(kDarkMenuHotBackground);
-    HBRUSH activeBrush = CreateSolidBrush(kDarkMenuActiveBackground);
+    HBRUSH hotBrush = CreateSolidBrush(hotBackgroundColor);
+    HBRUSH activeBrush = CreateSolidBrush(activeBackgroundColor);
     const int itemCount = GetTopLevelMenuCount();
     for (int index = 0; index < itemCount; ++index) {
         RECT itemRect = GetMenuBarItemRect(index);
@@ -974,6 +1103,11 @@ void ClassicNotepadApp::PaintMenuBar(HDC deviceContext) const
         textRect.left += kMenuHorizontalPadding;
         textRect.right -= kMenuHorizontalPadding;
         const std::wstring text = StripMenuMnemonics(GetTopLevelMenuText(index));
+        SetTextColor(
+            deviceContext,
+            !darkModeEnabled_ && (index == activeMenuIndex_ || index == hotMenuIndex_)
+                ? GetSysColor(COLOR_HIGHLIGHTTEXT)
+                : textColor);
         DrawTextW(
             deviceContext,
             text.c_str(),
@@ -1055,7 +1189,7 @@ void ClassicNotepadApp::ShowMenuPopup(int index, bool fromKeyboard)
 
 bool ClassicNotepadApp::ActivateMenuBarFromKeyboard()
 {
-    if (!darkModeEnabled_ || menuBar_ == nullptr || !IsWindowVisible(menuBar_) || GetTopLevelMenuCount() == 0) {
+    if (menuBar_ == nullptr || !IsWindowVisible(menuBar_) || GetTopLevelMenuCount() == 0) {
         return false;
     }
 
@@ -1067,7 +1201,7 @@ bool ClassicNotepadApp::ActivateMenuBarFromKeyboard()
 
 bool ClassicNotepadApp::ActivateMenuMnemonic(wchar_t mnemonic)
 {
-    if (!darkModeEnabled_ || menuBar_ == nullptr || !IsWindowVisible(menuBar_)) {
+    if (menuBar_ == nullptr || !IsWindowVisible(menuBar_)) {
         return false;
     }
 
@@ -1083,6 +1217,142 @@ bool ClassicNotepadApp::ActivateMenuMnemonic(wchar_t mnemonic)
     return false;
 }
 
+ClassicNotepadApp::OwnerDrawMenuItem* ClassicNotepadApp::StoreOwnerDrawMenuItem(
+    std::vector<std::unique_ptr<OwnerDrawMenuItem>>& storage,
+    const std::wstring& text,
+    bool separator,
+    bool reserveIconSpace) const
+{
+    auto item = std::make_unique<OwnerDrawMenuItem>();
+    item->text = text;
+    item->separator = separator;
+    item->reserveIconSpace = reserveIconSpace;
+    OwnerDrawMenuItem* storedItem = item.get();
+    storage.push_back(std::move(item));
+    return storedItem;
+}
+
+bool ClassicNotepadApp::AppendOwnerDrawMenuItem(
+    HMENU menu,
+    UINT flags,
+    UINT_PTR itemId,
+    const std::wstring& text,
+    std::vector<std::unique_ptr<OwnerDrawMenuItem>>& storage,
+    bool reserveIconSpace) const
+{
+    OwnerDrawMenuItem* item = StoreOwnerDrawMenuItem(storage, text, false, reserveIconSpace);
+    return AppendMenuW(
+        menu,
+        MF_OWNERDRAW | flags,
+        itemId,
+        reinterpret_cast<LPCWSTR>(item)) != 0;
+}
+
+bool ClassicNotepadApp::AppendOwnerDrawMenuSeparator(
+    HMENU menu,
+    std::vector<std::unique_ptr<OwnerDrawMenuItem>>& storage,
+    bool reserveIconSpace) const
+{
+    OwnerDrawMenuItem* item = StoreOwnerDrawMenuItem(storage, {}, true, reserveIconSpace);
+    return AppendMenuW(
+        menu,
+        MF_OWNERDRAW | MF_DISABLED,
+        0,
+        reinterpret_cast<LPCWSTR>(item)) != 0;
+}
+
+void ClassicNotepadApp::ApplyMenuBackground(HMENU menu) const
+{
+    if (menu == nullptr) {
+        return;
+    }
+
+    MENUINFO menuInfo{};
+    menuInfo.cbSize = sizeof(menuInfo);
+    menuInfo.fMask = MIM_BACKGROUND;
+    menuInfo.hbrBack = darkModeEnabled_ && darkMenuBackgroundBrush_ != nullptr
+        ? darkMenuBackgroundBrush_
+        : GetSysColorBrush(COLOR_MENU);
+    SetMenuInfo(menu, &menuInfo);
+}
+
+void ClassicNotepadApp::ApplyOwnerDrawToPopupMenu(
+    HMENU menu,
+    std::vector<std::unique_ptr<OwnerDrawMenuItem>>& storage) const
+{
+    if (menu == nullptr) {
+        return;
+    }
+
+    ApplyMenuBackground(menu);
+
+    const int itemCount = GetMenuItemCount(menu);
+    bool reserveIconSpace = false;
+    for (int index = 0; index < itemCount; ++index) {
+        MENUITEMINFOW itemInfo{};
+        itemInfo.cbSize = sizeof(itemInfo);
+        itemInfo.fMask = MIIM_ID;
+        if (GetMenuItemInfoW(menu, static_cast<UINT>(index), TRUE, &itemInfo) &&
+            itemInfo.wID == ID_VIEW_STATUS_BAR) {
+            reserveIconSpace = true;
+            break;
+        }
+    }
+
+    for (int index = 0; index < itemCount; ++index) {
+        const UINT state = GetMenuState(menu, static_cast<UINT>(index), MF_BYPOSITION);
+        const bool separator = (state & MF_SEPARATOR) != 0;
+
+        std::wstring text;
+        if (!separator) {
+            std::array<wchar_t, 256> textBuffer{};
+            GetMenuStringW(
+                menu,
+                static_cast<UINT>(index),
+                textBuffer.data(),
+                static_cast<int>(textBuffer.size()),
+                MF_BYPOSITION);
+            text = textBuffer.data();
+        }
+
+        OwnerDrawMenuItem* ownerDrawItem = StoreOwnerDrawMenuItem(storage, text, separator, reserveIconSpace);
+        MENUITEMINFOW itemInfo{};
+        itemInfo.cbSize = sizeof(itemInfo);
+        itemInfo.fMask = MIIM_FTYPE | MIIM_DATA;
+        itemInfo.fType = MFT_OWNERDRAW;
+        itemInfo.dwItemData = reinterpret_cast<ULONG_PTR>(ownerDrawItem);
+        if (separator) {
+            itemInfo.fMask |= MIIM_STATE;
+            itemInfo.fState = MFS_DISABLED;
+        }
+        SetMenuItemInfoW(menu, static_cast<UINT>(index), TRUE, &itemInfo);
+
+        HMENU submenu = GetSubMenu(menu, index);
+        if (submenu != nullptr) {
+            ApplyOwnerDrawToPopupMenu(submenu, storage);
+        }
+    }
+}
+
+void ClassicNotepadApp::ApplyOwnerDrawToMainMenu()
+{
+    if (mainMenu_ == nullptr || mainMenuOwnerDrawApplied_) {
+        return;
+    }
+
+    mainOwnerDrawMenuItems_.clear();
+
+    const int itemCount = GetMenuItemCount(mainMenu_);
+    for (int index = 0; index < itemCount; ++index) {
+        HMENU submenu = GetSubMenu(mainMenu_, index);
+        if (submenu != nullptr) {
+            ApplyOwnerDrawToPopupMenu(submenu, mainOwnerDrawMenuItems_);
+        }
+    }
+
+    mainMenuOwnerDrawApplied_ = true;
+}
+
 void ClassicNotepadApp::UpdateMenuChrome()
 {
     if (mainWindow_ == nullptr) {
@@ -1093,22 +1363,23 @@ void ClassicNotepadApp::UpdateMenuChrome()
         mainMenu_ = GetMenu(mainWindow_);
     }
 
-    if (darkModeEnabled_) {
-        if (GetMenu(mainWindow_) != nullptr) {
-            SetMenu(mainWindow_, nullptr);
+    ApplyOwnerDrawToMainMenu();
+    if (mainMenu_ != nullptr) {
+        const int itemCount = GetMenuItemCount(mainMenu_);
+        for (int index = 0; index < itemCount; ++index) {
+            HMENU submenu = GetSubMenu(mainMenu_, index);
+            if (submenu != nullptr) {
+                ApplyMenuBackground(submenu);
+            }
         }
-        if (menuBar_ != nullptr) {
-            ShowWindow(menuBar_, SW_SHOWNA);
-            InvalidateRect(menuBar_, nullptr, FALSE);
-        }
-    } else {
-        ClearMenuMode();
-        if (menuBar_ != nullptr) {
-            ShowWindow(menuBar_, SW_HIDE);
-        }
-        if (GetMenu(mainWindow_) == nullptr && mainMenu_ != nullptr) {
-            SetMenu(mainWindow_, mainMenu_);
-        }
+    }
+
+    if (GetMenu(mainWindow_) != nullptr) {
+        SetMenu(mainWindow_, nullptr);
+    }
+    if (menuBar_ != nullptr) {
+        ShowWindow(menuBar_, SW_SHOWNA);
+        InvalidateRect(menuBar_, nullptr, FALSE);
     }
 
     DrawMenuBar(mainWindow_);
@@ -1156,6 +1427,7 @@ void ClassicNotepadApp::RecreateThemeBrushes()
     if (darkModeEnabled_) {
         darkEditorBackgroundBrush_ = CreateSolidBrush(kDarkEditorBackground);
         darkStatusBackgroundBrush_ = CreateSolidBrush(kDarkStatusBackground);
+        darkMenuBackgroundBrush_ = CreateSolidBrush(kDarkMenuBackground);
     }
 }
 
@@ -1169,6 +1441,11 @@ void ClassicNotepadApp::DestroyThemeBrushes()
     if (darkStatusBackgroundBrush_ != nullptr) {
         DeleteObject(darkStatusBackgroundBrush_);
         darkStatusBackgroundBrush_ = nullptr;
+    }
+
+    if (darkMenuBackgroundBrush_ != nullptr) {
+        DeleteObject(darkMenuBackgroundBrush_);
+        darkMenuBackgroundBrush_ = nullptr;
     }
 }
 
@@ -1185,12 +1462,120 @@ LRESULT ClassicNotepadApp::HandleControlColor(HDC deviceContext, HWND controlWin
 
 LRESULT ClassicNotepadApp::HandleDrawItem(WPARAM controlId, LPARAM lParam) const
 {
+    const auto* drawItem = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+    if (drawItem == nullptr || drawItem->hDC == nullptr) {
+        return 0;
+    }
+
+    if (drawItem->CtlType == ODT_MENU) {
+        const auto* menuItem = reinterpret_cast<const OwnerDrawMenuItem*>(drawItem->itemData);
+        if (menuItem == nullptr) {
+            return 0;
+        }
+
+        const bool selected = (drawItem->itemState & ODS_SELECTED) != 0;
+        const bool disabled = (drawItem->itemState & (ODS_DISABLED | ODS_GRAYED)) != 0;
+        const bool checked = (drawItem->itemState & ODS_CHECKED) != 0;
+
+        const COLORREF backgroundColor = darkModeEnabled_
+            ? (selected ? kDarkMenuHotBackground : kDarkMenuBackground)
+            : GetSysColor(selected ? COLOR_HIGHLIGHT : COLOR_MENU);
+        const COLORREF textColor = darkModeEnabled_
+            ? (disabled ? kDarkMenuDisabledText : kDarkMenuText)
+            : GetSysColor(disabled ? COLOR_GRAYTEXT : (selected ? COLOR_HIGHLIGHTTEXT : COLOR_MENUTEXT));
+        const COLORREF separatorColor = darkModeEnabled_ ? kDarkMenuSeparator : GetSysColor(COLOR_3DSHADOW);
+
+        HBRUSH backgroundBrush = CreateSolidBrush(backgroundColor);
+        if (backgroundBrush != nullptr) {
+            FillRect(drawItem->hDC, &drawItem->rcItem, backgroundBrush);
+            DeleteObject(backgroundBrush);
+        }
+
+        if (menuItem->separator) {
+            const int checkWidth = menuItem->reserveIconSpace
+                ? ScalePixelsForWindow(mainWindow_, kPopupMenuCheckWidth)
+                : 0;
+            const int padding = ScalePixelsForWindow(mainWindow_, kPopupMenuHorizontalPadding);
+            const int y = drawItem->rcItem.top + ((drawItem->rcItem.bottom - drawItem->rcItem.top) / 2);
+            HPEN separatorPen = CreatePen(PS_SOLID, 1, separatorColor);
+            HGDIOBJ previousPen = separatorPen != nullptr ? SelectObject(drawItem->hDC, separatorPen) : nullptr;
+            MoveToEx(drawItem->hDC, drawItem->rcItem.left + checkWidth + padding, y, nullptr);
+            LineTo(drawItem->hDC, drawItem->rcItem.right - padding, y);
+            if (previousPen != nullptr) {
+                SelectObject(drawItem->hDC, previousPen);
+            }
+            if (separatorPen != nullptr) {
+                DeleteObject(separatorPen);
+            }
+            return TRUE;
+        }
+
+        HGDIOBJ previousFont = SelectObject(
+            drawItem->hDC,
+            menuFont_ != nullptr ? menuFont_ : GetStockObject(DEFAULT_GUI_FONT));
+        SetBkMode(drawItem->hDC, TRANSPARENT);
+        SetTextColor(drawItem->hDC, textColor);
+
+        const int checkWidth = menuItem->reserveIconSpace
+            ? ScalePixelsForWindow(mainWindow_, kPopupMenuCheckWidth)
+            : 0;
+        const int padding = ScalePixelsForWindow(mainWindow_, kPopupMenuHorizontalPadding);
+        const int acceleratorGap = ScalePixelsForWindow(mainWindow_, kPopupMenuAcceleratorGap);
+
+        if (checked && menuItem->reserveIconSpace) {
+            RECT checkRect = drawItem->rcItem;
+            checkRect.right = checkRect.left + checkWidth;
+            const wchar_t checkMark[] = { 0x2713, L'\0' };
+            DrawTextW(
+                drawItem->hDC,
+                checkMark,
+                -1,
+                &checkRect,
+                DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+        }
+
+        std::wstring label;
+        std::wstring accelerator;
+        SplitMenuItemText(menuItem->text, label, accelerator);
+
+        RECT labelRect = drawItem->rcItem;
+        labelRect.left += checkWidth + padding;
+        labelRect.right -= padding;
+        if (!accelerator.empty()) {
+            labelRect.right -= acceleratorGap + MeasureText(drawItem->hDC, accelerator).cx;
+        }
+
+        DrawTextW(
+            drawItem->hDC,
+            label.c_str(),
+            -1,
+            &labelRect,
+            DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+
+        if (!accelerator.empty()) {
+            RECT acceleratorRect = drawItem->rcItem;
+            acceleratorRect.left = labelRect.right + acceleratorGap;
+            acceleratorRect.right -= padding;
+            DrawTextW(
+                drawItem->hDC,
+                accelerator.c_str(),
+                -1,
+                &acceleratorRect,
+                DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
+        }
+
+        if (previousFont != nullptr) {
+            SelectObject(drawItem->hDC, previousFont);
+        }
+
+        return TRUE;
+    }
+
     if (!darkModeEnabled_ || controlId != ID_VIEW_STATUS_BAR || statusBar_ == nullptr) {
         return 0;
     }
 
-    const auto* drawItem = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
-    if (drawItem == nullptr || drawItem->hwndItem != statusBar_ || drawItem->hDC == nullptr) {
+    if (drawItem->hwndItem != statusBar_) {
         return 0;
     }
 
@@ -1212,6 +1597,68 @@ LRESULT ClassicNotepadApp::HandleDrawItem(WPARAM controlId, LPARAM lParam) const
         DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
 
     DrawDarkStatusBarChrome(drawItem->hDC);
+    return TRUE;
+}
+
+LRESULT ClassicNotepadApp::HandleMeasureItem(WPARAM, LPARAM lParam) const
+{
+    auto* measureItem = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+    if (measureItem == nullptr || measureItem->CtlType != ODT_MENU) {
+        return 0;
+    }
+
+    const auto* menuItem = reinterpret_cast<const OwnerDrawMenuItem*>(measureItem->itemData);
+    if (menuItem == nullptr) {
+        return 0;
+    }
+
+    if (menuItem->separator) {
+        measureItem->itemWidth = static_cast<UINT>(ScalePixelsForWindow(mainWindow_, 96));
+        measureItem->itemHeight = static_cast<UINT>(ScalePixelsForWindow(mainWindow_, kPopupMenuSeparatorHeight));
+        return TRUE;
+    }
+
+    HDC deviceContext = GetDC(mainWindow_);
+    if (deviceContext == nullptr) {
+        measureItem->itemWidth = static_cast<UINT>(ScalePixelsForWindow(mainWindow_, 160));
+        measureItem->itemHeight = static_cast<UINT>(ScalePixelsForWindow(mainWindow_, kPopupMenuItemHeight));
+        return TRUE;
+    }
+
+    HGDIOBJ previousFont = SelectObject(
+        deviceContext,
+        menuFont_ != nullptr ? menuFont_ : GetStockObject(DEFAULT_GUI_FONT));
+
+    std::wstring label;
+    std::wstring accelerator;
+    SplitMenuItemText(menuItem->text, label, accelerator);
+    const SIZE labelSize = MeasureText(deviceContext, label);
+    const SIZE acceleratorSize = MeasureText(deviceContext, accelerator);
+
+    TEXTMETRICW textMetrics{};
+    GetTextMetricsW(deviceContext, &textMetrics);
+
+    if (previousFont != nullptr) {
+        SelectObject(deviceContext, previousFont);
+    }
+    ReleaseDC(mainWindow_, deviceContext);
+
+    const int padding = ScalePixelsForWindow(mainWindow_, kPopupMenuHorizontalPadding);
+    const int checkWidth = menuItem->reserveIconSpace
+        ? ScalePixelsForWindow(mainWindow_, kPopupMenuCheckWidth)
+        : 0;
+    const int acceleratorGap = accelerator.empty() ? 0 : ScalePixelsForWindow(mainWindow_, kPopupMenuAcceleratorGap);
+    const int minimumHeight = ScalePixelsForWindow(mainWindow_, kPopupMenuItemHeight);
+
+    measureItem->itemWidth = static_cast<UINT>(
+        checkWidth +
+        (padding * 2) +
+        labelSize.cx +
+        acceleratorGap +
+        acceleratorSize.cx);
+    measureItem->itemHeight = static_cast<UINT>(std::max(
+        minimumHeight,
+        static_cast<int>(textMetrics.tmHeight + textMetrics.tmExternalLeading + ScalePixelsForWindow(mainWindow_, 10))));
     return TRUE;
 }
 
@@ -2805,6 +3252,8 @@ bool ClassicNotepadApp::HandleEditorContextMenu(HWND editorWindow, LPARAM lParam
     if (popup == nullptr) {
         return true;
     }
+    std::vector<std::unique_ptr<OwnerDrawMenuItem>> contextMenuItems;
+    ApplyMenuBackground(popup);
 
     contextMenuWord_.clear();
     contextMenuWordStart_ = 0;
@@ -2817,38 +3266,49 @@ bool ClassicNotepadApp::HandleEditorContextMenu(HWND editorWindow, LPARAM lParam
 
         const std::vector<std::wstring> suggestions = spellChecker_.Suggest(contextMenuWord_, 5);
         if (suggestions.empty()) {
-            AppendMenuW(popup, MF_STRING | MF_GRAYED, kSpellMenuNoSuggestions, L"No spelling suggestions");
+            AppendOwnerDrawMenuItem(
+                popup,
+                MF_GRAYED,
+                kSpellMenuNoSuggestions,
+                L"No spelling suggestions",
+                contextMenuItems);
         } else {
             UINT commandId = kSpellMenuSuggestionBase;
             for (const std::wstring& suggestion : suggestions) {
-                AppendMenuW(popup, MF_STRING, commandId, suggestion.c_str());
+                AppendOwnerDrawMenuItem(popup, MF_ENABLED, commandId, suggestion, contextMenuItems);
                 ++commandId;
             }
         }
 
-        AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(popup, MF_STRING, kSpellMenuIgnoreOnce, L"Ignore Once");
-        AppendMenuW(popup, MF_STRING, kSpellMenuAddToDictionary, L"Add to Dictionary");
-        AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+        AppendOwnerDrawMenuSeparator(popup, contextMenuItems);
+        AppendOwnerDrawMenuItem(popup, MF_ENABLED, kSpellMenuIgnoreOnce, L"Ignore Once", contextMenuItems);
+        AppendOwnerDrawMenuItem(popup, MF_ENABLED, kSpellMenuAddToDictionary, L"Add to Dictionary", contextMenuItems);
+        AppendOwnerDrawMenuSeparator(popup, contextMenuItems);
     } else if (!spellCheckAvailable_) {
-        AppendMenuW(
+        AppendOwnerDrawMenuItem(
             popup,
-            MF_STRING | MF_GRAYED,
+            MF_GRAYED,
             kSpellMenuNoSuggestions,
-            L"British English spell checking is not installed");
-        AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+            L"British English spell checking is not installed",
+            contextMenuItems);
+        AppendOwnerDrawMenuSeparator(popup, contextMenuItems);
     }
 
     const bool hasSelection = HasSelection();
     const bool hasText = GetWindowTextLengthW(editor_) > 0;
-    AppendMenuW(popup, MF_STRING | (SendMessageW(editor_, EM_CANUNDO, 0, 0) != 0 ? MF_ENABLED : MF_GRAYED), ID_EDIT_UNDO, L"Undo");
-    AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(popup, MF_STRING | (hasSelection ? MF_ENABLED : MF_GRAYED), ID_EDIT_CUT, L"Cut");
-    AppendMenuW(popup, MF_STRING | (hasSelection ? MF_ENABLED : MF_GRAYED), ID_EDIT_COPY, L"Copy");
-    AppendMenuW(popup, MF_STRING | (CanPasteText() ? MF_ENABLED : MF_GRAYED), ID_EDIT_PASTE, L"Paste");
-    AppendMenuW(popup, MF_STRING | (hasSelection ? MF_ENABLED : MF_GRAYED), ID_EDIT_DELETE, L"Delete");
-    AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(popup, MF_STRING | (hasText ? MF_ENABLED : MF_GRAYED), ID_EDIT_SELECT_ALL, L"Select All");
+    AppendOwnerDrawMenuItem(
+        popup,
+        SendMessageW(editor_, EM_CANUNDO, 0, 0) != 0 ? MF_ENABLED : MF_GRAYED,
+        ID_EDIT_UNDO,
+        L"Undo",
+        contextMenuItems);
+    AppendOwnerDrawMenuSeparator(popup, contextMenuItems);
+    AppendOwnerDrawMenuItem(popup, hasSelection ? MF_ENABLED : MF_GRAYED, ID_EDIT_CUT, L"Cut", contextMenuItems);
+    AppendOwnerDrawMenuItem(popup, hasSelection ? MF_ENABLED : MF_GRAYED, ID_EDIT_COPY, L"Copy", contextMenuItems);
+    AppendOwnerDrawMenuItem(popup, CanPasteText() ? MF_ENABLED : MF_GRAYED, ID_EDIT_PASTE, L"Paste", contextMenuItems);
+    AppendOwnerDrawMenuItem(popup, hasSelection ? MF_ENABLED : MF_GRAYED, ID_EDIT_DELETE, L"Delete", contextMenuItems);
+    AppendOwnerDrawMenuSeparator(popup, contextMenuItems);
+    AppendOwnerDrawMenuItem(popup, hasText ? MF_ENABLED : MF_GRAYED, ID_EDIT_SELECT_ALL, L"Select All", contextMenuItems);
 
     const UINT selected = TrackPopupMenu(
         popup,
@@ -2861,14 +3321,14 @@ bool ClassicNotepadApp::HandleEditorContextMenu(HWND editorWindow, LPARAM lParam
 
     if (selected >= kSpellMenuSuggestionBase && selected <= kSpellMenuSuggestionMax) {
         MENUITEMINFOW itemInfo{};
-        std::array<wchar_t, 256> suggestionBuffer{};
         itemInfo.cbSize = sizeof(itemInfo);
-        itemInfo.fMask = MIIM_STRING;
-        itemInfo.dwTypeData = suggestionBuffer.data();
-        itemInfo.cch = static_cast<UINT>(suggestionBuffer.size() - 1);
+        itemInfo.fMask = MIIM_DATA;
         if (GetMenuItemInfoW(popup, selected, FALSE, &itemInfo)) {
-            SendMessageW(editor_, EM_SETSEL, contextMenuWordStart_, contextMenuWordStart_ + contextMenuWordLength_);
-            SendMessageW(editor_, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(suggestionBuffer.data()));
+            const auto* suggestionItem = reinterpret_cast<const OwnerDrawMenuItem*>(itemInfo.dwItemData);
+            if (suggestionItem != nullptr) {
+                SendMessageW(editor_, EM_SETSEL, contextMenuWordStart_, contextMenuWordStart_ + contextMenuWordLength_);
+                SendMessageW(editor_, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(suggestionItem->text.c_str()));
+            }
         }
     } else if (selected == kSpellMenuIgnoreOnce) {
         spellChecker_.Ignore(contextMenuWord_);
@@ -3836,6 +4296,16 @@ void ClassicNotepadApp::DestroyOwnedEditorFont()
     ownsEditorFont_ = false;
 }
 
+void ClassicNotepadApp::DestroyOwnedMenuFont()
+{
+    if (ownsMenuFont_ && menuFont_ != nullptr) {
+        DeleteObject(menuFont_);
+    }
+
+    menuFont_ = nullptr;
+    ownsMenuFont_ = false;
+}
+
 void ClassicNotepadApp::DestroyPrintDialogHandles()
 {
     if (pageSetupDevMode_ != nullptr) {
@@ -4114,6 +4584,14 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
         const LRESULT drawItemResult = HandleDrawItem(wParam, lParam);
         if (drawItemResult != 0) {
             return drawItemResult;
+        }
+        break;
+    }
+
+    case WM_MEASUREITEM: {
+        const LRESULT measureItemResult = HandleMeasureItem(wParam, lParam);
+        if (measureItemResult != 0) {
+            return measureItemResult;
         }
         break;
     }
