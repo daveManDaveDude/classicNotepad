@@ -24,6 +24,7 @@ namespace {
 constexpr wchar_t kMainWindowClass[] = L"ClassicNotepadMainWindow";
 constexpr wchar_t kMenuBarClass[] = L"ClassicNotepadMenuBar";
 constexpr wchar_t kScrollBarClass[] = L"ClassicNotepadScrollBar";
+constexpr wchar_t kMessageDialogClass[] = L"ClassicNotepadMessageDialog";
 constexpr wchar_t kAppTitle[] = L"Untitled - Classic Notepad";
 constexpr wchar_t kFileDialogFilter[] = L"Text Documents (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
 constexpr wchar_t kFindReplaceMessageName[] = L"commdlg_FindReplace";
@@ -99,6 +100,32 @@ struct FontFamilySearch {
     const wchar_t* faceName = nullptr;
     bool found = false;
 };
+
+struct MessageDialogButton {
+    int id = IDOK;
+    std::wstring text;
+    RECT rect {};
+    bool defaultButton = false;
+};
+
+struct MessageDialogState {
+    HINSTANCE instance = nullptr;
+    HWND owner = nullptr;
+    std::wstring title;
+    std::wstring message;
+    UINT flags = MB_OK;
+    bool darkMode = false;
+    int result = IDCANCEL;
+    bool done = false;
+    HFONT font = nullptr;
+    HICON icon = nullptr;
+    SIZE clientSize {};
+    RECT iconRect {};
+    RECT messageRect {};
+    std::vector<MessageDialogButton> buttons;
+};
+
+LRESULT CALLBACK MessageDialogWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
 
 int CALLBACK EnumFontFamilyMatchProc(const LOGFONTW* logFont, const TEXTMETRICW*, DWORD, LPARAM lParam)
 {
@@ -761,6 +788,574 @@ HFONT CreateMenuFont(HWND ownerWindow)
     wcscpy_s(logFont.lfFaceName, faceName);
 
     return CreateFontIndirectW(&logFont);
+}
+
+HFONT CreateMessageDialogFont(HWND ownerWindow)
+{
+    NONCLIENTMETRICSW metrics{};
+    metrics.cbSize = sizeof(metrics);
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0)) {
+        return CreateFontIndirectW(&metrics.lfMessageFont);
+    }
+
+    LOGFONTW logFont{};
+    if (GetObjectW(GetStockObject(DEFAULT_GUI_FONT), sizeof(logFont), &logFont) != 0) {
+        return CreateFontIndirectW(&logFont);
+    }
+
+    return CreateMenuFont(ownerWindow);
+}
+
+std::vector<MessageDialogButton> BuildMessageDialogButtons(UINT flags)
+{
+    std::vector<MessageDialogButton> buttons;
+    switch (flags & MB_TYPEMASK) {
+    case MB_OKCANCEL:
+        buttons.push_back({ IDOK, L"OK" });
+        buttons.push_back({ IDCANCEL, L"Cancel" });
+        break;
+
+    case MB_YESNO:
+        buttons.push_back({ IDYES, L"Yes" });
+        buttons.push_back({ IDNO, L"No" });
+        break;
+
+    case MB_YESNOCANCEL:
+        buttons.push_back({ IDYES, L"Yes" });
+        buttons.push_back({ IDNO, L"No" });
+        buttons.push_back({ IDCANCEL, L"Cancel" });
+        break;
+
+    default:
+        buttons.push_back({ IDOK, L"OK" });
+        break;
+    }
+
+    const UINT defaultMask = flags & MB_DEFMASK;
+    std::size_t defaultIndex = 0;
+    if (defaultMask == MB_DEFBUTTON2) {
+        defaultIndex = 1;
+    } else if (defaultMask == MB_DEFBUTTON3) {
+        defaultIndex = 2;
+    } else if (defaultMask == MB_DEFBUTTON4) {
+        defaultIndex = 3;
+    }
+
+    if (defaultIndex >= buttons.size()) {
+        defaultIndex = 0;
+    }
+
+    buttons[defaultIndex].defaultButton = true;
+    return buttons;
+}
+
+HICON LoadMessageDialogIcon(UINT flags)
+{
+    const UINT icon = flags & MB_ICONMASK;
+    if (icon == MB_ICONERROR) {
+        return LoadIconW(nullptr, IDI_ERROR);
+    }
+    if (icon == MB_ICONWARNING) {
+        return LoadIconW(nullptr, IDI_WARNING);
+    }
+    if (icon == MB_ICONINFORMATION) {
+        return LoadIconW(nullptr, IDI_INFORMATION);
+    }
+    if (icon == MB_ICONQUESTION) {
+        return LoadIconW(nullptr, IDI_QUESTION);
+    }
+
+    return nullptr;
+}
+
+bool MessageDialogHasButton(const MessageDialogState& state, int id)
+{
+    for (const MessageDialogButton& button : state.buttons) {
+        if (button.id == id) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+int GetMessageDialogDefaultResult(const MessageDialogState& state)
+{
+    for (const MessageDialogButton& button : state.buttons) {
+        if (button.defaultButton) {
+            return button.id;
+        }
+    }
+
+    return state.buttons.empty() ? IDCANCEL : state.buttons.front().id;
+}
+
+int GetMessageDialogCloseResult(const MessageDialogState& state)
+{
+    if (MessageDialogHasButton(state, IDCANCEL)) {
+        return IDCANCEL;
+    }
+    if (MessageDialogHasButton(state, IDNO)) {
+        return IDNO;
+    }
+    if (MessageDialogHasButton(state, IDOK)) {
+        return IDOK;
+    }
+
+    return state.buttons.empty() ? IDCANCEL : state.buttons.front().id;
+}
+
+MessageDialogButton* FindMessageDialogButton(MessageDialogState& state, int id)
+{
+    for (MessageDialogButton& button : state.buttons) {
+        if (button.id == id) {
+            return &button;
+        }
+    }
+
+    return nullptr;
+}
+
+COLORREF MessageDialogBackgroundColor(bool darkMode)
+{
+    return darkMode ? kDarkMenuBackground : GetSysColor(COLOR_3DFACE);
+}
+
+COLORREF MessageDialogTextColor(bool darkMode)
+{
+    return darkMode ? kDarkMenuText : GetSysColor(COLOR_WINDOWTEXT);
+}
+
+HGDIOBJ MessageDialogFontObject(const MessageDialogState& state)
+{
+    return state.font != nullptr
+        ? reinterpret_cast<HGDIOBJ>(state.font)
+        : GetStockObject(DEFAULT_GUI_FONT);
+}
+
+void LayoutMessageDialog(MessageDialogState& state)
+{
+    const int paddingX = ScalePixelsForWindow(state.owner, 24);
+    const int paddingY = ScalePixelsForWindow(state.owner, 22);
+    const int iconTextGap = ScalePixelsForWindow(state.owner, 16);
+    const int buttonGap = ScalePixelsForWindow(state.owner, 8);
+    const int buttonWidth = ScalePixelsForWindow(state.owner, 88);
+    const int buttonHeight = ScalePixelsForWindow(state.owner, 32);
+    const int buttonTopGap = ScalePixelsForWindow(state.owner, 24);
+    const int iconSize = state.icon != nullptr ? ScalePixelsForWindow(state.owner, 32) : 0;
+    const int minClientWidth = ScalePixelsForWindow(state.owner, 330);
+    const int maxTextWidth = ScalePixelsForWindow(state.owner, 460);
+
+    int textHeight = ScalePixelsForWindow(state.owner, 18);
+    int textWidth = ScalePixelsForWindow(state.owner, 1);
+    HDC deviceContext = GetDC(state.owner);
+    HGDIOBJ previousFont = nullptr;
+    if (deviceContext != nullptr) {
+        previousFont = SelectObject(
+            deviceContext,
+            MessageDialogFontObject(state));
+
+        RECT measureRect{ 0, 0, maxTextWidth, 0 };
+        DrawTextW(
+            deviceContext,
+            state.message.c_str(),
+            -1,
+            &measureRect,
+            DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
+        textWidth = std::max(
+            ScalePixelsForWindow(state.owner, 1),
+            static_cast<int>(measureRect.right - measureRect.left));
+        textHeight = std::max(
+            ScalePixelsForWindow(state.owner, 18),
+            static_cast<int>(measureRect.bottom - measureRect.top));
+
+        if (previousFont != nullptr) {
+            SelectObject(deviceContext, previousFont);
+        }
+        ReleaseDC(state.owner, deviceContext);
+    }
+
+    const int textLeft = paddingX + (iconSize > 0 ? iconSize + iconTextGap : 0);
+    const int contentWidth = textLeft + textWidth + paddingX;
+    const int buttonCount = static_cast<int>(state.buttons.size());
+    const int totalButtonWidth =
+        buttonCount > 0 ? (buttonCount * buttonWidth) + ((buttonCount - 1) * buttonGap) : 0;
+    const int clientWidth = std::max(minClientWidth, std::max(contentWidth, totalButtonWidth + (paddingX * 2)));
+    const int contentHeight = std::max(iconSize, textHeight);
+    const int buttonY = paddingY + contentHeight + buttonTopGap;
+    int buttonX = clientWidth - paddingX - totalButtonWidth;
+
+    state.clientSize = { clientWidth, buttonY + buttonHeight + paddingY };
+    state.iconRect = {
+        paddingX,
+        paddingY,
+        paddingX + iconSize,
+        paddingY + iconSize
+    };
+    state.messageRect = {
+        textLeft,
+        paddingY,
+        clientWidth - paddingX,
+        paddingY + textHeight
+    };
+
+    for (MessageDialogButton& button : state.buttons) {
+        button.rect = { buttonX, buttonY, buttonX + buttonWidth, buttonY + buttonHeight };
+        buttonX += buttonWidth + buttonGap;
+    }
+}
+
+bool RegisterMessageDialogClass(HINSTANCE instance)
+{
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.lpfnWndProc = MessageDialogWindowProc;
+    windowClass.hInstance = instance;
+    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.lpszClassName = kMessageDialogClass;
+    windowClass.hbrBackground = nullptr;
+
+    return RegisterClassExW(&windowClass) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+}
+
+POINT GetCenteredMessageDialogPosition(HWND owner, int width, int height)
+{
+    RECT workArea{};
+    MONITORINFO monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &monitorInfo)) {
+        workArea = monitorInfo.rcWork;
+    } else {
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    }
+
+    RECT ownerRect = workArea;
+    if (owner != nullptr && IsWindow(owner)) {
+        GetWindowRect(owner, &ownerRect);
+    }
+
+    POINT position{
+        ownerRect.left + (((ownerRect.right - ownerRect.left) - width) / 2),
+        ownerRect.top + (((ownerRect.bottom - ownerRect.top) - height) / 2)
+    };
+
+    const int minimumX = static_cast<int>(workArea.left);
+    const int minimumY = static_cast<int>(workArea.top);
+    const int maximumX = static_cast<int>(workArea.right) - width;
+    const int maximumY = static_cast<int>(workArea.bottom) - height;
+    position.x = std::max(minimumX, std::min(static_cast<int>(position.x), maximumX));
+    position.y = std::max(minimumY, std::min(static_cast<int>(position.y), maximumY));
+    return position;
+}
+
+void CompleteMessageDialog(HWND window, MessageDialogState& state, int result)
+{
+    state.result = result;
+    state.done = true;
+    DestroyWindow(window);
+}
+
+bool DrawMessageDialogButton(MessageDialogState& state, DRAWITEMSTRUCT* drawItem)
+{
+    if (drawItem == nullptr) {
+        return false;
+    }
+
+    MessageDialogButton* button = FindMessageDialogButton(state, static_cast<int>(drawItem->CtlID));
+    if (button == nullptr) {
+        return false;
+    }
+
+    const bool pressed = (drawItem->itemState & ODS_SELECTED) != 0;
+    const bool focused = (drawItem->itemState & ODS_FOCUS) != 0;
+    const bool disabled = (drawItem->itemState & ODS_DISABLED) != 0;
+    const COLORREF fillColor = state.darkMode
+        ? (pressed ? kDarkMenuActiveBackground : kDarkMenuHotBackground)
+        : GetSysColor(pressed ? COLOR_3DSHADOW : COLOR_BTNFACE);
+    const COLORREF borderColor = button->defaultButton
+        ? RGB(0, 120, 215)
+        : (state.darkMode ? kDarkMenuSeparator : GetSysColor(COLOR_3DSHADOW));
+    const COLORREF textColor = disabled
+        ? (state.darkMode ? kDarkMenuDisabledText : GetSysColor(COLOR_GRAYTEXT))
+        : MessageDialogTextColor(state.darkMode);
+
+    HBRUSH fillBrush = CreateSolidBrush(fillColor);
+    FillRect(drawItem->hDC, &drawItem->rcItem, fillBrush);
+    DeleteObject(fillBrush);
+
+    RECT borderRect = drawItem->rcItem;
+    HBRUSH borderBrush = CreateSolidBrush(borderColor);
+    FrameRect(drawItem->hDC, &borderRect, borderBrush);
+    if (button->defaultButton) {
+        InflateRect(&borderRect, -1, -1);
+        FrameRect(drawItem->hDC, &borderRect, borderBrush);
+    }
+    DeleteObject(borderBrush);
+
+    RECT textRect = drawItem->rcItem;
+    InflateRect(&textRect, -ScalePixelsForWindow(state.owner, 8), 0);
+    SetBkMode(drawItem->hDC, TRANSPARENT);
+    SetTextColor(drawItem->hDC, textColor);
+    HGDIOBJ previousFont = SelectObject(
+        drawItem->hDC,
+        MessageDialogFontObject(state));
+    DrawTextW(
+        drawItem->hDC,
+        button->text.c_str(),
+        -1,
+        &textRect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if (previousFont != nullptr) {
+        SelectObject(drawItem->hDC, previousFont);
+    }
+
+    if (focused) {
+        RECT focusRect = drawItem->rcItem;
+        InflateRect(&focusRect, -ScalePixelsForWindow(state.owner, 4), -ScalePixelsForWindow(state.owner, 4));
+        DrawFocusRect(drawItem->hDC, &focusRect);
+    }
+
+    return true;
+}
+
+void PaintMessageDialog(HWND window, MessageDialogState& state)
+{
+    PAINTSTRUCT paint{};
+    HDC deviceContext = BeginPaint(window, &paint);
+
+    RECT clientRect{};
+    GetClientRect(window, &clientRect);
+    HBRUSH backgroundBrush = CreateSolidBrush(MessageDialogBackgroundColor(state.darkMode));
+    FillRect(deviceContext, &clientRect, backgroundBrush);
+    DeleteObject(backgroundBrush);
+
+    if (state.icon != nullptr) {
+        const int iconWidth = std::max(0, static_cast<int>(state.iconRect.right - state.iconRect.left));
+        const int iconHeight = std::max(0, static_cast<int>(state.iconRect.bottom - state.iconRect.top));
+        DrawIconEx(
+            deviceContext,
+            state.iconRect.left,
+            state.iconRect.top,
+            state.icon,
+            iconWidth,
+            iconHeight,
+            0,
+            nullptr,
+            DI_NORMAL);
+    }
+
+    SetBkMode(deviceContext, TRANSPARENT);
+    SetTextColor(deviceContext, MessageDialogTextColor(state.darkMode));
+    HGDIOBJ previousFont = SelectObject(
+        deviceContext,
+        MessageDialogFontObject(state));
+    RECT textRect = state.messageRect;
+    DrawTextW(
+        deviceContext,
+        state.message.c_str(),
+        -1,
+        &textRect,
+        DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
+    if (previousFont != nullptr) {
+        SelectObject(deviceContext, previousFont);
+    }
+
+    EndPaint(window, &paint);
+}
+
+LRESULT CALLBACK MessageDialogWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    MessageDialogState* state = reinterpret_cast<MessageDialogState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+
+    if (message == WM_NCCREATE) {
+        auto* createStruct = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        state = static_cast<MessageDialogState*>(createStruct->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+    }
+
+    if (state == nullptr) {
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+
+    switch (message) {
+    case WM_CREATE:
+        ApplyDarkTitleBar(window, state->darkMode);
+        for (const MessageDialogButton& button : state->buttons) {
+            HWND buttonWindow = CreateWindowExW(
+                0,
+                L"BUTTON",
+                button.text.c_str(),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW |
+                    (button.defaultButton ? BS_DEFPUSHBUTTON : BS_PUSHBUTTON),
+                button.rect.left,
+                button.rect.top,
+                button.rect.right - button.rect.left,
+                button.rect.bottom - button.rect.top,
+                window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(button.id)),
+                state->instance,
+                nullptr);
+            if (buttonWindow != nullptr && state->font != nullptr) {
+                SendMessageW(buttonWindow, WM_SETFONT, reinterpret_cast<WPARAM>(state->font), TRUE);
+            }
+        }
+        return 0;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+        PaintMessageDialog(window, *state);
+        return 0;
+
+    case WM_DRAWITEM:
+        if (DrawMessageDialogButton(*state, reinterpret_cast<DRAWITEMSTRUCT*>(lParam))) {
+            return TRUE;
+        }
+        break;
+
+    case WM_COMMAND:
+        if (HIWORD(wParam) == BN_CLICKED && FindMessageDialogButton(*state, LOWORD(wParam)) != nullptr) {
+            CompleteMessageDialog(window, *state, LOWORD(wParam));
+            return 0;
+        }
+        break;
+
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            CompleteMessageDialog(window, *state, GetMessageDialogCloseResult(*state));
+            return 0;
+        }
+        if (wParam == VK_RETURN) {
+            CompleteMessageDialog(window, *state, GetMessageDialogDefaultResult(*state));
+            return 0;
+        }
+        break;
+
+    case WM_CLOSE:
+        CompleteMessageDialog(window, *state, GetMessageDialogCloseResult(*state));
+        return 0;
+
+    default:
+        break;
+    }
+
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+int ShowThemedMessageDialog(
+    HWND owner,
+    HINSTANCE instance,
+    const std::wstring& message,
+    const std::wstring& title,
+    UINT flags,
+    bool darkMode)
+{
+    if (!darkMode) {
+        return MessageBoxW(owner, message.c_str(), title.c_str(), flags);
+    }
+
+    MessageDialogState state{};
+    state.instance = instance;
+    state.owner = owner;
+    state.title = title;
+    state.message = message;
+    state.flags = flags;
+    state.darkMode = darkMode;
+    state.buttons = BuildMessageDialogButtons(flags);
+    state.result = GetMessageDialogCloseResult(state);
+    state.font = CreateMessageDialogFont(owner);
+    state.icon = LoadMessageDialogIcon(flags);
+    LayoutMessageDialog(state);
+
+    if (!RegisterMessageDialogClass(instance)) {
+        if (state.font != nullptr) {
+            DeleteObject(state.font);
+        }
+        return MessageBoxW(owner, message.c_str(), title.c_str(), flags);
+    }
+
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    const DWORD exStyle = WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CONTROLPARENT;
+    RECT windowRect{ 0, 0, state.clientSize.cx, state.clientSize.cy };
+    AdjustWindowRectEx(&windowRect, style, FALSE, exStyle);
+    const int windowWidth = windowRect.right - windowRect.left;
+    const int windowHeight = windowRect.bottom - windowRect.top;
+    const POINT position = GetCenteredMessageDialogPosition(owner, windowWidth, windowHeight);
+
+    HWND window = CreateWindowExW(
+        exStyle,
+        kMessageDialogClass,
+        state.title.c_str(),
+        style,
+        position.x,
+        position.y,
+        windowWidth,
+        windowHeight,
+        owner,
+        nullptr,
+        instance,
+        &state);
+
+    if (window == nullptr) {
+        if (state.font != nullptr) {
+            DeleteObject(state.font);
+        }
+        return MessageBoxW(owner, message.c_str(), title.c_str(), flags);
+    }
+
+    const bool enableOwnerAfterDialog = owner != nullptr && IsWindow(owner) && IsWindowEnabled(owner) != FALSE;
+    HWND previousFocus = GetFocus();
+    if (enableOwnerAfterDialog) {
+        EnableWindow(owner, FALSE);
+    }
+
+    ShowWindow(window, SW_SHOW);
+    UpdateWindow(window);
+
+    for (const MessageDialogButton& button : state.buttons) {
+        if (button.defaultButton) {
+            HWND defaultButton = GetDlgItem(window, button.id);
+            if (defaultButton != nullptr) {
+                SetFocus(defaultButton);
+            }
+            break;
+        }
+    }
+
+    MSG dialogMessage{};
+    while (!state.done && IsWindow(window)) {
+        const BOOL messageResult = GetMessageW(&dialogMessage, nullptr, 0, 0);
+        if (messageResult == -1) {
+            break;
+        }
+        if (messageResult == 0) {
+            PostQuitMessage(static_cast<int>(dialogMessage.wParam));
+            break;
+        }
+
+        if (!IsDialogMessageW(window, &dialogMessage)) {
+            TranslateMessage(&dialogMessage);
+            DispatchMessageW(&dialogMessage);
+        }
+    }
+
+    if (IsWindow(window)) {
+        DestroyWindow(window);
+    }
+
+    if (enableOwnerAfterDialog) {
+        EnableWindow(owner, TRUE);
+        SetActiveWindow(owner);
+    }
+    if (previousFocus != nullptr && IsWindow(previousFocus)) {
+        SetFocus(previousFocus);
+    }
+    if (state.font != nullptr) {
+        DeleteObject(state.font);
+    }
+
+    return state.result;
 }
 
 HFONT CreatePrinterFont(HDC printerDc, HFONT sourceFont, HWND ownerWindow)
@@ -3408,10 +4003,8 @@ void ClassicNotepadApp::ShowSpellingUnavailableMessage()
     }
 
     spellCheckMessageShown_ = true;
-    MessageBoxW(
-        mainWindow_,
+    ShowMessageDialog(
         L"British English spell checking is not installed for Windows.",
-        L"Classic Notepad",
         MB_OK | MB_ICONINFORMATION);
 }
 
@@ -3596,7 +4189,7 @@ void ClassicNotepadApp::ShowAboutDialog()
             L"Single-document editor with classic menus, file open/save, find/replace, Go To, word wrap, font selection, status bar, page setup, print, dark mode, and Windows spell checking.\n\n"
             L"No tabs, cloud features, telemetry, or modern editor extras.";
 
-        MessageBoxW(mainWindow_, message.c_str(), L"About Classic Notepad", MB_OK | MB_ICONINFORMATION);
+        ShowMessageDialog(message, MB_OK | MB_ICONINFORMATION);
     }
 }
 
@@ -3629,11 +4222,7 @@ bool ClassicNotepadApp::ConfirmCreateMissingFile(const std::wstring& path) const
     prompt += path;
     prompt += L" file.\n\nDo you want to create a new file?";
 
-    return MessageBoxW(
-        mainWindow_,
-        prompt.c_str(),
-        L"Classic Notepad",
-        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1) == IDYES;
+    return ShowMessageDialog(prompt, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1) == IDYES;
 }
 
 void ClassicNotepadApp::HandleEditorChanged()
@@ -3974,7 +4563,7 @@ void ClassicNotepadApp::HandleToggleWordWrap()
 
     editor_ = CreateEditor();
     if (editor_ == nullptr) {
-        MessageBoxW(mainWindow_, L"Could not recreate the editor control.", L"Classic Notepad", MB_OK | MB_ICONERROR);
+        ShowMessageDialog(L"Could not recreate the editor control.", MB_OK | MB_ICONERROR);
         DestroyWindow(mainWindow_);
         return;
     }
@@ -4085,11 +4674,7 @@ bool ClassicNotepadApp::ConfirmSaveChanges()
     prompt += document_.DisplayName();
     prompt += L"?";
 
-    const int result = MessageBoxW(
-        mainWindow_,
-        prompt.c_str(),
-        L"Classic Notepad",
-        MB_YESNOCANCEL | MB_ICONWARNING);
+    const int result = ShowMessageDialog(prompt, MB_YESNOCANCEL | MB_ICONWARNING);
 
     if (result == IDYES) {
         return HandleSave();
@@ -4225,7 +4810,7 @@ bool ClassicNotepadApp::FindNextWithFlags(DWORD flags, bool showNotFoundMessage,
             std::wstring message = L"Cannot find \"";
             message += needle;
             message += L"\".";
-            MessageBoxW(mainWindow_, message.c_str(), L"Classic Notepad", MB_OK | MB_ICONINFORMATION);
+            ShowMessageDialog(message, MB_OK | MB_ICONINFORMATION);
         }
         return false;
     }
@@ -4280,7 +4865,7 @@ bool ClassicNotepadApp::FindNextWithFlags(DWORD flags, bool showNotFoundMessage,
         std::wstring message = L"Cannot find \"";
         message += needle;
         message += L"\".";
-        MessageBoxW(mainWindow_, message.c_str(), L"Classic Notepad", MB_OK | MB_ICONINFORMATION);
+        ShowMessageDialog(message, MB_OK | MB_ICONINFORMATION);
     }
 
     return false;
@@ -4327,7 +4912,7 @@ void ClassicNotepadApp::ReplaceAllMatches(DWORD flags)
         std::wstring message = L"Cannot find \"";
         message += needle;
         message += L"\".";
-        MessageBoxW(mainWindow_, message.c_str(), L"Classic Notepad", MB_OK | MB_ICONINFORMATION);
+        ShowMessageDialog(message, MB_OK | MB_ICONINFORMATION);
         return;
     }
 
@@ -4705,7 +5290,12 @@ std::wstring ClassicNotepadApp::ShowSaveFileDialog()
 
 void ClassicNotepadApp::ShowError(const std::wstring& message)
 {
-    MessageBoxW(mainWindow_, message.c_str(), L"Classic Notepad", MB_OK | MB_ICONERROR);
+    ShowMessageDialog(message, MB_OK | MB_ICONERROR);
+}
+
+int ClassicNotepadApp::ShowMessageDialog(const std::wstring& message, UINT flags) const
+{
+    return ShowThemedMessageDialog(mainWindow_, instance_, message, L"Classic Notepad", flags, darkModeEnabled_);
 }
 
 LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)

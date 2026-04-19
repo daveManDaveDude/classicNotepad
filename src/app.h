@@ -194,6 +194,7 @@ private:
     std::wstring BuildTimeDateText() const;
     std::wstring ShowOpenFileDialog();
     std::wstring ShowSaveFileDialog();
+    int ShowMessageDialog(const std::wstring& message, UINT flags) const;
     void ShowError(const std::wstring& message);
 
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
