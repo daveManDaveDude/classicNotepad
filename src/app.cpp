@@ -77,8 +77,10 @@ constexpr COLORREF kDwmDefaultColor = 0xFFFFFFFF;
 constexpr int kAboutIconSizePixels = 72;
 constexpr int kStatusBarPartCount = 4;
 constexpr int kStatusBarHorizontalPadding = 12;
+constexpr int kStatusBarExtraPartRoom = 20;
 constexpr int kStatusBarSeparatorInset = 7;
 constexpr int kStatusBarMinHeight = 32;
+constexpr std::array<int, kStatusBarPartCount - 1> kStatusBarPartRightPercents{ 18, 40, 62 };
 
 struct GoToDialogState {
     int currentLine = 1;
@@ -2880,18 +2882,44 @@ void ClassicNotepadApp::UpdateStatusBarPartLayout()
     }
 
     std::array<int, kStatusBarPartCount> partRights{};
-    int right = 0;
     const int horizontalPadding = ScalePixelsForWindow(statusBar_, kStatusBarHorizontalPadding);
+    const int extraPartRoom = ScalePixelsForWindow(statusBar_, kStatusBarExtraPartRoom);
+
+    std::array<int, kStatusBarPartCount> minimumWidths{};
     for (int index = 0; index < kStatusBarPartCount; ++index) {
-        if (index + 1 == kStatusBarPartCount) {
-            partRights[static_cast<std::size_t>(index)] = -1;
-            break;
+        const SIZE textSize = MeasureText(deviceContext, statusBarParts_[static_cast<std::size_t>(index)]);
+        minimumWidths[static_cast<std::size_t>(index)] = textSize.cx + (horizontalPadding * 2) + extraPartRoom;
+    }
+
+    RECT statusRect{};
+    GetClientRect(statusBar_, &statusRect);
+    const int statusWidth = std::max(0, static_cast<int>(statusRect.right - statusRect.left));
+    const RECT gripRect = GetStatusBarResizeGripRect();
+    const int gripWidth = IsRectEmpty(&gripRect)
+        ? 0
+        : std::max(0, static_cast<int>(gripRect.right - gripRect.left));
+    const int usableWidth = std::max(0, statusWidth - gripWidth);
+
+    int previousRight = 0;
+    for (int index = 0; index < kStatusBarPartCount - 1; ++index) {
+        int remainingMinimum = minimumWidths.back();
+        for (int nextIndex = index + 1; nextIndex < kStatusBarPartCount - 1; ++nextIndex) {
+            remainingMinimum += minimumWidths[static_cast<std::size_t>(nextIndex)];
         }
 
-        const SIZE textSize = MeasureText(deviceContext, statusBarParts_[static_cast<std::size_t>(index)]);
-        right += textSize.cx + (horizontalPadding * 2);
+        const int minimumRight = previousRight + minimumWidths[static_cast<std::size_t>(index)];
+        const int maximumRight = usableWidth > 0 ? usableWidth - remainingMinimum : minimumRight;
+        const int preferredRight = usableWidth > 0
+            ? MulDiv(usableWidth, kStatusBarPartRightPercents[static_cast<std::size_t>(index)], 100)
+            : minimumRight;
+        const int right = maximumRight >= minimumRight
+            ? std::clamp(preferredRight, minimumRight, maximumRight)
+            : minimumRight;
+
         partRights[static_cast<std::size_t>(index)] = right;
+        previousRight = right;
     }
+    partRights.back() = -1;
 
     if (previousFont != nullptr) {
         SelectObject(deviceContext, previousFont);
