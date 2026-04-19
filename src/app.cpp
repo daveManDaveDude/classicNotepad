@@ -34,6 +34,12 @@ constexpr UINT kSpellMenuSuggestionMax = 50004;
 constexpr UINT kSpellMenuNoSuggestions = 50005;
 constexpr UINT kSpellMenuIgnoreOnce = 50006;
 constexpr UINT kSpellMenuAddToDictionary = 50007;
+constexpr int kSpellCheckVisibleLineMargin = 3;
+constexpr std::size_t kMaxVisibleSpellCheckChars = 96U * 1024U;
+constexpr int kFullDocumentWidthScanCharLimit = 256 * 1024;
+constexpr int kExactLineWidthMeasureCharLimit = 4096;
+constexpr int kMaxEditorLineFetchChars = 0xFFFE;
+constexpr int kExactStatusCharacterCountLimit = 256 * 1024;
 constexpr int kDefaultEditorFontPointSize = 11;
 constexpr wchar_t kDefaultEditorFontFace[] = L"Consolas";
 constexpr COLORREF kDarkEditorBackground = RGB(32, 32, 32);
@@ -65,6 +71,19 @@ struct GoToDialogState {
 bool IsWordCharacter(wchar_t character)
 {
     return std::iswalnum(static_cast<wint_t>(character)) != 0 || character == L'_';
+}
+
+int SaturatingTextWidthEstimate(int characterCount, int averageCharacterWidth)
+{
+    if (characterCount <= 0 || averageCharacterWidth <= 0) {
+        return 0;
+    }
+
+    if (characterCount > std::numeric_limits<int>::max() / averageCharacterWidth) {
+        return std::numeric_limits<int>::max();
+    }
+
+    return characterCount * averageCharacterWidth;
 }
 
 bool GetChildWindowRect(HWND window, RECT& rect)
@@ -1196,6 +1215,7 @@ void ClassicNotepadApp::ResizeEditor()
     }
 
     UpdateScrollBars();
+    RefreshSpellCheck(false);
 }
 
 RECT ClassicNotepadApp::GetEditorHostRect()
@@ -1456,6 +1476,130 @@ void ClassicNotepadApp::UpdateScrollBars()
     updatingScrollBars_ = false;
 }
 
+void ClassicNotepadApp::InvalidateWidestLineCache()
+{
+    cachedWidestLineWidth_ = 0;
+    widestLineCacheDirty_ = true;
+}
+
+int ClassicNotepadApp::GetVisibleEditorLineCount(int lineMargin) const
+{
+    if (editor_ == nullptr) {
+        return std::max(1, lineMargin * 2 + 1);
+    }
+
+    RECT clientRect{};
+    GetClientRect(editor_, &clientRect);
+    const int clientHeight = std::max(0, static_cast<int>(clientRect.bottom - clientRect.top));
+    const int lineHeight = GetEditorLineHeight();
+    const int visibleLines = std::max(1, (clientHeight + lineHeight - 1) / lineHeight + 1);
+    return visibleLines + std::max(0, lineMargin) * 2;
+}
+
+int ClassicNotepadApp::GetLastVisibleEditorLine(int lineMargin) const
+{
+    if (editor_ == nullptr) {
+        return 0;
+    }
+
+    const int lineCount = std::max<int>(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
+    const int firstVisibleLine = std::clamp(
+        static_cast<int>(SendMessageW(editor_, EM_GETFIRSTVISIBLELINE, 0, 0)),
+        0,
+        std::max(0, lineCount - 1));
+    const int startLine = std::max(0, firstVisibleLine - std::max(0, lineMargin));
+    return std::min(lineCount - 1, startLine + GetVisibleEditorLineCount(lineMargin) - 1);
+}
+
+std::wstring ClassicNotepadApp::GetEditorLineText(int line, int lengthLimit) const
+{
+    if (editor_ == nullptr || lengthLimit <= 0) {
+        return {};
+    }
+
+    const int bufferLength = std::clamp(lengthLimit, 0, kMaxEditorLineFetchChars);
+    if (bufferLength <= 0) {
+        return {};
+    }
+
+    std::vector<wchar_t> buffer(static_cast<std::size_t>(bufferLength) + 1U, L'\0');
+    *reinterpret_cast<WORD*>(buffer.data()) = static_cast<WORD>(bufferLength);
+    const LRESULT copied = SendMessageW(editor_, EM_GETLINE, static_cast<WPARAM>(line), reinterpret_cast<LPARAM>(buffer.data()));
+    if (copied <= 0) {
+        return {};
+    }
+
+    return std::wstring(
+        buffer.data(),
+        static_cast<std::size_t>(std::min<int>(static_cast<int>(copied), bufferLength)));
+}
+
+bool ClassicNotepadApp::GetVisibleEditorText(std::wstring& text, DWORD& rangeStart) const
+{
+    text.clear();
+    rangeStart = 0;
+
+    if (editor_ == nullptr || GetWindowTextLengthW(editor_) <= 0) {
+        return false;
+    }
+
+    const int lineCount = std::max<int>(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
+    const int firstVisibleLine = std::clamp(
+        static_cast<int>(SendMessageW(editor_, EM_GETFIRSTVISIBLELINE, 0, 0)),
+        0,
+        std::max(0, lineCount - 1));
+    const int startLine = std::max(0, firstVisibleLine - kSpellCheckVisibleLineMargin);
+    const int endLine = GetLastVisibleEditorLine(kSpellCheckVisibleLineMargin);
+
+    const LRESULT startResult = SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(startLine), 0);
+    if (startResult < 0) {
+        return false;
+    }
+
+    rangeStart = static_cast<DWORD>(startResult);
+    DWORD expectedPosition = rangeStart;
+    text.reserve(std::min<std::size_t>(kMaxVisibleSpellCheckChars, 4096U));
+
+    for (int line = startLine; line <= endLine && text.size() < kMaxVisibleSpellCheckChars; ++line) {
+        const LRESULT lineStartResult = SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(line), 0);
+        if (lineStartResult < 0) {
+            continue;
+        }
+
+        const DWORD lineStart = static_cast<DWORD>(lineStartResult);
+        if (lineStart > expectedPosition) {
+            const DWORD gapLength = lineStart - expectedPosition;
+            const std::size_t remaining = kMaxVisibleSpellCheckChars - text.size();
+            const std::size_t copiedGap = std::min<std::size_t>(gapLength, remaining);
+            text.append(copiedGap, L'\n');
+            expectedPosition += static_cast<DWORD>(copiedGap);
+            if (copiedGap < gapLength) {
+                break;
+            }
+        } else if (lineStart < expectedPosition) {
+            continue;
+        }
+
+        const int lineLength = static_cast<int>(SendMessageW(editor_, EM_LINELENGTH, static_cast<WPARAM>(lineStart), 0));
+        const std::size_t remaining = kMaxVisibleSpellCheckChars - text.size();
+        const int copyLength = static_cast<int>(std::min<std::size_t>(
+            std::max(0, lineLength),
+            std::min<std::size_t>(remaining, static_cast<std::size_t>(kMaxEditorLineFetchChars))));
+        if (copyLength <= 0) {
+            continue;
+        }
+
+        const std::wstring lineText = GetEditorLineText(line, copyLength);
+        text += lineText;
+        expectedPosition += static_cast<DWORD>(lineText.size());
+        if (lineText.size() < static_cast<std::size_t>(lineLength)) {
+            break;
+        }
+    }
+
+    return !text.empty();
+}
+
 int ClassicNotepadApp::GetEditorLineHeight() const
 {
     if (editor_ == nullptr) {
@@ -1488,6 +1632,32 @@ int ClassicNotepadApp::GetEditorLineHeight() const
 }
 
 int ClassicNotepadApp::MeasureWidestEditorLine() const
+{
+    if (editor_ == nullptr) {
+        return 0;
+    }
+
+    const int textLength = GetWindowTextLengthW(editor_);
+    if (textLength <= 0) {
+        cachedWidestLineWidth_ = 0;
+        widestLineCacheDirty_ = false;
+        return 0;
+    }
+
+    if (textLength > kFullDocumentWidthScanCharLimit) {
+        return MeasureVisibleEditorLineWidth();
+    }
+
+    if (!widestLineCacheDirty_) {
+        return cachedWidestLineWidth_;
+    }
+
+    cachedWidestLineWidth_ = MeasureFullEditorLineWidth();
+    widestLineCacheDirty_ = false;
+    return cachedWidestLineWidth_;
+}
+
+int ClassicNotepadApp::MeasureFullEditorLineWidth() const
 {
     if (editor_ == nullptr) {
         return 0;
@@ -1530,6 +1700,79 @@ int ClassicNotepadApp::MeasureWidestEditorLine() const
             ++index;
         }
         lineStart = index + 1U;
+    }
+
+    if (previousFont != nullptr) {
+        SelectObject(deviceContext, previousFont);
+    }
+    ReleaseDC(editor_, deviceContext);
+
+    return widestLine;
+}
+
+int ClassicNotepadApp::MeasureVisibleEditorLineWidth() const
+{
+    if (editor_ == nullptr) {
+        return 0;
+    }
+
+    HDC deviceContext = GetDC(editor_);
+    if (deviceContext == nullptr) {
+        return 0;
+    }
+
+    HGDIOBJ previousFont = nullptr;
+    if (editorFont_ != nullptr) {
+        previousFont = SelectObject(deviceContext, editorFont_);
+    }
+
+    TEXTMETRICW textMetrics{};
+    const bool measuredMetrics = GetTextMetricsW(deviceContext, &textMetrics) != 0;
+    const int averageCharacterWidth = measuredMetrics
+        ? std::max(1, static_cast<int>(textMetrics.tmAveCharWidth))
+        : 1;
+
+    int widestLine = 0;
+    const int lineCount = std::max<int>(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
+    const int firstVisibleLine = std::clamp(
+        static_cast<int>(SendMessageW(editor_, EM_GETFIRSTVISIBLELINE, 0, 0)),
+        0,
+        std::max(0, lineCount - 1));
+    const int startLine = std::max(0, firstVisibleLine - kSpellCheckVisibleLineMargin);
+    const int endLine = GetLastVisibleEditorLine(kSpellCheckVisibleLineMargin);
+
+    for (int line = startLine; line <= endLine; ++line) {
+        const LRESULT lineStartResult = SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(line), 0);
+        if (lineStartResult < 0) {
+            continue;
+        }
+
+        const int lineLength = static_cast<int>(SendMessageW(
+            editor_,
+            EM_LINELENGTH,
+            static_cast<WPARAM>(lineStartResult),
+            0));
+        if (lineLength <= 0) {
+            continue;
+        }
+
+        if (lineLength > kExactLineWidthMeasureCharLimit) {
+            widestLine = std::max(widestLine, SaturatingTextWidthEstimate(lineLength, averageCharacterWidth));
+            continue;
+        }
+
+        const std::wstring lineText = ExpandTabsForPrinting(GetEditorLineText(line, lineLength));
+        SIZE textSize{};
+        if (!lineText.empty() &&
+            GetTextExtentPoint32W(
+                deviceContext,
+                lineText.c_str(),
+                static_cast<int>(std::min<std::size_t>(
+                    lineText.size(),
+                    static_cast<std::size_t>(std::numeric_limits<int>::max()))),
+                &textSize)) {
+            widestLine = std::max(widestLine, static_cast<int>(textSize.cx));
+        }
     }
 
     if (previousFont != nullptr) {
@@ -1842,6 +2085,7 @@ void ClassicNotepadApp::ScrollCustomScrollBarToPosition(ScrollBarOrientation ori
 
     UpdateStatusBar();
     UpdateScrollBars();
+    RefreshSpellCheck(false);
     InvalidateRect(editor_, nullptr, FALSE);
 }
 
@@ -2004,7 +2248,7 @@ void ClassicNotepadApp::UpdateStatusBar()
     statusBarText_ += L", Col ";
     statusBarText_ += std::to_wstring(column);
     statusBarText_ += L" | ";
-    statusBarText_ += FormatCharacterCount(CountStatusCharacters(GetEditorText()));
+    statusBarText_ += FormatCharacterCount(GetStatusCharacterCount());
     statusBarText_ += L" | ";
     statusBarText_ += FormatLineEnding(document_.LineEnding());
     statusBarText_ += L" | ";
@@ -2012,6 +2256,40 @@ void ClassicNotepadApp::UpdateStatusBar()
 
     const WPARAM part = darkModeEnabled_ ? (SBT_OWNERDRAW | SBT_NOBORDERS) : 0;
     SendMessageW(statusBar_, SB_SETTEXTW, part, reinterpret_cast<LPARAM>(statusBarText_.c_str()));
+}
+
+void ClassicNotepadApp::SetStatusCharacterCountFromText(const std::wstring& text)
+{
+    statusCharacterCount_ = CountStatusCharacters(text);
+    statusCharacterTextLength_ = static_cast<int>(std::min<std::size_t>(
+        text.size(),
+        static_cast<std::size_t>(std::numeric_limits<int>::max())));
+    statusCharacterCountDirty_ = false;
+}
+
+std::size_t ClassicNotepadApp::GetStatusCharacterCount()
+{
+    if (editor_ == nullptr) {
+        statusCharacterCount_ = 0;
+        statusCharacterTextLength_ = 0;
+        statusCharacterCountDirty_ = false;
+        return statusCharacterCount_;
+    }
+
+    const int textLength = GetWindowTextLengthW(editor_);
+    if (!statusCharacterCountDirty_ && textLength == statusCharacterTextLength_) {
+        return statusCharacterCount_;
+    }
+
+    statusCharacterTextLength_ = std::max(0, textLength);
+    if (textLength > kExactStatusCharacterCountLimit) {
+        statusCharacterCount_ = static_cast<std::size_t>(textLength);
+    } else {
+        statusCharacterCount_ = CountStatusCharacters(GetEditorText());
+    }
+
+    statusCharacterCountDirty_ = false;
+    return statusCharacterCount_;
 }
 
 void ClassicNotepadApp::UpdateStatusBarSizeGripStyle()
@@ -2237,8 +2515,27 @@ void ClassicNotepadApp::RunSpellCheckNow()
         return;
     }
 
-    spellingErrors_ = spellChecker_.Check(GetEditorText());
-    InvalidateRect(editor_, nullptr, FALSE);
+    std::wstring visibleText;
+    DWORD visibleStart = 0;
+    if (!GetVisibleEditorText(visibleText, visibleStart)) {
+        spellingErrors_.clear();
+        if (editor_ != nullptr) {
+            InvalidateRect(editor_, nullptr, FALSE);
+        }
+        return;
+    }
+
+    spellingErrors_ = spellChecker_.Check(visibleText);
+    for (SpellingErrorRange& error : spellingErrors_) {
+        if (error.start > std::numeric_limits<DWORD>::max() - visibleStart) {
+            error.start = std::numeric_limits<DWORD>::max();
+        } else {
+            error.start += visibleStart;
+        }
+    }
+    if (editor_ != nullptr) {
+        InvalidateRect(editor_, nullptr, FALSE);
+    }
 }
 
 void ClassicNotepadApp::DrawSpellingUnderlines(HWND editorWindow)
@@ -2369,23 +2666,43 @@ bool ClassicNotepadApp::HandleEditorContextMenu(HWND editorWindow, LPARAM lParam
 
     POINT clientPoint = screenPoint;
     ScreenToClient(editorWindow, &clientPoint);
-    const LRESULT charResult = SendMessageW(
-        editorWindow,
-        EM_CHARFROMPOS,
-        0,
-        MAKELPARAM(clientPoint.x, clientPoint.y));
-    const DWORD charIndex = LOWORD(charResult);
+    DWORD charIndex = 0;
+    bool hasCharacterIndex = false;
+    if (lParam == -1) {
+        DWORD selectionStart = 0;
+        DWORD selectionEnd = 0;
+        GetSelectionRange(selectionStart, selectionEnd);
+        charIndex = selectionEnd;
+        hasCharacterIndex = true;
+    } else {
+        const LRESULT charResult = SendMessageW(
+            editorWindow,
+            EM_CHARFROMPOS,
+            0,
+            MAKELPARAM(clientPoint.x, clientPoint.y));
+        charIndex = LOWORD(charResult);
+        hasCharacterIndex = true;
+    }
 
-    const std::wstring text = GetEditorText();
+    std::wstring visibleText;
+    DWORD visibleTextStart = 0;
+    const bool hasVisibleText = GetVisibleEditorText(visibleText, visibleTextStart);
     classic_notepad::TextRange wordRange{};
-    const bool hasWord = charIndex < text.size() &&
-        classic_notepad::ExpandWordRangeAt(text, charIndex, wordRange);
+    std::size_t absoluteWordStart = 0;
+    const bool hasWord = hasCharacterIndex &&
+        hasVisibleText &&
+        charIndex >= visibleTextStart &&
+        static_cast<std::size_t>(charIndex - visibleTextStart) < visibleText.size() &&
+        classic_notepad::ExpandWordRangeAt(visibleText, charIndex - visibleTextStart, wordRange);
+    if (hasWord) {
+        absoluteWordStart = static_cast<std::size_t>(visibleTextStart) + wordRange.start;
+    }
 
     bool wordMisspelled = false;
     if (hasWord) {
         for (const SpellingErrorRange& error : spellingErrors_) {
             if (classic_notepad::RangesOverlap(
-                    wordRange.start,
+                    absoluteWordStart,
                     wordRange.length,
                     error.start,
                     error.length)) {
@@ -2405,8 +2722,8 @@ bool ClassicNotepadApp::HandleEditorContextMenu(HWND editorWindow, LPARAM lParam
     contextMenuWordLength_ = 0;
 
     if (spellCheckAvailable_ && wordMisspelled) {
-        contextMenuWord_ = text.substr(wordRange.start, wordRange.length);
-        contextMenuWordStart_ = static_cast<DWORD>(wordRange.start);
+        contextMenuWord_ = visibleText.substr(wordRange.start, wordRange.length);
+        contextMenuWordStart_ = static_cast<DWORD>(absoluteWordStart);
         contextMenuWordLength_ = static_cast<DWORD>(wordRange.length);
 
         const std::vector<std::wstring> suggestions = spellChecker_.Suggest(contextMenuWord_, 5);
@@ -2434,7 +2751,7 @@ bool ClassicNotepadApp::HandleEditorContextMenu(HWND editorWindow, LPARAM lParam
     }
 
     const bool hasSelection = HasSelection();
-    const bool hasText = !text.empty();
+    const bool hasText = GetWindowTextLengthW(editor_) > 0;
     AppendMenuW(popup, MF_STRING | (SendMessageW(editor_, EM_CANUNDO, 0, 0) != 0 ? MF_ENABLED : MF_GRAYED), ID_EDIT_UNDO, L"Undo");
     AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(popup, MF_STRING | (hasSelection ? MF_ENABLED : MF_GRAYED), ID_EDIT_CUT, L"Cut");
@@ -2530,6 +2847,8 @@ void ClassicNotepadApp::HandleEditorChanged()
         return;
     }
 
+    statusCharacterCountDirty_ = true;
+    InvalidateWidestLineCache();
     UpdateStatusBar();
     UpdateScrollBars();
     RefreshSpellCheck(false);
@@ -2915,6 +3234,7 @@ void ClassicNotepadApp::HandleChooseFont()
         DeleteObject(oldFont);
     }
 
+    InvalidateWidestLineCache();
     ResizeEditor();
     UpdateStatusBar();
     UpdateScrollBars();
@@ -3015,21 +3335,30 @@ std::wstring ClassicNotepadApp::GetSelectedText() const
 void ClassicNotepadApp::SetEditorText(const std::wstring& text)
 {
     horizontalScrollPosition_ = 0;
+    InvalidateWidestLineCache();
+    SetStatusCharacterCountFromText(text);
     suppressEditorChange_ = true;
+    SendMessageW(editor_, WM_SETREDRAW, FALSE, 0);
     SetWindowTextW(editor_, text.c_str());
+    SendMessageW(editor_, WM_SETREDRAW, TRUE, 0);
     SendMessageW(editor_, EM_EMPTYUNDOBUFFER, 0, 0);
     SendMessageW(editor_, EM_SETMODIFY, FALSE, 0);
     suppressEditorChange_ = false;
     UpdateStatusBar();
     UpdateScrollBars();
+    InvalidateRect(editor_, nullptr, TRUE);
     RefreshSpellCheck(true);
 }
 
 void ClassicNotepadApp::ReplaceEditorTextFromCommand(const std::wstring& text)
 {
     horizontalScrollPosition_ = 0;
+    InvalidateWidestLineCache();
+    SetStatusCharacterCountFromText(text);
     suppressEditorChange_ = true;
+    SendMessageW(editor_, WM_SETREDRAW, FALSE, 0);
     SetWindowTextW(editor_, text.c_str());
+    SendMessageW(editor_, WM_SETREDRAW, TRUE, 0);
     SendMessageW(editor_, EM_EMPTYUNDOBUFFER, 0, 0);
     SendMessageW(editor_, EM_SETMODIFY, TRUE, 0);
     suppressEditorChange_ = false;
@@ -3038,6 +3367,7 @@ void ClassicNotepadApp::ReplaceEditorTextFromCommand(const std::wstring& text)
     UpdateTitle();
     UpdateStatusBar();
     UpdateScrollBars();
+    InvalidateRect(editor_, nullptr, TRUE);
     RefreshSpellCheck(true);
 }
 
@@ -4183,6 +4513,13 @@ LRESULT CALLBACK ClassicNotepadApp::EditorWindowProc(HWND window, UINT message, 
             message == WM_VSCROLL ||
             message == WM_SIZE) {
             app->UpdateScrollBars();
+        }
+        if (message == WM_KEYDOWN ||
+            message == WM_MOUSEWHEEL ||
+            message == WM_HSCROLL ||
+            message == WM_VSCROLL ||
+            message == WM_SIZE) {
+            app->RefreshSpellCheck(false);
         }
         InvalidateRect(window, nullptr, FALSE);
         break;
