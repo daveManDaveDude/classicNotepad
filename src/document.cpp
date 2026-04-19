@@ -255,3 +255,18 @@ std::wstring Document::DisplayName() const
 
     return path_.substr(separator + 1U);
 }
+
+Document::TextEncoding Document::Encoding() const
+{
+    return encoding_;
+}
+
+Document::LineEndingStyle Document::LineEnding() const
+{
+    return lineEnding_;
+}
+
+Document::LineEndingStyle Document::SaveLineEnding() const
+{
+    return saveLineEnding_;
+}

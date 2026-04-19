@@ -23,6 +23,9 @@ public:
 
     const std::wstring& Path() const;
     std::wstring DisplayName() const;
+    TextEncoding Encoding() const;
+    LineEndingStyle LineEnding() const;
+    LineEndingStyle SaveLineEnding() const;
 
 private:
     std::wstring path_;

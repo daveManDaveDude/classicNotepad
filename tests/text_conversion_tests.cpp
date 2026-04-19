@@ -213,6 +213,64 @@ void TestDocumentRoundTrips()
     std::filesystem::remove_all(testRoot);
 }
 
+void TestDocumentMetadata()
+{
+    using classic_notepad::LineEndingStyle;
+    using classic_notepad::TextEncoding;
+
+    Document newDocument;
+    newDocument.ResetUntitled();
+    Expect(newDocument.Encoding() == TextEncoding::Utf8NoBom, "New document reports UTF-8");
+    Expect(newDocument.LineEnding() == LineEndingStyle::Crlf, "New document reports CRLF");
+    Expect(newDocument.SaveLineEnding() == LineEndingStyle::Crlf, "New document saves as CRLF");
+
+    const std::filesystem::path testRoot =
+        std::filesystem::temp_directory_path() / L"classic-notepad-metadata-tests";
+    std::filesystem::create_directories(testRoot);
+
+    {
+        const std::filesystem::path path = testRoot / L"lf-utf8.txt";
+        WriteBinary(path, { 'a', '\n', 'b', '\n' });
+
+        Document document;
+        std::wstring editorText;
+        std::wstring error;
+
+        Expect(document.Load(path.wstring(), editorText, error), "Document metadata loads LF file");
+        Expect(document.Encoding() == TextEncoding::Utf8NoBom, "LF file reports UTF-8");
+        Expect(document.LineEnding() == LineEndingStyle::Lf, "LF file reports Unix line endings");
+        Expect(document.SaveLineEnding() == LineEndingStyle::Lf, "LF file save style remains LF");
+    }
+
+    {
+        const std::filesystem::path path = testRoot / L"bom-utf8.txt";
+        WriteBinary(path, { 0xEFU, 0xBBU, 0xBFU, 'a', '\r', '\n' });
+
+        Document document;
+        std::wstring editorText;
+        std::wstring error;
+
+        Expect(document.Load(path.wstring(), editorText, error), "Document metadata loads UTF-8 BOM file");
+        Expect(document.Encoding() == TextEncoding::Utf8Bom, "UTF-8 BOM file reports UTF-8 with BOM");
+        Expect(document.LineEnding() == LineEndingStyle::Crlf, "UTF-8 BOM file reports CRLF");
+    }
+
+    {
+        const std::filesystem::path path = testRoot / L"utf16-le.txt";
+        WriteBinary(path, { 0xFFU, 0xFEU, 'A', 0x00U, '\r', 0x00U, '\n', 0x00U });
+
+        Document document;
+        std::wstring editorText;
+        std::wstring error;
+
+        Expect(document.Load(path.wstring(), editorText, error), "Document metadata loads UTF-16 LE file");
+        Expect(document.Encoding() == TextEncoding::Utf16LeBom, "UTF-16 LE file reports UTF-16 LE");
+        Expect(document.LineEnding() == LineEndingStyle::Crlf, "UTF-16 LE file reports CRLF");
+    }
+
+    std::filesystem::remove_all(testRoot);
+}
+
 void TestDocumentNewFilePath()
 {
     const std::filesystem::path testRoot =
@@ -274,6 +332,7 @@ int main()
     TestLineEndingAnalysis();
     TestLineEndingConversion();
     TestDocumentRoundTrips();
+    TestDocumentMetadata();
     TestDocumentNewFilePath();
     TestSpellWordExpansion();
     TestSpellRangeOverlap();

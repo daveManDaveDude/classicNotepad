@@ -20,6 +20,8 @@
 namespace {
 
 constexpr wchar_t kMainWindowClass[] = L"ClassicNotepadMainWindow";
+constexpr wchar_t kMenuBarClass[] = L"ClassicNotepadMenuBar";
+constexpr wchar_t kScrollBarClass[] = L"ClassicNotepadScrollBar";
 constexpr wchar_t kAppTitle[] = L"Untitled - Classic Notepad";
 constexpr wchar_t kFileDialogFilter[] = L"Text Documents (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
 constexpr wchar_t kFindReplaceMessageName[] = L"commdlg_FindReplace";
@@ -38,8 +40,21 @@ constexpr COLORREF kDarkEditorBackground = RGB(32, 32, 32);
 constexpr COLORREF kDarkEditorText = RGB(242, 242, 242);
 constexpr COLORREF kDarkStatusBackground = RGB(43, 43, 43);
 constexpr COLORREF kDarkStatusText = RGB(242, 242, 242);
+constexpr COLORREF kDarkKeyLine = RGB(0, 0, 0);
+constexpr COLORREF kDarkResizeGrip = kDarkKeyLine;
+constexpr COLORREF kDarkMenuBackground = RGB(38, 38, 38);
+constexpr COLORREF kDarkMenuHotBackground = RGB(58, 58, 58);
+constexpr COLORREF kDarkMenuActiveBackground = RGB(70, 70, 70);
+constexpr COLORREF kDarkMenuText = RGB(245, 245, 245);
+constexpr COLORREF kDarkScrollTrack = RGB(32, 32, 32);
+constexpr COLORREF kDarkScrollThumb = RGB(78, 78, 78);
+constexpr COLORREF kDarkScrollThumbActive = RGB(96, 96, 96);
+constexpr int kMenuHorizontalPadding = 12;
+constexpr int kMinimumScrollThumbLength = 28;
 constexpr DWORD kDwmUseImmersiveDarkMode = 20;
 constexpr DWORD kDwmUseImmersiveDarkModeBefore20H1 = 19;
+constexpr DWORD kDwmBorderColor = 34;
+constexpr COLORREF kDwmDefaultColor = 0xFFFFFFFF;
 
 struct GoToDialogState {
     int currentLine = 1;
@@ -50,6 +65,37 @@ struct GoToDialogState {
 bool IsWordCharacter(wchar_t character)
 {
     return std::iswalnum(static_cast<wint_t>(character)) != 0 || character == L'_';
+}
+
+bool GetChildWindowRect(HWND window, RECT& rect)
+{
+    if (window == nullptr) {
+        return false;
+    }
+
+    GetWindowRect(window, &rect);
+    HWND parent = GetParent(window);
+    if (parent != nullptr) {
+        MapWindowPoints(nullptr, parent, reinterpret_cast<POINT*>(&rect), 2);
+    }
+
+    return true;
+}
+
+void MoveChildWindowIfNeeded(HWND window, const RECT& rect, bool repaint)
+{
+    RECT currentRect{};
+    if (GetChildWindowRect(window, currentRect) && EqualRect(&currentRect, &rect)) {
+        return;
+    }
+
+    MoveWindow(
+        window,
+        rect.left,
+        rect.top,
+        std::max(0, static_cast<int>(rect.right - rect.left)),
+        std::max(0, static_cast<int>(rect.bottom - rect.top)),
+        repaint ? TRUE : FALSE);
 }
 
 POINT PointFromEditorCharPosition(HWND editor, DWORD charIndex)
@@ -265,6 +311,107 @@ void ApplyDarkTitleBar(HWND window, bool useDarkMode)
             &enabled,
             sizeof(enabled));
     }
+
+    const COLORREF borderColor = useDarkMode ? kDarkKeyLine : kDwmDefaultColor;
+    DwmSetWindowAttribute(
+        window,
+        kDwmBorderColor,
+        &borderColor,
+        sizeof(borderColor));
+}
+
+std::wstring FormatEncoding(Document::TextEncoding encoding)
+{
+    switch (encoding) {
+    case Document::TextEncoding::Utf8NoBom:
+        return L"UTF-8";
+    case Document::TextEncoding::Utf8Bom:
+        return L"UTF-8 with BOM";
+    case Document::TextEncoding::Utf16LeBom:
+        return L"UTF-16 LE";
+    case Document::TextEncoding::Ansi:
+        return L"ANSI";
+    default:
+        return L"UTF-8";
+    }
+}
+
+std::wstring FormatLineEnding(Document::LineEndingStyle lineEnding)
+{
+    switch (lineEnding) {
+    case Document::LineEndingStyle::Crlf:
+        return L"Windows (CRLF)";
+    case Document::LineEndingStyle::Lf:
+        return L"Unix (LF)";
+    case Document::LineEndingStyle::Cr:
+        return L"Macintosh (CR)";
+    case Document::LineEndingStyle::Mixed:
+        return L"Mixed";
+    default:
+        return L"Windows (CRLF)";
+    }
+}
+
+std::wstring FormatCharacterCount(std::size_t count)
+{
+    std::wstring text = std::to_wstring(count);
+    text += count == 1U ? L" character" : L" characters";
+    return text;
+}
+
+std::size_t CountStatusCharacters(const std::wstring& text)
+{
+    std::size_t count = 0;
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        if (text[index] == L'\r' && index + 1U < text.size() && text[index + 1U] == L'\n') {
+            ++index;
+        } else if (
+            text[index] >= 0xD800 &&
+            text[index] <= 0xDBFF &&
+            index + 1U < text.size() &&
+            text[index + 1U] >= 0xDC00 &&
+            text[index + 1U] <= 0xDFFF) {
+            ++index;
+        }
+
+        ++count;
+    }
+
+    return count;
+}
+
+std::wstring StripMenuMnemonics(const std::wstring& text)
+{
+    std::wstring stripped;
+    stripped.reserve(text.size());
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        if (text[index] == L'&') {
+            if (index + 1U < text.size() && text[index + 1U] == L'&') {
+                stripped.push_back(L'&');
+                ++index;
+            }
+            continue;
+        }
+
+        stripped.push_back(text[index]);
+    }
+
+    return stripped;
+}
+
+wchar_t FindMenuMnemonic(const std::wstring& text)
+{
+    for (std::size_t index = 0; index + 1U < text.size(); ++index) {
+        if (text[index] == L'&' && text[index + 1U] != L'&') {
+            return static_cast<wchar_t>(std::towlower(static_cast<wint_t>(text[index + 1U])));
+        }
+
+        if (text[index] == L'&') {
+            ++index;
+        }
+    }
+
+    return L'\0';
 }
 
 std::size_t FindWrapBreakLength(const std::wstring& text, std::size_t start, std::size_t maxLength)
@@ -447,6 +594,40 @@ bool ClassicNotepadApp::RegisterMainWindowClass()
     windowClass.lpszClassName = kMainWindowClass;
     windowClass.hIconSm = LoadIconW(nullptr, IDI_APPLICATION);
 
+    const bool mainWindowClassRegistered =
+        RegisterClassExW(&windowClass) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    return mainWindowClassRegistered && RegisterMenuBarClass() && RegisterScrollBarClass();
+}
+
+bool ClassicNotepadApp::RegisterMenuBarClass()
+{
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.style = CS_HREDRAW | CS_VREDRAW;
+    windowClass.lpfnWndProc = ClassicNotepadApp::MenuBarWindowProc;
+    windowClass.hInstance = instance_;
+    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.hbrBackground = nullptr;
+    windowClass.lpszClassName = kMenuBarClass;
+
+    if (RegisterClassExW(&windowClass) != 0) {
+        return true;
+    }
+
+    return GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+}
+
+bool ClassicNotepadApp::RegisterScrollBarClass()
+{
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.style = CS_HREDRAW | CS_VREDRAW;
+    windowClass.lpfnWndProc = ClassicNotepadApp::ScrollBarWindowProc;
+    windowClass.hInstance = instance_;
+    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.hbrBackground = nullptr;
+    windowClass.lpszClassName = kScrollBarClass;
+
     if (RegisterClassExW(&windowClass) != 0) {
         return true;
     }
@@ -480,17 +661,72 @@ bool ClassicNotepadApp::CreateMainWindow(int showCommand)
     return true;
 }
 
+HWND ClassicNotepadApp::CreateMenuBar()
+{
+    return CreateWindowExW(
+        0,
+        kMenuBarClass,
+        nullptr,
+        WS_CHILD | (darkModeEnabled_ ? WS_VISIBLE : 0),
+        0,
+        0,
+        0,
+        0,
+        mainWindow_,
+        nullptr,
+        instance_,
+        this);
+}
+
+HWND ClassicNotepadApp::CreateCustomScrollBar(ScrollBarOrientation orientation)
+{
+    (void)orientation;
+    return CreateWindowExW(
+        0,
+        kScrollBarClass,
+        nullptr,
+        WS_CHILD,
+        0,
+        0,
+        0,
+        0,
+        mainWindow_,
+        nullptr,
+        instance_,
+        this);
+}
+
+HWND ClassicNotepadApp::CreateScrollCorner()
+{
+    return CreateWindowExW(
+        0,
+        kScrollBarClass,
+        nullptr,
+        WS_CHILD,
+        0,
+        0,
+        0,
+        0,
+        mainWindow_,
+        nullptr,
+        instance_,
+        this);
+}
+
 HWND ClassicNotepadApp::CreateEditor()
 {
+    const bool useCustomScrollBars = UseCustomScrollBars();
     const DWORD editorStyle =
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL |
-        (wordWrap_ ? 0 : WS_HSCROLL) |
+        WS_CHILD | WS_VISIBLE |
+        (useCustomScrollBars ? 0 : WS_VSCROLL) |
+        (wordWrap_ || useCustomScrollBars ? 0 : WS_HSCROLL) |
         ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL |
         (wordWrap_ ? 0 : ES_AUTOHSCROLL) |
         ES_NOHIDESEL | ES_WANTRETURN;
 
+    const DWORD editorExStyle = darkModeEnabled_ ? 0 : WS_EX_CLIENTEDGE;
     HWND editor = CreateWindowExW(
-        WS_EX_CLIENTEDGE,
+        editorExStyle,
         L"EDIT",
         nullptr,
         editorStyle,
@@ -524,6 +760,10 @@ HWND ClassicNotepadApp::CreateEditor()
         GWLP_WNDPROC,
         reinterpret_cast<LONG_PTR>(ClassicNotepadApp::EditorWindowProc)));
 
+    verticalScrollBarVisible_ = true;
+    horizontalScrollBarVisible_ = !wordWrap_;
+    nativeVerticalScrollBarVisible_ = !useCustomScrollBars;
+    nativeHorizontalScrollBarVisible_ = !useCustomScrollBars && !wordWrap_;
     return editor;
 }
 
@@ -538,7 +778,8 @@ HWND ClassicNotepadApp::CreateStatusBar()
         0,
         STATUSCLASSNAMEW,
         nullptr,
-        WS_CHILD | (statusBarVisible_ ? WS_VISIBLE : 0) | SBARS_SIZEGRIP,
+        WS_CHILD | (statusBarVisible_ ? WS_VISIBLE : 0) |
+            (darkModeEnabled_ ? CCS_NODIVIDER : SBARS_SIZEGRIP),
         0,
         0,
         0,
@@ -550,9 +791,278 @@ HWND ClassicNotepadApp::CreateStatusBar()
 
     if (statusBar != nullptr) {
         SendMessageW(statusBar, SB_SETBKCOLOR, 0, darkModeEnabled_ ? kDarkStatusBackground : CLR_DEFAULT);
+        SetWindowSubclass(
+            statusBar,
+            ClassicNotepadApp::StatusBarSubclassProc,
+            1,
+            reinterpret_cast<DWORD_PTR>(this));
     }
 
     return statusBar;
+}
+
+int ClassicNotepadApp::GetMenuBarHeight() const
+{
+    return std::max(24, GetSystemMetrics(SM_CYMENU));
+}
+
+HMENU ClassicNotepadApp::ActiveMenu() const
+{
+    return mainMenu_ != nullptr ? mainMenu_ : GetMenu(mainWindow_);
+}
+
+int ClassicNotepadApp::GetTopLevelMenuCount() const
+{
+    HMENU menu = ActiveMenu();
+    return menu != nullptr ? std::max(0, GetMenuItemCount(menu)) : 0;
+}
+
+std::wstring ClassicNotepadApp::GetTopLevelMenuText(int index) const
+{
+    HMENU menu = ActiveMenu();
+    if (menu == nullptr || index < 0 || index >= GetTopLevelMenuCount()) {
+        return {};
+    }
+
+    std::array<wchar_t, 128> buffer{};
+    if (GetMenuStringW(menu, static_cast<UINT>(index), buffer.data(), static_cast<int>(buffer.size()), MF_BYPOSITION) == 0) {
+        return {};
+    }
+
+    return buffer.data();
+}
+
+RECT ClassicNotepadApp::GetMenuBarItemRect(int index) const
+{
+    RECT itemRect{};
+    if (menuBar_ == nullptr || index < 0 || index >= GetTopLevelMenuCount()) {
+        return itemRect;
+    }
+
+    RECT clientRect{};
+    GetClientRect(menuBar_, &clientRect);
+
+    HDC deviceContext = GetDC(menuBar_);
+    if (deviceContext == nullptr) {
+        return itemRect;
+    }
+
+    HGDIOBJ previousFont = SelectObject(deviceContext, GetStockObject(DEFAULT_GUI_FONT));
+    int x = clientRect.left;
+    for (int itemIndex = 0; itemIndex <= index; ++itemIndex) {
+        const std::wstring text = StripMenuMnemonics(GetTopLevelMenuText(itemIndex));
+        SIZE textSize{};
+        if (!text.empty()) {
+            GetTextExtentPoint32W(deviceContext, text.c_str(), static_cast<int>(text.size()), &textSize);
+        }
+
+        const int itemWidth = textSize.cx + (kMenuHorizontalPadding * 2);
+        if (itemIndex == index) {
+            itemRect = RECT{ x, clientRect.top, x + itemWidth, clientRect.bottom };
+            break;
+        }
+
+        x += itemWidth;
+    }
+
+    if (previousFont != nullptr) {
+        SelectObject(deviceContext, previousFont);
+    }
+    ReleaseDC(menuBar_, deviceContext);
+
+    return itemRect;
+}
+
+int ClassicNotepadApp::MenuIndexFromPoint(POINT point) const
+{
+    const int itemCount = GetTopLevelMenuCount();
+    for (int index = 0; index < itemCount; ++index) {
+        const RECT itemRect = GetMenuBarItemRect(index);
+        if (!IsRectEmpty(&itemRect) && PtInRect(&itemRect, point)) {
+            return index;
+        }
+    }
+
+    return -1;
+}
+
+void ClassicNotepadApp::PaintMenuBar(HDC deviceContext) const
+{
+    if (deviceContext == nullptr || menuBar_ == nullptr) {
+        return;
+    }
+
+    RECT clientRect{};
+    GetClientRect(menuBar_, &clientRect);
+
+    HBRUSH backgroundBrush = CreateSolidBrush(kDarkMenuBackground);
+    if (backgroundBrush != nullptr) {
+        FillRect(deviceContext, &clientRect, backgroundBrush);
+        DeleteObject(backgroundBrush);
+    }
+
+    HGDIOBJ previousFont = SelectObject(deviceContext, GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(deviceContext, TRANSPARENT);
+    SetTextColor(deviceContext, kDarkMenuText);
+
+    HBRUSH hotBrush = CreateSolidBrush(kDarkMenuHotBackground);
+    HBRUSH activeBrush = CreateSolidBrush(kDarkMenuActiveBackground);
+    const int itemCount = GetTopLevelMenuCount();
+    for (int index = 0; index < itemCount; ++index) {
+        RECT itemRect = GetMenuBarItemRect(index);
+        if (IsRectEmpty(&itemRect)) {
+            continue;
+        }
+
+        if (index == activeMenuIndex_ && activeBrush != nullptr) {
+            FillRect(deviceContext, &itemRect, activeBrush);
+        } else if (index == hotMenuIndex_ && hotBrush != nullptr) {
+            FillRect(deviceContext, &itemRect, hotBrush);
+        }
+
+        RECT textRect = itemRect;
+        textRect.left += kMenuHorizontalPadding;
+        textRect.right -= kMenuHorizontalPadding;
+        const std::wstring text = StripMenuMnemonics(GetTopLevelMenuText(index));
+        DrawTextW(
+            deviceContext,
+            text.c_str(),
+            -1,
+            &textRect,
+            DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+    }
+
+    if (hotBrush != nullptr) {
+        DeleteObject(hotBrush);
+    }
+    if (activeBrush != nullptr) {
+        DeleteObject(activeBrush);
+    }
+    if (previousFont != nullptr) {
+        SelectObject(deviceContext, previousFont);
+    }
+}
+
+void ClassicNotepadApp::SetHotMenuIndex(int index)
+{
+    if (index == hotMenuIndex_) {
+        return;
+    }
+
+    hotMenuIndex_ = index;
+    if (menuBar_ != nullptr) {
+        InvalidateRect(menuBar_, nullptr, FALSE);
+    }
+}
+
+void ClassicNotepadApp::ClearMenuMode()
+{
+    hotMenuIndex_ = -1;
+    activeMenuIndex_ = -1;
+    menuKeyboardActive_ = false;
+    if (menuBar_ != nullptr) {
+        InvalidateRect(menuBar_, nullptr, FALSE);
+    }
+}
+
+void ClassicNotepadApp::ShowMenuPopup(int index, bool fromKeyboard)
+{
+    HMENU menu = ActiveMenu();
+    if (menu == nullptr || menuBar_ == nullptr || index < 0 || index >= GetTopLevelMenuCount()) {
+        return;
+    }
+
+    HMENU submenu = GetSubMenu(menu, index);
+    if (submenu == nullptr) {
+        return;
+    }
+
+    UpdateMenuState(menu);
+    hotMenuIndex_ = index;
+    activeMenuIndex_ = index;
+    menuKeyboardActive_ = fromKeyboard;
+    InvalidateRect(menuBar_, nullptr, FALSE);
+
+    RECT itemRect = GetMenuBarItemRect(index);
+    POINT popupPoint{ itemRect.left, itemRect.bottom };
+    ClientToScreen(menuBar_, &popupPoint);
+
+    SetForegroundWindow(mainWindow_);
+    TrackPopupMenuEx(
+        submenu,
+        TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
+        popupPoint.x,
+        popupPoint.y,
+        mainWindow_,
+        nullptr);
+    PostMessageW(mainWindow_, WM_NULL, 0, 0);
+
+    ClearMenuMode();
+    if (editor_ != nullptr) {
+        SetFocus(editor_);
+    }
+}
+
+bool ClassicNotepadApp::ActivateMenuBarFromKeyboard()
+{
+    if (!darkModeEnabled_ || menuBar_ == nullptr || !IsWindowVisible(menuBar_) || GetTopLevelMenuCount() == 0) {
+        return false;
+    }
+
+    menuKeyboardActive_ = true;
+    SetHotMenuIndex(hotMenuIndex_ >= 0 ? hotMenuIndex_ : 0);
+    SetFocus(menuBar_);
+    return true;
+}
+
+bool ClassicNotepadApp::ActivateMenuMnemonic(wchar_t mnemonic)
+{
+    if (!darkModeEnabled_ || menuBar_ == nullptr || !IsWindowVisible(menuBar_)) {
+        return false;
+    }
+
+    const wchar_t target = static_cast<wchar_t>(std::towlower(static_cast<wint_t>(mnemonic)));
+    const int itemCount = GetTopLevelMenuCount();
+    for (int index = 0; index < itemCount; ++index) {
+        if (FindMenuMnemonic(GetTopLevelMenuText(index)) == target) {
+            ShowMenuPopup(index, true);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void ClassicNotepadApp::UpdateMenuChrome()
+{
+    if (mainWindow_ == nullptr) {
+        return;
+    }
+
+    if (mainMenu_ == nullptr) {
+        mainMenu_ = GetMenu(mainWindow_);
+    }
+
+    if (darkModeEnabled_) {
+        if (GetMenu(mainWindow_) != nullptr) {
+            SetMenu(mainWindow_, nullptr);
+        }
+        if (menuBar_ != nullptr) {
+            ShowWindow(menuBar_, SW_SHOWNA);
+            InvalidateRect(menuBar_, nullptr, FALSE);
+        }
+    } else {
+        ClearMenuMode();
+        if (menuBar_ != nullptr) {
+            ShowWindow(menuBar_, SW_HIDE);
+        }
+        if (GetMenu(mainWindow_) == nullptr && mainMenu_ != nullptr) {
+            SetMenu(mainWindow_, mainMenu_);
+        }
+    }
+
+    DrawMenuBar(mainWindow_);
+    ResizeEditor();
 }
 
 void ClassicNotepadApp::UpdateThemeFromSystem()
@@ -571,16 +1081,21 @@ void ClassicNotepadApp::ApplyThemeToWindows()
     ApplyDarkTitleBar(mainWindow_, darkModeEnabled_);
 
     if (mainWindow_ != nullptr) {
-        DrawMenuBar(mainWindow_);
+        UpdateMenuChrome();
         InvalidateRect(mainWindow_, nullptr, TRUE);
     }
 
     if (editor_ != nullptr) {
+        UpdateEditorFrameStyle();
         InvalidateRect(editor_, nullptr, TRUE);
     }
 
     if (statusBar_ != nullptr) {
+        UpdateStatusBarSizeGripStyle();
         SendMessageW(statusBar_, SB_SETBKCOLOR, 0, darkModeEnabled_ ? kDarkStatusBackground : CLR_DEFAULT);
+        if (editor_ != nullptr) {
+            UpdateStatusBar();
+        }
         InvalidateRect(statusBar_, nullptr, TRUE);
     }
 }
@@ -618,6 +1133,38 @@ LRESULT ClassicNotepadApp::HandleControlColor(HDC deviceContext, HWND controlWin
     return reinterpret_cast<LRESULT>(darkEditorBackgroundBrush_);
 }
 
+LRESULT ClassicNotepadApp::HandleDrawItem(WPARAM controlId, LPARAM lParam) const
+{
+    if (!darkModeEnabled_ || controlId != ID_VIEW_STATUS_BAR || statusBar_ == nullptr) {
+        return 0;
+    }
+
+    const auto* drawItem = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+    if (drawItem == nullptr || drawItem->hwndItem != statusBar_ || drawItem->hDC == nullptr) {
+        return 0;
+    }
+
+    RECT statusRect{};
+    GetClientRect(statusBar_, &statusRect);
+    FillRect(drawItem->hDC, &statusRect, darkStatusBackgroundBrush_ != nullptr
+        ? darkStatusBackgroundBrush_
+        : reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+
+    RECT itemRect = drawItem->rcItem;
+    itemRect.left += 4;
+    SetBkMode(drawItem->hDC, TRANSPARENT);
+    SetTextColor(drawItem->hDC, kDarkStatusText);
+    DrawTextW(
+        drawItem->hDC,
+        statusBarText_.c_str(),
+        -1,
+        &itemRect,
+        DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+
+    DrawDarkStatusBarChrome(drawItem->hDC);
+    return TRUE;
+}
+
 LRESULT ClassicNotepadApp::HandleNotify(LPARAM lParam) const
 {
     const auto* header = reinterpret_cast<const NMHDR*>(lParam);
@@ -648,6 +1195,16 @@ void ClassicNotepadApp::ResizeEditor()
         return;
     }
 
+    UpdateScrollBars();
+}
+
+RECT ClassicNotepadApp::GetEditorHostRect()
+{
+    RECT hostRect{};
+    if (mainWindow_ == nullptr) {
+        return hostRect;
+    }
+
     RECT clientArea{};
     GetClientRect(mainWindow_, &clientArea);
 
@@ -662,8 +1219,714 @@ void ClassicNotepadApp::ResizeEditor()
     }
 
     const int width = static_cast<int>(clientArea.right - clientArea.left);
-    const int height = std::max(0, static_cast<int>(clientArea.bottom - clientArea.top) - statusHeight);
-    MoveWindow(editor_, 0, 0, width, height, TRUE);
+    int menuHeight = 0;
+    if (darkModeEnabled_ && menuBar_ != nullptr && IsWindowVisible(menuBar_)) {
+        menuHeight = GetMenuBarHeight();
+        MoveChildWindowIfNeeded(menuBar_, RECT{ 0, 0, width, menuHeight }, true);
+    }
+
+    hostRect.left = 0;
+    hostRect.top = menuHeight;
+    hostRect.right = width;
+    hostRect.bottom = std::max(menuHeight, static_cast<int>(clientArea.bottom - clientArea.top) - statusHeight);
+    return hostRect;
+}
+
+RECT ClassicNotepadApp::GetEditorRectForScrollBars(
+    const RECT& hostRect,
+    bool verticalVisible,
+    bool horizontalVisible) const
+{
+    RECT editorRect = hostRect;
+    if (!UseCustomScrollBars()) {
+        return editorRect;
+    }
+
+    if (verticalVisible) {
+        editorRect.right = std::max(editorRect.left, editorRect.right - GetScrollBarThickness(ScrollBarOrientation::Vertical));
+    }
+    if (horizontalVisible) {
+        editorRect.bottom = std::max(editorRect.top, editorRect.bottom - GetScrollBarThickness(ScrollBarOrientation::Horizontal));
+    }
+
+    return editorRect;
+}
+
+void ClassicNotepadApp::ApplyEditorAndScrollBarLayout(
+    const RECT& hostRect,
+    bool verticalVisible,
+    bool horizontalVisible,
+    bool repaint)
+{
+    if (editor_ == nullptr) {
+        return;
+    }
+
+    const RECT editorRect = GetEditorRectForScrollBars(hostRect, verticalVisible, horizontalVisible);
+    MoveChildWindowIfNeeded(editor_, editorRect, repaint);
+
+    if (verticalScrollBar_ == nullptr || horizontalScrollBar_ == nullptr || scrollCorner_ == nullptr) {
+        return;
+    }
+
+    if (!UseCustomScrollBars()) {
+        ShowWindow(verticalScrollBar_, SW_HIDE);
+        ShowWindow(horizontalScrollBar_, SW_HIDE);
+        ShowWindow(scrollCorner_, SW_HIDE);
+        return;
+    }
+
+    const int verticalThickness = GetScrollBarThickness(ScrollBarOrientation::Vertical);
+    const int horizontalThickness = GetScrollBarThickness(ScrollBarOrientation::Horizontal);
+    const int editorWidth = std::max(0, static_cast<int>(editorRect.right - editorRect.left));
+    const int editorHeight = std::max(0, static_cast<int>(editorRect.bottom - editorRect.top));
+
+    if (verticalVisible && editorHeight > 0) {
+        MoveChildWindowIfNeeded(
+            verticalScrollBar_,
+            RECT{ editorRect.right, hostRect.top, editorRect.right + verticalThickness, hostRect.top + editorHeight },
+            repaint);
+        if (!IsWindowVisible(verticalScrollBar_)) {
+            SetWindowPos(
+                verticalScrollBar_,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+    } else {
+        ShowWindow(verticalScrollBar_, SW_HIDE);
+    }
+
+    if (horizontalVisible && editorWidth > 0) {
+        MoveChildWindowIfNeeded(
+            horizontalScrollBar_,
+            RECT{ hostRect.left, editorRect.bottom, hostRect.left + editorWidth, editorRect.bottom + horizontalThickness },
+            repaint);
+        if (!IsWindowVisible(horizontalScrollBar_)) {
+            SetWindowPos(
+                horizontalScrollBar_,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+    } else {
+        ShowWindow(horizontalScrollBar_, SW_HIDE);
+    }
+
+    if (verticalVisible && horizontalVisible && editorWidth > 0 && editorHeight > 0) {
+        MoveChildWindowIfNeeded(
+            scrollCorner_,
+            RECT{ editorRect.right, editorRect.bottom, editorRect.right + verticalThickness, editorRect.bottom + horizontalThickness },
+            repaint);
+        if (!IsWindowVisible(scrollCorner_)) {
+            SetWindowPos(
+                scrollCorner_,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+    } else {
+        ShowWindow(scrollCorner_, SW_HIDE);
+    }
+}
+
+int ClassicNotepadApp::GetScrollBarThickness(ScrollBarOrientation orientation) const
+{
+    return orientation == ScrollBarOrientation::Vertical
+        ? std::max(1, GetSystemMetrics(SM_CXVSCROLL))
+        : std::max(1, GetSystemMetrics(SM_CYHSCROLL));
+}
+
+bool ClassicNotepadApp::UseCustomScrollBars() const
+{
+    return darkModeEnabled_;
+}
+
+void ClassicNotepadApp::UpdateEditorFrameStyle()
+{
+    if (editor_ == nullptr) {
+        return;
+    }
+
+    const LONG_PTR currentStyle = GetWindowLongPtrW(editor_, GWL_EXSTYLE);
+    const LONG_PTR wantedStyle = darkModeEnabled_
+        ? (currentStyle & ~static_cast<LONG_PTR>(WS_EX_CLIENTEDGE))
+        : (currentStyle | static_cast<LONG_PTR>(WS_EX_CLIENTEDGE));
+
+    if (wantedStyle == currentStyle) {
+        return;
+    }
+
+    SetWindowLongPtrW(editor_, GWL_EXSTYLE, wantedStyle);
+    SetWindowPos(
+        editor_,
+        nullptr,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    ResizeEditor();
+}
+
+void ClassicNotepadApp::UpdateScrollBars()
+{
+    if (editor_ == nullptr) {
+        return;
+    }
+
+    if (updatingScrollBars_) {
+        return;
+    }
+
+    updatingScrollBars_ = true;
+    const RECT hostRect = GetEditorHostRect();
+    const bool useCustomScrollBars = UseCustomScrollBars();
+
+    if (useCustomScrollBars) {
+        SetNativeEditorScrollBarVisibility(false, false);
+
+        bool verticalVisible = verticalScrollBarVisible_;
+        bool horizontalVisible = horizontalScrollBarVisible_ && !wordWrap_;
+        for (int pass = 0; pass < 4; ++pass) {
+            ApplyEditorAndScrollBarLayout(hostRect, verticalVisible, horizontalVisible, false);
+            const RECT editorRect = GetEditorRectForScrollBars(hostRect, verticalVisible, horizontalVisible);
+            const int availableWidth = std::max(0, static_cast<int>(editorRect.right - editorRect.left));
+            const int availableHeight = std::max(0, static_cast<int>(editorRect.bottom - editorRect.top));
+            const bool nextHorizontalVisible = !wordWrap_ && NeedsHorizontalScrollBar(availableWidth);
+            const bool nextVerticalVisible = NeedsVerticalScrollBar(availableHeight);
+
+            if (nextVerticalVisible == verticalVisible && nextHorizontalVisible == horizontalVisible) {
+                break;
+            }
+
+            verticalVisible = nextVerticalVisible;
+            horizontalVisible = nextHorizontalVisible;
+        }
+
+        ApplyEditorAndScrollBarLayout(hostRect, verticalVisible, horizontalVisible, true);
+        SetEditorScrollBarVisibility(verticalVisible, horizontalVisible);
+        updatingScrollBars_ = false;
+        return;
+    }
+
+    ApplyEditorAndScrollBarLayout(hostRect, false, false, false);
+
+    RECT clientRect{};
+    GetClientRect(editor_, &clientRect);
+
+    const int verticalMetric = GetSystemMetrics(SM_CXVSCROLL);
+    const int horizontalMetric = GetSystemMetrics(SM_CYHSCROLL);
+    const int baseWidth = std::max(
+        0,
+        static_cast<int>(clientRect.right - clientRect.left) +
+            (verticalScrollBarVisible_ ? verticalMetric : 0));
+    const int baseHeight = std::max(
+        0,
+        static_cast<int>(clientRect.bottom - clientRect.top) +
+            (horizontalScrollBarVisible_ ? horizontalMetric : 0));
+
+    bool verticalVisible = false;
+    bool horizontalVisible = false;
+    for (int pass = 0; pass < 3; ++pass) {
+        const int availableWidth = std::max(0, baseWidth - (verticalVisible ? verticalMetric : 0));
+        const int availableHeight = std::max(0, baseHeight - (horizontalVisible ? horizontalMetric : 0));
+        const bool nextVerticalVisible = NeedsVerticalScrollBar(availableHeight);
+        const bool nextHorizontalVisible = !wordWrap_ && NeedsHorizontalScrollBar(availableWidth);
+
+        if (nextVerticalVisible == verticalVisible && nextHorizontalVisible == horizontalVisible) {
+            break;
+        }
+
+        verticalVisible = nextVerticalVisible;
+        horizontalVisible = nextHorizontalVisible;
+    }
+
+    SetEditorScrollBarVisibility(verticalVisible, horizontalVisible);
+    ApplyEditorAndScrollBarLayout(hostRect, verticalVisible, horizontalVisible, true);
+    updatingScrollBars_ = false;
+}
+
+int ClassicNotepadApp::GetEditorLineHeight() const
+{
+    if (editor_ == nullptr) {
+        return 1;
+    }
+
+    HDC deviceContext = GetDC(editor_);
+    if (deviceContext == nullptr) {
+        return 1;
+    }
+
+    HGDIOBJ previousFont = nullptr;
+    if (editorFont_ != nullptr) {
+        previousFont = SelectObject(deviceContext, editorFont_);
+    }
+
+    TEXTMETRICW textMetrics{};
+    const bool measured = GetTextMetricsW(deviceContext, &textMetrics) != 0;
+
+    if (previousFont != nullptr) {
+        SelectObject(deviceContext, previousFont);
+    }
+    ReleaseDC(editor_, deviceContext);
+
+    if (!measured) {
+        return 1;
+    }
+
+    return std::max(1, static_cast<int>(textMetrics.tmHeight + textMetrics.tmExternalLeading));
+}
+
+int ClassicNotepadApp::MeasureWidestEditorLine() const
+{
+    if (editor_ == nullptr) {
+        return 0;
+    }
+
+    HDC deviceContext = GetDC(editor_);
+    if (deviceContext == nullptr) {
+        return 0;
+    }
+
+    HGDIOBJ previousFont = nullptr;
+    if (editorFont_ != nullptr) {
+        previousFont = SelectObject(deviceContext, editorFont_);
+    }
+
+    int widestLine = 0;
+    const std::wstring text = GetEditorText();
+    std::size_t lineStart = 0;
+    for (std::size_t index = 0; index <= text.size(); ++index) {
+        const bool atEnd = index == text.size();
+        const bool atLineBreak = !atEnd && (text[index] == L'\r' || text[index] == L'\n');
+        if (!atEnd && !atLineBreak) {
+            continue;
+        }
+
+        const std::wstring line = ExpandTabsForPrinting(text.substr(lineStart, index - lineStart));
+        SIZE textSize{};
+        if (!line.empty() &&
+            GetTextExtentPoint32W(
+                deviceContext,
+                line.c_str(),
+                static_cast<int>(std::min<std::size_t>(
+                    line.size(),
+                    static_cast<std::size_t>(std::numeric_limits<int>::max()))),
+                &textSize)) {
+            widestLine = std::max(widestLine, static_cast<int>(textSize.cx));
+        }
+
+        if (!atEnd && text[index] == L'\r' && index + 1U < text.size() && text[index + 1U] == L'\n') {
+            ++index;
+        }
+        lineStart = index + 1U;
+    }
+
+    if (previousFont != nullptr) {
+        SelectObject(deviceContext, previousFont);
+    }
+    ReleaseDC(editor_, deviceContext);
+
+    return widestLine;
+}
+
+bool ClassicNotepadApp::NeedsVerticalScrollBar(int availableHeight) const
+{
+    if (editor_ == nullptr || availableHeight <= 0) {
+        return false;
+    }
+
+    const int lineCount = std::max<int>(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
+    return lineCount * GetEditorLineHeight() > availableHeight;
+}
+
+bool ClassicNotepadApp::NeedsHorizontalScrollBar(int availableWidth) const
+{
+    if (editor_ == nullptr || availableWidth <= 0) {
+        return false;
+    }
+
+    return MeasureWidestEditorLine() > std::max(0, availableWidth - 8);
+}
+
+void ClassicNotepadApp::SetEditorScrollBarVisibility(bool verticalVisible, bool horizontalVisible)
+{
+    if (editor_ == nullptr) {
+        verticalScrollBarVisible_ = verticalVisible;
+        horizontalScrollBarVisible_ = horizontalVisible;
+        return;
+    }
+
+    horizontalVisible = horizontalVisible && !wordWrap_;
+    const bool verticalChanged = verticalScrollBarVisible_ != verticalVisible;
+    const bool horizontalChanged = horizontalScrollBarVisible_ != horizontalVisible;
+
+    // ShowScrollBar can synchronously send WM_SIZE back through the edit callback.
+    // Store the requested state first so a re-entrant UpdateScrollBars call sees
+    // the new truth instead of repeatedly asking USER32 for the same transition.
+    verticalScrollBarVisible_ = verticalVisible;
+    horizontalScrollBarVisible_ = horizontalVisible;
+
+    const bool useCustomScrollBars = UseCustomScrollBars();
+    const bool nativeVerticalVisible = !useCustomScrollBars && verticalVisible;
+    const bool nativeHorizontalVisible = !useCustomScrollBars && horizontalVisible;
+
+    SetNativeEditorScrollBarVisibility(nativeVerticalVisible, nativeHorizontalVisible);
+
+    if (verticalChanged && !verticalVisible) {
+        const int firstVisibleLine = static_cast<int>(SendMessageW(editor_, EM_GETFIRSTVISIBLELINE, 0, 0));
+        if (firstVisibleLine > 0) {
+            SendMessageW(editor_, EM_LINESCROLL, 0, -firstVisibleLine);
+        }
+    }
+
+    if (horizontalChanged && !horizontalVisible) {
+        horizontalScrollPosition_ = 0;
+        SendMessageW(editor_, WM_HSCROLL, SB_LEFT, 0);
+    } else if (useCustomScrollBars && horizontalVisible) {
+        const ScrollBarMetrics horizontalMetrics = GetCustomScrollBarMetrics(ScrollBarOrientation::Horizontal);
+        horizontalScrollPosition_ = horizontalMetrics.position;
+    }
+
+    if (useCustomScrollBars) {
+        const RECT verticalThumb = verticalVisible ? GetCustomScrollBarThumbRect(ScrollBarOrientation::Vertical) : RECT{};
+        const RECT horizontalThumb = horizontalVisible ? GetCustomScrollBarThumbRect(ScrollBarOrientation::Horizontal) : RECT{};
+
+        if (verticalScrollBar_ != nullptr &&
+            (lastVerticalScrollBarPainted_ != verticalVisible ||
+                !EqualRect(&lastVerticalScrollBarThumb_, &verticalThumb))) {
+            InvalidateRect(verticalScrollBar_, nullptr, FALSE);
+        }
+        if (horizontalScrollBar_ != nullptr &&
+            (lastHorizontalScrollBarPainted_ != horizontalVisible ||
+                !EqualRect(&lastHorizontalScrollBarThumb_, &horizontalThumb))) {
+            InvalidateRect(horizontalScrollBar_, nullptr, FALSE);
+        }
+        if (scrollCorner_ != nullptr && (verticalChanged || horizontalChanged)) {
+            InvalidateRect(scrollCorner_, nullptr, FALSE);
+        }
+
+        lastVerticalScrollBarThumb_ = verticalThumb;
+        lastHorizontalScrollBarThumb_ = horizontalThumb;
+        lastVerticalScrollBarPainted_ = verticalVisible;
+        lastHorizontalScrollBarPainted_ = horizontalVisible;
+    } else {
+        lastVerticalScrollBarThumb_ = RECT{};
+        lastHorizontalScrollBarThumb_ = RECT{};
+        lastVerticalScrollBarPainted_ = false;
+        lastHorizontalScrollBarPainted_ = false;
+    }
+}
+
+void ClassicNotepadApp::SetNativeEditorScrollBarVisibility(bool verticalVisible, bool horizontalVisible)
+{
+    if (editor_ == nullptr) {
+        nativeVerticalScrollBarVisible_ = verticalVisible;
+        nativeHorizontalScrollBarVisible_ = horizontalVisible;
+        return;
+    }
+
+    if (nativeVerticalScrollBarVisible_ != verticalVisible) {
+        nativeVerticalScrollBarVisible_ = verticalVisible;
+        ShowScrollBar(editor_, SB_VERT, verticalVisible ? TRUE : FALSE);
+    }
+
+    if (nativeHorizontalScrollBarVisible_ != horizontalVisible) {
+        nativeHorizontalScrollBarVisible_ = horizontalVisible;
+        ShowScrollBar(editor_, SB_HORZ, horizontalVisible ? TRUE : FALSE);
+    }
+}
+
+ClassicNotepadApp::ScrollBarMetrics ClassicNotepadApp::GetCustomScrollBarMetrics(ScrollBarOrientation orientation) const
+{
+    ScrollBarMetrics metrics{};
+    if (editor_ == nullptr) {
+        return metrics;
+    }
+
+    RECT clientRect{};
+    GetClientRect(editor_, &clientRect);
+
+    if (orientation == ScrollBarOrientation::Vertical) {
+        const int lineHeight = GetEditorLineHeight();
+        const int clientHeight = std::max(0, static_cast<int>(clientRect.bottom - clientRect.top));
+        const int lineCount = std::max<int>(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
+        metrics.minimum = 0;
+        metrics.maximum = std::max(0, lineCount - 1);
+        metrics.page = std::max(1, clientHeight / lineHeight);
+        const int maxPosition = std::max(metrics.minimum, metrics.maximum - metrics.page + 1);
+        const int firstVisibleLine = static_cast<int>(SendMessageW(editor_, EM_GETFIRSTVISIBLELINE, 0, 0));
+        metrics.position = std::clamp(firstVisibleLine, metrics.minimum, maxPosition);
+        return metrics;
+    }
+
+    const int unit = GetEditorHorizontalScrollUnit();
+    const int clientWidth = std::max(0, static_cast<int>(clientRect.right - clientRect.left));
+    const int widestLine = MeasureWidestEditorLine();
+    const int viewportWidth = std::max(0, clientWidth - 8);
+    const int rangeUnits = std::max(1, (widestLine + unit - 1) / unit);
+    metrics.minimum = 0;
+    metrics.maximum = std::max(0, rangeUnits - 1);
+    metrics.page = std::max(1, viewportWidth / unit);
+    const int maxPosition = std::max(metrics.minimum, metrics.maximum - metrics.page + 1);
+    metrics.position = std::clamp(horizontalScrollPosition_, metrics.minimum, maxPosition);
+    return metrics;
+}
+
+int ClassicNotepadApp::GetEditorHorizontalScrollUnit() const
+{
+    if (editor_ == nullptr) {
+        return 1;
+    }
+
+    HDC deviceContext = GetDC(editor_);
+    if (deviceContext == nullptr) {
+        return 1;
+    }
+
+    HGDIOBJ previousFont = nullptr;
+    if (editorFont_ != nullptr) {
+        previousFont = SelectObject(deviceContext, editorFont_);
+    }
+
+    TEXTMETRICW textMetrics{};
+    const bool measured = GetTextMetricsW(deviceContext, &textMetrics) != 0;
+
+    if (previousFont != nullptr) {
+        SelectObject(deviceContext, previousFont);
+    }
+    ReleaseDC(editor_, deviceContext);
+
+    if (!measured) {
+        return 1;
+    }
+
+    return std::max(1, static_cast<int>(textMetrics.tmAveCharWidth));
+}
+
+RECT ClassicNotepadApp::GetCustomScrollBarThumbRect(ScrollBarOrientation orientation) const
+{
+    HWND scrollBar = orientation == ScrollBarOrientation::Vertical ? verticalScrollBar_ : horizontalScrollBar_;
+    RECT clientRect{};
+    if (scrollBar == nullptr) {
+        return clientRect;
+    }
+
+    GetClientRect(scrollBar, &clientRect);
+    if (IsRectEmpty(&clientRect)) {
+        return clientRect;
+    }
+
+    const ScrollBarMetrics metrics = GetCustomScrollBarMetrics(orientation);
+    const int minimum = metrics.minimum;
+    const int maximum = metrics.maximum;
+    const int page = std::max(1, metrics.page);
+    const int range = std::max(1, maximum - minimum + 1);
+    const int maxPosition = std::max(minimum, maximum - page + 1);
+    const int position = std::clamp(metrics.position, minimum, maxPosition);
+    if (maxPosition <= minimum) {
+        return RECT{};
+    }
+
+    const int trackLength = orientation == ScrollBarOrientation::Vertical
+        ? std::max(0, static_cast<int>(clientRect.bottom - clientRect.top))
+        : std::max(0, static_cast<int>(clientRect.right - clientRect.left));
+    if (trackLength <= 0) {
+        return clientRect;
+    }
+
+    int thumbLength = MulDiv(trackLength, std::min(page, range), range);
+    thumbLength = std::clamp(thumbLength, std::min(trackLength, kMinimumScrollThumbLength), trackLength);
+
+    const int movableLength = std::max(0, trackLength - thumbLength);
+    const int scrollableRange = std::max(1, maxPosition - minimum);
+    const int thumbOffset = maxPosition > minimum
+        ? MulDiv(position - minimum, movableLength, scrollableRange)
+        : 0;
+
+    RECT thumbRect = clientRect;
+    if (orientation == ScrollBarOrientation::Vertical) {
+        thumbRect.top = clientRect.top + thumbOffset;
+        thumbRect.bottom = thumbRect.top + thumbLength;
+        InflateRect(&thumbRect, -3, -2);
+    } else {
+        thumbRect.left = clientRect.left + thumbOffset;
+        thumbRect.right = thumbRect.left + thumbLength;
+        InflateRect(&thumbRect, -2, -3);
+    }
+
+    return thumbRect;
+}
+
+void ClassicNotepadApp::PaintCustomScrollBar(HWND scrollBar, HDC deviceContext) const
+{
+    if (scrollBar == nullptr || deviceContext == nullptr) {
+        return;
+    }
+
+    RECT clientRect{};
+    GetClientRect(scrollBar, &clientRect);
+    HBRUSH trackBrush = CreateSolidBrush(kDarkScrollTrack);
+    if (trackBrush != nullptr) {
+        FillRect(deviceContext, &clientRect, trackBrush);
+        DeleteObject(trackBrush);
+    }
+
+    if (scrollBar == scrollCorner_) {
+        return;
+    }
+
+    const ScrollBarOrientation orientation = scrollBar == verticalScrollBar_
+        ? ScrollBarOrientation::Vertical
+        : ScrollBarOrientation::Horizontal;
+    RECT thumbRect = GetCustomScrollBarThumbRect(orientation);
+    if (IsRectEmpty(&thumbRect)) {
+        return;
+    }
+
+    HBRUSH thumbBrush = CreateSolidBrush(customScrollBarDragging_ && activeScrollBar_ == orientation
+        ? kDarkScrollThumbActive
+        : kDarkScrollThumb);
+    if (thumbBrush != nullptr) {
+        FillRect(deviceContext, &thumbRect, thumbBrush);
+        DeleteObject(thumbBrush);
+    }
+}
+
+void ClassicNotepadApp::ScrollCustomScrollBarByPage(ScrollBarOrientation orientation, bool forward)
+{
+    if (editor_ == nullptr) {
+        return;
+    }
+
+    const ScrollBarMetrics metrics = GetCustomScrollBarMetrics(orientation);
+    const int maxPosition = std::max(metrics.minimum, metrics.maximum - metrics.page + 1);
+    const int delta = std::max(1, metrics.page);
+    const int target = metrics.position + (forward ? delta : -delta);
+    ScrollCustomScrollBarToPosition(orientation, std::clamp(target, metrics.minimum, maxPosition));
+}
+
+void ClassicNotepadApp::ScrollCustomScrollBarToPosition(ScrollBarOrientation orientation, int targetPosition)
+{
+    if (editor_ == nullptr) {
+        return;
+    }
+
+    const ScrollBarMetrics metrics = GetCustomScrollBarMetrics(orientation);
+    const int minimum = metrics.minimum;
+    const int maximum = metrics.maximum;
+    const int page = std::max(1, metrics.page);
+    const int maxPosition = std::max(minimum, maximum - page + 1);
+    const int target = std::clamp(targetPosition, minimum, maxPosition);
+    const int delta = target - metrics.position;
+    if (delta == 0) {
+        return;
+    }
+
+    if (orientation == ScrollBarOrientation::Vertical) {
+        SendMessageW(editor_, EM_LINESCROLL, 0, delta);
+    } else {
+        horizontalScrollPosition_ = target;
+        SendMessageW(editor_, EM_LINESCROLL, delta, 0);
+    }
+
+    UpdateStatusBar();
+    UpdateScrollBars();
+    InvalidateRect(editor_, nullptr, FALSE);
+}
+
+void ClassicNotepadApp::BeginCustomScrollBarInteraction(HWND scrollBar, LPARAM lParam)
+{
+    if (scrollBar != verticalScrollBar_ && scrollBar != horizontalScrollBar_) {
+        return;
+    }
+
+    const ScrollBarOrientation orientation = scrollBar == verticalScrollBar_
+        ? ScrollBarOrientation::Vertical
+        : ScrollBarOrientation::Horizontal;
+    const POINT point{
+        static_cast<LONG>(static_cast<short>(LOWORD(lParam))),
+        static_cast<LONG>(static_cast<short>(HIWORD(lParam)))
+    };
+    const RECT thumbRect = GetCustomScrollBarThumbRect(orientation);
+    if (!IsRectEmpty(&thumbRect) && PtInRect(&thumbRect, point)) {
+        const ScrollBarMetrics metrics = GetCustomScrollBarMetrics(orientation);
+        customScrollBarDragging_ = true;
+        activeScrollBar_ = orientation;
+        scrollBarDragStartMouse_ = orientation == ScrollBarOrientation::Vertical ? point.y : point.x;
+        scrollBarDragStartPosition_ = metrics.position;
+        SetCapture(scrollBar);
+        InvalidateRect(scrollBar, nullptr, FALSE);
+        return;
+    }
+
+    const int coordinate = orientation == ScrollBarOrientation::Vertical ? point.y : point.x;
+    const int thumbStart = orientation == ScrollBarOrientation::Vertical ? thumbRect.top : thumbRect.left;
+    ScrollCustomScrollBarByPage(orientation, coordinate > thumbStart);
+}
+
+void ClassicNotepadApp::UpdateCustomScrollBarDrag(HWND scrollBar, LPARAM lParam)
+{
+    if (!customScrollBarDragging_ ||
+        (activeScrollBar_ == ScrollBarOrientation::Vertical && scrollBar != verticalScrollBar_) ||
+        (activeScrollBar_ == ScrollBarOrientation::Horizontal && scrollBar != horizontalScrollBar_)) {
+        return;
+    }
+
+    RECT clientRect{};
+    GetClientRect(scrollBar, &clientRect);
+    const int trackLength = activeScrollBar_ == ScrollBarOrientation::Vertical
+        ? std::max(0, static_cast<int>(clientRect.bottom - clientRect.top))
+        : std::max(0, static_cast<int>(clientRect.right - clientRect.left));
+
+    RECT thumbRect = GetCustomScrollBarThumbRect(activeScrollBar_);
+    const int thumbLength = activeScrollBar_ == ScrollBarOrientation::Vertical
+        ? std::max(1, static_cast<int>(thumbRect.bottom - thumbRect.top))
+        : std::max(1, static_cast<int>(thumbRect.right - thumbRect.left));
+    const int movableLength = std::max(1, trackLength - thumbLength);
+
+    const ScrollBarMetrics metrics = GetCustomScrollBarMetrics(activeScrollBar_);
+    const int minimum = metrics.minimum;
+    const int maximum = metrics.maximum;
+    const int page = std::max(1, metrics.page);
+    const int maxPosition = std::max(minimum, maximum - page + 1);
+    const int scrollableRange = std::max(1, maxPosition - minimum);
+
+    const int mousePosition = activeScrollBar_ == ScrollBarOrientation::Vertical
+        ? static_cast<int>(static_cast<short>(HIWORD(lParam)))
+        : static_cast<int>(static_cast<short>(LOWORD(lParam)));
+    const int mouseDelta = mousePosition - scrollBarDragStartMouse_;
+    const int positionDelta = MulDiv(mouseDelta, scrollableRange, movableLength);
+    ScrollCustomScrollBarToPosition(activeScrollBar_, scrollBarDragStartPosition_ + positionDelta);
+}
+
+void ClassicNotepadApp::EndCustomScrollBarDrag(HWND scrollBar)
+{
+    if (!customScrollBarDragging_) {
+        return;
+    }
+
+    customScrollBarDragging_ = false;
+    if (GetCapture() == scrollBar) {
+        ReleaseCapture();
+    }
+
+    if (verticalScrollBar_ != nullptr) {
+        InvalidateRect(verticalScrollBar_, nullptr, FALSE);
+    }
+    if (horizontalScrollBar_ != nullptr) {
+        InvalidateRect(horizontalScrollBar_, nullptr, FALSE);
+    }
 }
 
 void ClassicNotepadApp::UpdateTitle()
@@ -736,12 +1999,196 @@ void ClassicNotepadApp::UpdateStatusBar()
     const int column = caretPosition >= lineStartPosition
         ? static_cast<int>(caretPosition - lineStartPosition) + 1
         : 1;
-    std::wstring text = L"Ln ";
-    text += std::to_wstring(line);
-    text += L", Col ";
-    text += std::to_wstring(column);
+    statusBarText_ = L"Ln ";
+    statusBarText_ += std::to_wstring(line);
+    statusBarText_ += L", Col ";
+    statusBarText_ += std::to_wstring(column);
+    statusBarText_ += L" | ";
+    statusBarText_ += FormatCharacterCount(CountStatusCharacters(GetEditorText()));
+    statusBarText_ += L" | ";
+    statusBarText_ += FormatLineEnding(document_.LineEnding());
+    statusBarText_ += L" | ";
+    statusBarText_ += FormatEncoding(document_.Encoding());
 
-    SendMessageW(statusBar_, SB_SETTEXTW, 0, reinterpret_cast<LPARAM>(text.c_str()));
+    const WPARAM part = darkModeEnabled_ ? (SBT_OWNERDRAW | SBT_NOBORDERS) : 0;
+    SendMessageW(statusBar_, SB_SETTEXTW, part, reinterpret_cast<LPARAM>(statusBarText_.c_str()));
+}
+
+void ClassicNotepadApp::UpdateStatusBarSizeGripStyle()
+{
+    if (statusBar_ == nullptr) {
+        return;
+    }
+
+    const LONG_PTR currentStyle = GetWindowLongPtrW(statusBar_, GWL_STYLE);
+    const LONG_PTR wantedStyle = darkModeEnabled_
+        ? ((currentStyle & ~static_cast<LONG_PTR>(SBARS_SIZEGRIP)) | static_cast<LONG_PTR>(CCS_NODIVIDER))
+        : ((currentStyle | static_cast<LONG_PTR>(SBARS_SIZEGRIP)) & ~static_cast<LONG_PTR>(CCS_NODIVIDER));
+
+    if (wantedStyle != currentStyle) {
+        SetWindowLongPtrW(statusBar_, GWL_STYLE, wantedStyle);
+        SetWindowPos(
+            statusBar_,
+            nullptr,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        SendMessageW(statusBar_, WM_SIZE, 0, 0);
+    }
+}
+
+RECT ClassicNotepadApp::GetStatusBarResizeGripRect() const
+{
+    RECT gripRect{};
+    if (statusBar_ == nullptr || !statusBarVisible_) {
+        return gripRect;
+    }
+
+    GetClientRect(statusBar_, &gripRect);
+    const int statusHeight = std::max(0, static_cast<int>(gripRect.bottom - gripRect.top));
+    const int statusWidth = std::max(0, static_cast<int>(gripRect.right - gripRect.left));
+    const int gripSize = std::min(
+        statusWidth,
+        std::max(statusHeight, std::max(GetSystemMetrics(SM_CXVSCROLL), GetSystemMetrics(SM_CYHSCROLL))));
+    gripRect.left = std::max(gripRect.left, gripRect.right - gripSize);
+    gripRect.top = std::max(gripRect.top, gripRect.bottom - gripSize);
+    return gripRect;
+}
+
+RECT ClassicNotepadApp::GetResizeGripRect() const
+{
+    RECT gripRect = GetStatusBarResizeGripRect();
+    if (statusBar_ == nullptr || IsRectEmpty(&gripRect)) {
+        return RECT{};
+    }
+
+    MapWindowPoints(statusBar_, mainWindow_, reinterpret_cast<POINT*>(&gripRect), 2);
+    return gripRect;
+}
+
+bool ClassicNotepadApp::IsResizableFromGrip() const
+{
+    if (mainWindow_ == nullptr || IsZoomed(mainWindow_)) {
+        return false;
+    }
+
+    const LONG_PTR style = GetWindowLongPtrW(mainWindow_, GWL_STYLE);
+    return (style & WS_THICKFRAME) != 0;
+}
+
+bool ClassicNotepadApp::IsPointInStatusBarResizeGrip(POINT point) const
+{
+    if (!darkModeEnabled_ || !IsResizableFromGrip()) {
+        return false;
+    }
+
+    const RECT gripRect = GetStatusBarResizeGripRect();
+    return !IsRectEmpty(&gripRect) && PtInRect(&gripRect, point) != 0;
+}
+
+void ClassicNotepadApp::DrawDarkResizeGrip(HDC deviceContext) const
+{
+    if (!darkModeEnabled_ || deviceContext == nullptr || !IsResizableFromGrip()) {
+        return;
+    }
+
+    const RECT gripRect = GetStatusBarResizeGripRect();
+    if (IsRectEmpty(&gripRect)) {
+        return;
+    }
+
+    RECT paintRect = gripRect;
+    RECT statusRect{};
+    GetClientRect(statusBar_, &statusRect);
+    paintRect.left = std::max(statusRect.left, paintRect.left - 2);
+    paintRect.top = statusRect.top;
+    paintRect.right = statusRect.right;
+    paintRect.bottom = statusRect.bottom;
+
+    HBRUSH backgroundBrush = darkStatusBackgroundBrush_ != nullptr
+        ? darkStatusBackgroundBrush_
+        : reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+    FillRect(deviceContext, &paintRect, backgroundBrush);
+
+    HPEN pen = CreatePen(PS_SOLID, 1, kDarkResizeGrip);
+    if (pen == nullptr) {
+        return;
+    }
+
+    HGDIOBJ previousPen = SelectObject(deviceContext, pen);
+    for (int index = 0; index < 3; ++index) {
+        const int inset = 4 + index * 4;
+        MoveToEx(deviceContext, paintRect.right - inset, paintRect.bottom - 3, nullptr);
+        LineTo(deviceContext, paintRect.right - 3, paintRect.bottom - inset);
+    }
+
+    if (previousPen != nullptr) {
+        SelectObject(deviceContext, previousPen);
+    }
+    DeleteObject(pen);
+}
+
+void ClassicNotepadApp::DrawDarkStatusBarChrome(HDC deviceContext) const
+{
+    if (!darkModeEnabled_ || deviceContext == nullptr || statusBar_ == nullptr) {
+        return;
+    }
+
+    RECT statusRect{};
+    GetClientRect(statusBar_, &statusRect);
+    if (IsRectEmpty(&statusRect)) {
+        return;
+    }
+
+    DrawDarkResizeGrip(deviceContext);
+
+    HBRUSH lineBrush = CreateSolidBrush(kDarkKeyLine);
+    if (lineBrush != nullptr) {
+        RECT topLine = statusRect;
+        topLine.bottom = topLine.top + 1;
+        FillRect(deviceContext, &topLine, lineBrush);
+
+        RECT bottomLine = statusRect;
+        bottomLine.top = std::max(bottomLine.top, bottomLine.bottom - 1);
+        FillRect(deviceContext, &bottomLine, lineBrush);
+
+        const RECT gripRect = GetStatusBarResizeGripRect();
+        if (!IsRectEmpty(&gripRect)) {
+            RECT gripLeftLine = gripRect;
+            gripLeftLine.right = gripLeftLine.left + 1;
+            FillRect(deviceContext, &gripLeftLine, lineBrush);
+        }
+
+        DeleteObject(lineBrush);
+    }
+}
+
+bool ClassicNotepadApp::StartResizeFromStatusGrip(HWND statusBar, LPARAM lParam) const
+{
+    if (statusBar != statusBar_ || !IsResizableFromGrip()) {
+        return false;
+    }
+
+    POINT point{
+        static_cast<LONG>(static_cast<short>(LOWORD(lParam))),
+        static_cast<LONG>(static_cast<short>(HIWORD(lParam)))
+    };
+
+    if (!IsPointInStatusBarResizeGrip(point)) {
+        return false;
+    }
+
+    POINT screenPoint{};
+    GetCursorPos(&screenPoint);
+    ReleaseCapture();
+    SendMessageW(
+        mainWindow_,
+        WM_NCLBUTTONDOWN,
+        HTBOTTOMRIGHT,
+        MAKELPARAM(static_cast<short>(screenPoint.x), static_cast<short>(screenPoint.y)));
+    return true;
 }
 
 void ClassicNotepadApp::RefreshSpellCheck(bool immediate)
@@ -1084,6 +2531,7 @@ void ClassicNotepadApp::HandleEditorChanged()
     }
 
     UpdateStatusBar();
+    UpdateScrollBars();
     RefreshSpellCheck(false);
 
     if (!document_.IsModified()) {
@@ -1249,6 +2697,7 @@ void ClassicNotepadApp::HandleUndo()
 {
     SendMessageW(editor_, EM_UNDO, 0, 0);
     UpdateStatusBar();
+    UpdateScrollBars();
     SetFocus(editor_);
 }
 
@@ -1256,6 +2705,7 @@ void ClassicNotepadApp::HandleCut()
 {
     SendMessageW(editor_, WM_CUT, 0, 0);
     UpdateStatusBar();
+    UpdateScrollBars();
     SetFocus(editor_);
 }
 
@@ -1269,6 +2719,7 @@ void ClassicNotepadApp::HandlePaste()
 {
     SendMessageW(editor_, WM_PASTE, 0, 0);
     UpdateStatusBar();
+    UpdateScrollBars();
     SetFocus(editor_);
 }
 
@@ -1276,6 +2727,7 @@ void ClassicNotepadApp::HandleDelete()
 {
     SendMessageW(editor_, WM_CLEAR, 0, 0);
     UpdateStatusBar();
+    UpdateScrollBars();
     SetFocus(editor_);
 }
 
@@ -1417,10 +2869,11 @@ void ClassicNotepadApp::HandleToggleWordWrap()
 
     ResizeEditor();
     UpdateStatusBar();
+    UpdateScrollBars();
     RefreshSpellCheck(true);
     UpdateTitle();
-    UpdateMenuState(GetMenu(mainWindow_));
-    DrawMenuBar(mainWindow_);
+    UpdateMenuState(ActiveMenu());
+    UpdateMenuChrome();
     if (hadFocus) {
         SetFocus(editor_);
     }
@@ -1464,6 +2917,7 @@ void ClassicNotepadApp::HandleChooseFont()
 
     ResizeEditor();
     UpdateStatusBar();
+    UpdateScrollBars();
     InvalidateRect(editor_, nullptr, FALSE);
     SetFocus(editor_);
 }
@@ -1477,8 +2931,9 @@ void ClassicNotepadApp::HandleToggleStatusBar()
 
     ResizeEditor();
     UpdateStatusBar();
-    UpdateMenuState(GetMenu(mainWindow_));
-    DrawMenuBar(mainWindow_);
+    UpdateScrollBars();
+    UpdateMenuState(ActiveMenu());
+    UpdateMenuChrome();
     SetFocus(editor_);
 }
 
@@ -1559,17 +3014,20 @@ std::wstring ClassicNotepadApp::GetSelectedText() const
 
 void ClassicNotepadApp::SetEditorText(const std::wstring& text)
 {
+    horizontalScrollPosition_ = 0;
     suppressEditorChange_ = true;
     SetWindowTextW(editor_, text.c_str());
     SendMessageW(editor_, EM_EMPTYUNDOBUFFER, 0, 0);
     SendMessageW(editor_, EM_SETMODIFY, FALSE, 0);
     suppressEditorChange_ = false;
     UpdateStatusBar();
+    UpdateScrollBars();
     RefreshSpellCheck(true);
 }
 
 void ClassicNotepadApp::ReplaceEditorTextFromCommand(const std::wstring& text)
 {
+    horizontalScrollPosition_ = 0;
     suppressEditorChange_ = true;
     SetWindowTextW(editor_, text.c_str());
     SendMessageW(editor_, EM_EMPTYUNDOBUFFER, 0, 0);
@@ -1579,6 +3037,7 @@ void ClassicNotepadApp::ReplaceEditorTextFromCommand(const std::wstring& text)
     document_.SetModified(true);
     UpdateTitle();
     UpdateStatusBar();
+    UpdateScrollBars();
     RefreshSpellCheck(true);
 }
 
@@ -1658,6 +3117,7 @@ bool ClassicNotepadApp::FindNextWithFlags(DWORD flags, bool showNotFoundMessage)
                 SendMessageW(editor_, EM_SETSEL, position, position + needle.size());
                 SendMessageW(editor_, EM_SCROLLCARET, 0, 0);
                 UpdateStatusBar();
+                UpdateScrollBars();
                 SetFocus(editor_);
                 findFlags_ = flags & kFindOptionFlags;
                 return true;
@@ -1670,6 +3130,7 @@ bool ClassicNotepadApp::FindNextWithFlags(DWORD flags, bool showNotFoundMessage)
                 SendMessageW(editor_, EM_SETSEL, position, position + needle.size());
                 SendMessageW(editor_, EM_SCROLLCARET, 0, 0);
                 UpdateStatusBar();
+                UpdateScrollBars();
                 SetFocus(editor_);
                 findFlags_ = flags & kFindOptionFlags;
                 return true;
@@ -1742,6 +3203,7 @@ void ClassicNotepadApp::ReplaceAllMatches(DWORD flags)
     SendMessageW(editor_, EM_SETSEL, 0, 0);
     SendMessageW(editor_, EM_SCROLLCARET, 0, 0);
     UpdateStatusBar();
+    UpdateScrollBars();
     SetFocus(editor_);
 }
 
@@ -2007,6 +3469,7 @@ void ClassicNotepadApp::GoToLine(int lineNumber)
     SendMessageW(editor_, EM_SETSEL, static_cast<WPARAM>(characterIndex), static_cast<LPARAM>(characterIndex));
     SendMessageW(editor_, EM_SCROLLCARET, 0, 0);
     UpdateStatusBar();
+    UpdateScrollBars();
     SetFocus(editor_);
 }
 
@@ -2105,9 +3568,22 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
 
     switch (message) {
     case WM_CREATE:
+        mainMenu_ = GetMenu(mainWindow_);
+        menuBar_ = CreateMenuBar();
+        if (menuBar_ == nullptr) {
+            MessageBoxW(mainWindow_, L"Could not create the menu bar.", L"Classic Notepad", MB_OK | MB_ICONERROR);
+            return -1;
+        }
         editor_ = CreateEditor();
         if (editor_ == nullptr) {
             MessageBoxW(mainWindow_, L"Could not create the editor control.", L"Classic Notepad", MB_OK | MB_ICONERROR);
+            return -1;
+        }
+        verticalScrollBar_ = CreateCustomScrollBar(ScrollBarOrientation::Vertical);
+        horizontalScrollBar_ = CreateCustomScrollBar(ScrollBarOrientation::Horizontal);
+        scrollCorner_ = CreateScrollCorner();
+        if (verticalScrollBar_ == nullptr || horizontalScrollBar_ == nullptr || scrollCorner_ == nullptr) {
+            MessageBoxW(mainWindow_, L"Could not create the custom scrollbars.", L"Classic Notepad", MB_OK | MB_ICONERROR);
             return -1;
         }
         statusBar_ = CreateStatusBar();
@@ -2138,11 +3614,42 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
         }
         return 0;
 
+    case WM_SYSKEYDOWN:
+        if (wParam == VK_MENU && ActivateMenuBarFromKeyboard()) {
+            return 0;
+        }
+        break;
+
+    case WM_SYSCHAR:
+        if (ActivateMenuMnemonic(static_cast<wchar_t>(wParam))) {
+            return 0;
+        }
+        break;
+
+    case WM_SYSKEYUP:
+        if (wParam == VK_MENU && menuKeyboardActive_) {
+            return 0;
+        }
+        break;
+
     case WM_SETTINGCHANGE:
     case WM_SYSCOLORCHANGE:
     case WM_THEMECHANGED:
         UpdateThemeFromSystem();
         return 0;
+
+    case WM_NCHITTEST: {
+        POINT point{
+            static_cast<LONG>(static_cast<short>(LOWORD(lParam))),
+            static_cast<LONG>(static_cast<short>(HIWORD(lParam)))
+        };
+        ScreenToClient(mainWindow_, &point);
+        const RECT gripRect = GetResizeGripRect();
+        if (darkModeEnabled_ && IsResizableFromGrip() && !IsRectEmpty(&gripRect) && PtInRect(&gripRect, point)) {
+            return HTBOTTOMRIGHT;
+        }
+        break;
+    }
 
     case WM_ERASEBKGND:
         if (darkModeEnabled_ && darkStatusBackgroundBrush_ != nullptr) {
@@ -2164,9 +3671,17 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
         break;
     }
 
+    case WM_DRAWITEM: {
+        const LRESULT drawItemResult = HandleDrawItem(wParam, lParam);
+        if (drawItemResult != 0) {
+            return drawItemResult;
+        }
+        break;
+    }
+
     case WM_INITMENUPOPUP:
         if (HIWORD(lParam) == 0) {
-            UpdateMenuState(GetMenu(mainWindow_));
+            UpdateMenuState(ActiveMenu());
         }
         return 0;
 
@@ -2290,6 +3805,10 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
             KillTimer(mainWindow_, spellCheckTimerId_);
             spellCheckTimerId_ = 0;
         }
+        if (mainMenu_ != nullptr && GetMenu(mainWindow_) != mainMenu_) {
+            DestroyMenu(mainMenu_);
+            mainMenu_ = nullptr;
+        }
         PostQuitMessage(0);
         return 0;
 
@@ -2378,11 +3897,255 @@ LRESULT CALLBACK ClassicNotepadApp::WindowProc(HWND window, UINT message, WPARAM
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
+LRESULT CALLBACK ClassicNotepadApp::MenuBarWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    ClassicNotepadApp* app = reinterpret_cast<ClassicNotepadApp*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+
+    if (message == WM_NCCREATE) {
+        auto* createStruct = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        app = static_cast<ClassicNotepadApp*>(createStruct->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
+    }
+
+    if (app == nullptr) {
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+
+    switch (message) {
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        HDC deviceContext = BeginPaint(window, &paint);
+        app->PaintMenuBar(deviceContext);
+        EndPaint(window, &paint);
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        POINT point{
+            static_cast<LONG>(static_cast<short>(LOWORD(lParam))),
+            static_cast<LONG>(static_cast<short>(HIWORD(lParam)))
+        };
+        app->SetHotMenuIndex(app->MenuIndexFromPoint(point));
+        if (!app->menuTrackingMouse_) {
+            TRACKMOUSEEVENT trackMouse{};
+            trackMouse.cbSize = sizeof(trackMouse);
+            trackMouse.dwFlags = TME_LEAVE;
+            trackMouse.hwndTrack = window;
+            app->menuTrackingMouse_ = TrackMouseEvent(&trackMouse) != 0;
+        }
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        app->menuTrackingMouse_ = false;
+        if (app->activeMenuIndex_ < 0 && !app->menuKeyboardActive_) {
+            app->SetHotMenuIndex(-1);
+        }
+        return 0;
+
+    case WM_LBUTTONDOWN: {
+        SetFocus(window);
+        POINT point{
+            static_cast<LONG>(static_cast<short>(LOWORD(lParam))),
+            static_cast<LONG>(static_cast<short>(HIWORD(lParam)))
+        };
+        const int index = app->MenuIndexFromPoint(point);
+        if (index >= 0) {
+            app->ShowMenuPopup(index, false);
+        }
+        return 0;
+    }
+
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
+        const int itemCount = app->GetTopLevelMenuCount();
+        if (itemCount <= 0) {
+            return 0;
+        }
+
+        int hotIndex = app->hotMenuIndex_ >= 0 ? app->hotMenuIndex_ : 0;
+        switch (wParam) {
+        case VK_LEFT:
+            hotIndex = (hotIndex + itemCount - 1) % itemCount;
+            app->menuKeyboardActive_ = true;
+            app->SetHotMenuIndex(hotIndex);
+            return 0;
+
+        case VK_RIGHT:
+            hotIndex = (hotIndex + 1) % itemCount;
+            app->menuKeyboardActive_ = true;
+            app->SetHotMenuIndex(hotIndex);
+            return 0;
+
+        case VK_HOME:
+            app->menuKeyboardActive_ = true;
+            app->SetHotMenuIndex(0);
+            return 0;
+
+        case VK_END:
+            app->menuKeyboardActive_ = true;
+            app->SetHotMenuIndex(itemCount - 1);
+            return 0;
+
+        case VK_DOWN:
+        case VK_RETURN:
+        case VK_SPACE:
+            app->ShowMenuPopup(hotIndex, true);
+            return 0;
+
+        case VK_ESCAPE:
+            app->ClearMenuMode();
+            if (app->editor_ != nullptr) {
+                SetFocus(app->editor_);
+            }
+            return 0;
+
+        default:
+            break;
+        }
+        break;
+    }
+
+    case WM_SYSCHAR:
+        if (app->ActivateMenuMnemonic(static_cast<wchar_t>(wParam))) {
+            return 0;
+        }
+        break;
+
+    case WM_SYSKEYUP:
+        if (wParam == VK_MENU && app->menuKeyboardActive_) {
+            return 0;
+        }
+        break;
+
+    case WM_GETDLGCODE:
+        return DLGC_WANTARROWS | DLGC_WANTCHARS;
+
+    case WM_KILLFOCUS:
+        if (app->activeMenuIndex_ < 0) {
+            app->ClearMenuMode();
+        }
+        return 0;
+
+    default:
+        break;
+    }
+
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+LRESULT CALLBACK ClassicNotepadApp::ScrollBarWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    ClassicNotepadApp* app = reinterpret_cast<ClassicNotepadApp*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+
+    if (message == WM_NCCREATE) {
+        auto* createStruct = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        app = static_cast<ClassicNotepadApp*>(createStruct->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
+    }
+
+    if (app == nullptr) {
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+
+    switch (message) {
+    case WM_ERASEBKGND:
+        return TRUE;
+
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        HDC deviceContext = BeginPaint(window, &paint);
+
+        RECT clientRect{};
+        GetClientRect(window, &clientRect);
+        const int width = std::max(0, static_cast<int>(clientRect.right - clientRect.left));
+        const int height = std::max(0, static_cast<int>(clientRect.bottom - clientRect.top));
+
+        HDC bufferedContext = nullptr;
+        HBITMAP bufferBitmap = nullptr;
+        HGDIOBJ previousBitmap = nullptr;
+        if (width > 0 && height > 0) {
+            bufferedContext = CreateCompatibleDC(deviceContext);
+            if (bufferedContext != nullptr) {
+                bufferBitmap = CreateCompatibleBitmap(deviceContext, width, height);
+                if (bufferBitmap != nullptr) {
+                    previousBitmap = SelectObject(bufferedContext, bufferBitmap);
+                    app->PaintCustomScrollBar(window, bufferedContext);
+                    BitBlt(deviceContext, 0, 0, width, height, bufferedContext, 0, 0, SRCCOPY);
+                }
+            }
+        }
+
+        if (bufferBitmap == nullptr) {
+            app->PaintCustomScrollBar(window, deviceContext);
+        }
+
+        if (previousBitmap != nullptr) {
+            SelectObject(bufferedContext, previousBitmap);
+        }
+        if (bufferBitmap != nullptr) {
+            DeleteObject(bufferBitmap);
+        }
+        if (bufferedContext != nullptr) {
+            DeleteDC(bufferedContext);
+        }
+
+        EndPaint(window, &paint);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN:
+        app->BeginCustomScrollBarInteraction(window, lParam);
+        return 0;
+
+    case WM_MOUSEMOVE:
+        app->UpdateCustomScrollBarDrag(window, lParam);
+        return 0;
+
+    case WM_LBUTTONUP:
+    case WM_CAPTURECHANGED:
+        app->EndCustomScrollBarDrag(window);
+        return 0;
+
+    case WM_MOUSEWHEEL:
+        if (app->editor_ != nullptr) {
+            SendMessageW(app->editor_, WM_MOUSEWHEEL, wParam, lParam);
+            app->UpdateStatusBar();
+            app->UpdateScrollBars();
+            InvalidateRect(app->editor_, nullptr, FALSE);
+        }
+        return 0;
+
+    case WM_SETCURSOR:
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        return TRUE;
+
+    default:
+        break;
+    }
+
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
 LRESULT CALLBACK ClassicNotepadApp::EditorWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
     ClassicNotepadApp* app = reinterpret_cast<ClassicNotepadApp*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     if (app != nullptr && message == WM_CONTEXTMENU) {
         if (app->HandleEditorContextMenu(window, lParam)) {
+            return 0;
+        }
+    }
+
+    if (app != nullptr) {
+        if (message == WM_SYSKEYDOWN && wParam == VK_MENU && app->ActivateMenuBarFromKeyboard()) {
+            return 0;
+        }
+
+        if (message == WM_SYSCHAR && app->ActivateMenuMnemonic(static_cast<wchar_t>(wParam))) {
+            return 0;
+        }
+
+        if (message == WM_SYSKEYUP && wParam == VK_MENU && app->menuKeyboardActive_) {
             return 0;
         }
     }
@@ -2413,6 +4176,14 @@ LRESULT CALLBACK ClassicNotepadApp::EditorWindowProc(HWND window, UINT message, 
     case WM_SETFOCUS:
     case WM_SIZE:
         app->UpdateStatusBar();
+        if (message == WM_CHAR ||
+            message == WM_KEYDOWN ||
+            message == WM_MOUSEWHEEL ||
+            message == WM_HSCROLL ||
+            message == WM_VSCROLL ||
+            message == WM_SIZE) {
+            app->UpdateScrollBars();
+        }
         InvalidateRect(window, nullptr, FALSE);
         break;
 
@@ -2427,4 +4198,65 @@ LRESULT CALLBACK ClassicNotepadApp::EditorWindowProc(HWND window, UINT message, 
     }
 
     return result;
+}
+
+LRESULT CALLBACK ClassicNotepadApp::StatusBarSubclassProc(
+    HWND window,
+    UINT message,
+    WPARAM wParam,
+    LPARAM lParam,
+    UINT_PTR subclassId,
+    DWORD_PTR referenceData)
+{
+    auto* app = reinterpret_cast<ClassicNotepadApp*>(referenceData);
+
+    switch (message) {
+    case WM_ERASEBKGND:
+        if (app != nullptr && app->darkModeEnabled_ && app->darkStatusBackgroundBrush_ != nullptr) {
+            RECT clientRect{};
+            GetClientRect(window, &clientRect);
+            FillRect(reinterpret_cast<HDC>(wParam), &clientRect, app->darkStatusBackgroundBrush_);
+            return TRUE;
+        }
+        break;
+
+    case WM_PAINT: {
+        const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
+        if (app != nullptr && app->darkModeEnabled_) {
+            HDC deviceContext = GetDC(window);
+            if (deviceContext != nullptr) {
+                app->DrawDarkStatusBarChrome(deviceContext);
+                ReleaseDC(window, deviceContext);
+            }
+        }
+        return result;
+    }
+
+    case WM_LBUTTONDOWN:
+        if (app != nullptr && app->StartResizeFromStatusGrip(window, lParam)) {
+            return 0;
+        }
+        break;
+
+    case WM_SETCURSOR:
+        if (app != nullptr) {
+            POINT point{};
+            GetCursorPos(&point);
+            ScreenToClient(window, &point);
+            if (app->IsPointInStatusBarResizeGrip(point)) {
+                SetCursor(LoadCursorW(nullptr, IDC_SIZENWSE));
+                return TRUE;
+            }
+        }
+        break;
+
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(window, ClassicNotepadApp::StatusBarSubclassProc, subclassId);
+        break;
+
+    default:
+        break;
+    }
+
+    return DefSubclassProc(window, message, wParam, lParam);
 }
