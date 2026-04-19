@@ -1,7 +1,40 @@
 #include <windows.h>
 #include "resource.h"
+#include "app_version.h"
 
 IDI_APPICON ICON "classic_notepad_large_transparent.ico"
+
+1 VERSIONINFO
+ FILEVERSION CLASSIC_NOTEPAD_VERSION_MAJOR,CLASSIC_NOTEPAD_VERSION_MINOR,CLASSIC_NOTEPAD_VERSION_PATCH,CLASSIC_NOTEPAD_VERSION_BUILD
+ PRODUCTVERSION CLASSIC_NOTEPAD_VERSION_MAJOR,CLASSIC_NOTEPAD_VERSION_MINOR,CLASSIC_NOTEPAD_VERSION_PATCH,CLASSIC_NOTEPAD_VERSION_BUILD
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS 0x1L
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Classic Notepad\0"
+            VALUE "FileDescription", "Classic Notepad\0"
+            VALUE "FileVersion", CLASSIC_NOTEPAD_VERSION_STRING_A "\0"
+            VALUE "InternalName", "ClassicNotepad\0"
+            VALUE "OriginalFilename", "ClassicNotepad.exe\0"
+            VALUE "ProductName", "Classic Notepad\0"
+            VALUE "ProductVersion", CLASSIC_NOTEPAD_VERSION_STRING_A "\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
 
 IDR_MAINMENU MENU
 BEGIN
@@ -90,7 +123,8 @@ FONT 9, "Segoe UI"
 BEGIN
     CONTROL "", IDC_ABOUT_ICON, "STATIC", SS_OWNERDRAW, 14, 16, 72, 72
     LTEXT "Classic Notepad", IDC_ABOUT_TITLE, 98, 16, 170, 10
-    LTEXT "Finished native Win32 build.\r\nSingle-document editor with classic menus, file open/save, find/replace, Go To, word wrap, font selection, status bar, page setup, print, dark mode, and Windows spell checking.", IDC_ABOUT_TEXT, 98, 34, 170, 52
-    LTEXT "No tabs, cloud features, telemetry, or modern editor extras.", IDC_STATIC, 98, 94, 170, 18
+    LTEXT "v1.0.0", IDC_ABOUT_VERSION, 98, 29, 170, 10
+    LTEXT "Finished native Win32 build.\r\nSingle-document editor with classic menus, file open/save, find/replace, Go To, word wrap, font selection, status bar, page setup, print, dark mode, and Windows spell checking.", IDC_ABOUT_TEXT, 98, 45, 170, 48
+    LTEXT "No tabs, cloud features, telemetry, or modern editor extras.", IDC_STATIC, 98, 98, 170, 18
     DEFPUSHBUTTON "OK", IDOK, 218, 122, 50, 14
 END

@@ -1,8 +1,30 @@
 cmake_minimum_required(VERSION 3.20)
 
+set(CLASSIC_NOTEPAD_VERSION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
+set(CLASSIC_NOTEPAD_VERSION "1.0.0")
+
+if(EXISTS "${CLASSIC_NOTEPAD_VERSION_FILE}")
+    file(READ "${CLASSIC_NOTEPAD_VERSION_FILE}" CLASSIC_NOTEPAD_VERSION)
+    string(STRIP "${CLASSIC_NOTEPAD_VERSION}" CLASSIC_NOTEPAD_VERSION)
+endif()
+
+if(NOT CLASSIC_NOTEPAD_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
+    message(FATAL_ERROR "VERSION must contain a semantic version like 1.0.0")
+endif()
+
+set(CLASSIC_NOTEPAD_VERSION_MAJOR "${CMAKE_MATCH_1}")
+set(CLASSIC_NOTEPAD_VERSION_MINOR "${CMAKE_MATCH_2}")
+set(CLASSIC_NOTEPAD_VERSION_PATCH "${CMAKE_MATCH_3}")
+
 project(ClassicNotepad
-    VERSION 0.1.0
+    VERSION "${CLASSIC_NOTEPAD_VERSION}"
     LANGUAGES CXX RC
+)
+
+configure_file(
+    src/app_version.h.in
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/app_version.h"
+    @ONLY
 )
 
 add_library(ClassicNotepadCore STATIC
@@ -50,6 +72,7 @@ add_executable(ClassicNotepad WIN32
 
 target_include_directories(ClassicNotepad PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated"
 )
 
 target_link_libraries(ClassicNotepad PRIVATE

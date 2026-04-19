@@ -100,6 +100,7 @@ bool ReadAllBytes(const std::wstring& path, std::vector<std::uint8_t>& bytes, st
         totalRead += bytesRead;
     }
 
+    CloseHandle(file);
     return true;
 }
 

@@ -1,5 +1,6 @@
 #include "app.h"
 
+#include "app_version.h"
 #include "resource.h"
 #include "spell_text_utils.h"
 
@@ -61,7 +62,7 @@ constexpr DWORD kDwmUseImmersiveDarkMode = 20;
 constexpr DWORD kDwmUseImmersiveDarkModeBefore20H1 = 19;
 constexpr DWORD kDwmBorderColor = 34;
 constexpr COLORREF kDwmDefaultColor = 0xFFFFFFFF;
-constexpr int kAboutIconSizePixels = 96;
+constexpr int kAboutIconSizePixels = 72;
 
 struct GoToDialogState {
     int currentLine = 1;
@@ -2894,13 +2895,14 @@ void ClassicNotepadApp::ShowAboutDialog()
             mainWindow_,
             ClassicNotepadApp::AboutDialogProc,
             reinterpret_cast<LPARAM>(&state)) == -1) {
-        constexpr wchar_t message[] =
-            L"Classic Notepad\n\n"
-            L"Finished native Win32 build.\n"
+        std::wstring message = L"Classic Notepad ";
+        message += CLASSIC_NOTEPAD_VERSION_DISPLAY_W;
+        message +=
+            L"\n\nFinished native Win32 build.\n"
             L"Single-document editor with classic menus, file open/save, find/replace, Go To, word wrap, font selection, status bar, page setup, print, dark mode, and Windows spell checking.\n\n"
             L"No tabs, cloud features, telemetry, or modern editor extras.";
 
-        MessageBoxW(mainWindow_, message, L"About Classic Notepad", MB_OK | MB_ICONINFORMATION);
+        MessageBoxW(mainWindow_, message.c_str(), L"About Classic Notepad", MB_OK | MB_ICONINFORMATION);
     }
 }
 
@@ -4330,6 +4332,7 @@ INT_PTR CALLBACK ClassicNotepadApp::AboutDialogProc(HWND dialog, UINT message, W
     case WM_INITDIALOG:
         state = reinterpret_cast<AboutDialogState*>(lParam);
         SetWindowLongPtrW(dialog, DWLP_USER, reinterpret_cast<LONG_PTR>(state));
+        SetDlgItemTextW(dialog, IDC_ABOUT_VERSION, CLASSIC_NOTEPAD_VERSION_DISPLAY_W);
         if (state != nullptr) {
             state->largeIcon = static_cast<HICON>(LoadImageW(
                 state->instance,

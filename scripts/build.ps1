@@ -1,12 +1,52 @@
 param(
     [ValidateSet("Debug", "Release", "RelWithDebInfo", "MinSizeRel")]
-    [string]$Configuration = "Debug"
+    [string]$Configuration = "Debug",
+    [switch]$SkipVersionIncrement
 )
 
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $BuildDir = Join-Path $RepoRoot "build"
+$VersionFile = Join-Path $RepoRoot "VERSION"
+
+function Get-ClassicNotepadVersion {
+    if (!(Test-Path -LiteralPath $VersionFile)) {
+        return "1.0.0"
+    }
+
+    $version = (Get-Content -Raw -LiteralPath $VersionFile).Trim()
+    if ([string]::IsNullOrWhiteSpace($version)) {
+        return "1.0.0"
+    }
+
+    if ($version -notmatch "^v?(\d+)\.(\d+)\.(\d+)$") {
+        throw "VERSION must contain a semantic version like 1.0.0"
+    }
+
+    return "$([int]$Matches[1]).$([int]$Matches[2]).$([int]$Matches[3])"
+}
+
+function Set-ClassicNotepadVersion {
+    param([string]$Version)
+
+    if ($Version -notmatch "^(\d+)\.(\d+)\.(\d+)$") {
+        throw "Version must be written as major.minor.patch, for example 1.0.0"
+    }
+
+    Set-Content -LiteralPath $VersionFile -Value $Version -Encoding ASCII
+}
+
+function Get-NextPatchVersion {
+    param([string]$Version)
+
+    if ($Version -notmatch "^(\d+)\.(\d+)\.(\d+)$") {
+        throw "Version must be written as major.minor.patch, for example 1.0.0"
+    }
+
+    $patch = [int]$Matches[3] + 1
+    return "$([int]$Matches[1]).$([int]$Matches[2]).$patch"
+}
 
 function Repair-DuplicateProcessEnvironmentNames {
     $environment = [System.Environment]::GetEnvironmentVariables("Process")
@@ -248,12 +288,34 @@ Write-Host "Build type: $Configuration"
 Write-Host "Using CMake: $cmake"
 Write-Host "Generator: $generator"
 
-Invoke-NativeCommand $cmake @("-S", $RepoRoot, "-B", $BuildDir, "-G", $generator, "-A", "x64")
-Invoke-NativeCommand $cmake @("--build", $BuildDir, "--config", $Configuration)
+$previousVersion = Get-ClassicNotepadVersion
+$currentVersion = $previousVersion
+$versionWasIncremented = $false
 
-$exePath = Join-Path $BuildDir "$Configuration\ClassicNotepad.exe"
-if (!(Test-Path $exePath)) {
-    throw "Build finished, but the expected executable was not found: $exePath"
+if ($SkipVersionIncrement) {
+    Write-Host "Version: v$currentVersion (increment skipped)"
+} else {
+    $currentVersion = Get-NextPatchVersion -Version $previousVersion
+    Set-ClassicNotepadVersion -Version $currentVersion
+    $versionWasIncremented = $true
+    Write-Host "Version: v$previousVersion -> v$currentVersion"
 }
 
-Write-Host "Built: $exePath"
+try {
+    Invoke-NativeCommand $cmake @("-S", $RepoRoot, "-B", $BuildDir, "-G", $generator, "-A", "x64")
+    Invoke-NativeCommand $cmake @("--build", $BuildDir, "--config", $Configuration)
+
+    $exePath = Join-Path $BuildDir "$Configuration\ClassicNotepad.exe"
+    if (!(Test-Path $exePath)) {
+        throw "Build finished, but the expected executable was not found: $exePath"
+    }
+
+    Write-Host "Built: $exePath"
+} catch {
+    if ($versionWasIncremented) {
+        Set-ClassicNotepadVersion -Version $previousVersion
+        Write-Warning "Build failed; reverted VERSION to v$previousVersion."
+    }
+
+    throw
+}
