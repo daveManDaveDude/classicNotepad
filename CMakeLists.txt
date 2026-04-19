@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 
 set(CLASSIC_NOTEPAD_VERSION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 set(CLASSIC_NOTEPAD_VERSION "1.0.0")
+set(CLASSIC_NOTEPAD_APP_ICON "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/classic_notepad_large_transparent.ico")
 
 if(EXISTS "${CLASSIC_NOTEPAD_VERSION_FILE}")
     file(READ "${CLASSIC_NOTEPAD_VERSION_FILE}" CLASSIC_NOTEPAD_VERSION)
@@ -36,6 +37,7 @@ add_library(ClassicNotepadCore STATIC
     src/line_endings.h
     src/spell_text_utils.cpp
     src/spell_text_utils.h
+    src/win32_platform.h
 )
 
 target_compile_features(ClassicNotepadCore PUBLIC cxx_std_17)
@@ -60,7 +62,7 @@ if(MSVC)
 endif()
 
 add_executable(ClassicNotepad WIN32
-    classic_notepad_large_transparent.ico
+    "${CLASSIC_NOTEPAD_APP_ICON}"
     src/app.cpp
     src/app.h
     src/main.cpp
@@ -68,6 +70,7 @@ add_executable(ClassicNotepad WIN32
     src/spell_check.h
     src/resource.h
     src/resources.rc
+    src/win32_platform.h
 )
 
 target_include_directories(ClassicNotepad PRIVATE

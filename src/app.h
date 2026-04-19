@@ -1,5 +1,7 @@
 #pragma once
 
+#include "win32_platform.h"
+
 #include "document.h"
 #include "spell_check.h"
 

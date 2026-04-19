@@ -3,7 +3,11 @@
 #include <shellapi.h>
 #include <windows.h>
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
+int WINAPI wWinMain(
+    _In_ HINSTANCE instance,
+    _In_opt_ HINSTANCE,
+    _In_ PWSTR,
+    _In_ int showCommand)
 {
     std::wstring initialFilePath;
     int argumentCount = 0;

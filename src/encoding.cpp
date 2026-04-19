@@ -1,5 +1,7 @@
 #include "encoding.h"
 
+#include "win32_platform.h"
+
 #include <windows.h>
 
 #include <limits>

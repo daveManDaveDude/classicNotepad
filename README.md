@@ -212,6 +212,12 @@ src/
   spell_text_utils.cpp, .h    Word range and spelling range helpers
   resources.rc               Menus, accelerators, and Go To dialog resource
 
+assets/
+  icons/                     Application icon resources
+
+docs/
+  README.md                  Index for planning, research, and review notes
+
 tests/
   text_conversion_tests.cpp   Console tests for text/document/spell utility behavior
 

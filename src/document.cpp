@@ -1,5 +1,7 @@
 #include "document.h"
 
+#include "win32_platform.h"
+
 #include <windows.h>
 
 #include <algorithm>

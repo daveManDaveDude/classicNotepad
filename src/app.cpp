@@ -78,6 +78,8 @@ constexpr DWORD kDwmBorderColor = 34;
 constexpr COLORREF kDwmDefaultColor = 0xFFFFFFFF;
 constexpr int kAboutIconSizePixels = 72;
 constexpr int kStatusBarPartCount = 4;
+constexpr UINT kStatusBarCustomDrawCode = static_cast<UINT>(-12);
+constexpr std::size_t kFileDialogPathBufferChars = 32768U;
 constexpr int kStatusBarHorizontalPadding = 12;
 constexpr int kStatusBarExtraPartRoom = 20;
 constexpr int kStatusBarSeparatorInset = 7;
@@ -128,6 +130,14 @@ struct MessageDialogState {
 };
 
 LRESULT CALLBACK MessageDialogWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+
+void AddMessageDialogButton(std::vector<MessageDialogButton>& buttons, int id, const wchar_t* text)
+{
+    MessageDialogButton button;
+    button.id = id;
+    button.text = text;
+    buttons.push_back(button);
+}
 
 int CALLBACK EnumFontFamilyMatchProc(const LOGFONTW* logFont, const TEXTMETRICW*, DWORD, LPARAM lParam)
 {
@@ -813,23 +823,23 @@ std::vector<MessageDialogButton> BuildMessageDialogButtons(UINT flags)
     std::vector<MessageDialogButton> buttons;
     switch (flags & MB_TYPEMASK) {
     case MB_OKCANCEL:
-        buttons.push_back({ IDOK, L"OK" });
-        buttons.push_back({ IDCANCEL, L"Cancel" });
+        AddMessageDialogButton(buttons, IDOK, L"OK");
+        AddMessageDialogButton(buttons, IDCANCEL, L"Cancel");
         break;
 
     case MB_YESNO:
-        buttons.push_back({ IDYES, L"Yes" });
-        buttons.push_back({ IDNO, L"No" });
+        AddMessageDialogButton(buttons, IDYES, L"Yes");
+        AddMessageDialogButton(buttons, IDNO, L"No");
         break;
 
     case MB_YESNOCANCEL:
-        buttons.push_back({ IDYES, L"Yes" });
-        buttons.push_back({ IDNO, L"No" });
-        buttons.push_back({ IDCANCEL, L"Cancel" });
+        AddMessageDialogButton(buttons, IDYES, L"Yes");
+        AddMessageDialogButton(buttons, IDNO, L"No");
+        AddMessageDialogButton(buttons, IDCANCEL, L"Cancel");
         break;
 
     default:
-        buttons.push_back({ IDOK, L"OK" });
+        AddMessageDialogButton(buttons, IDOK, L"OK");
         break;
     }
 
@@ -2487,7 +2497,8 @@ LRESULT ClassicNotepadApp::HandleMeasureItem(WPARAM, LPARAM lParam) const
 LRESULT ClassicNotepadApp::HandleNotify(LPARAM lParam) const
 {
     const auto* header = reinterpret_cast<const NMHDR*>(lParam);
-    if (!darkModeEnabled_ || header == nullptr || header->hwndFrom != statusBar_ || header->code != NM_CUSTOMDRAW) {
+    if (!darkModeEnabled_ || header == nullptr || header->hwndFrom != statusBar_ ||
+        header->code != kStatusBarCustomDrawCode) {
         return 0;
     }
 
@@ -4215,7 +4226,13 @@ bool ClassicNotepadApp::HandleEditorContextMenu(HWND editorWindow, LPARAM lParam
         if (GetMenuItemInfoW(popup, selected, FALSE, &itemInfo)) {
             const auto* suggestionItem = reinterpret_cast<const OwnerDrawMenuItem*>(itemInfo.dwItemData);
             if (suggestionItem != nullptr) {
-                SendMessageW(editor_, EM_SETSEL, contextMenuWordStart_, contextMenuWordStart_ + contextMenuWordLength_);
+                const DWORD_PTR contextMenuWordEnd =
+                    static_cast<DWORD_PTR>(contextMenuWordStart_) + static_cast<DWORD_PTR>(contextMenuWordLength_);
+                SendMessageW(
+                    editor_,
+                    EM_SETSEL,
+                    static_cast<WPARAM>(contextMenuWordStart_),
+                    static_cast<LPARAM>(contextMenuWordEnd));
                 SendMessageW(editor_, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(suggestionItem->text.c_str()));
             }
         }
@@ -5302,7 +5319,7 @@ std::wstring ClassicNotepadApp::BuildTimeDateText() const
 
 std::wstring ClassicNotepadApp::ShowOpenFileDialog()
 {
-    std::array<wchar_t, 32768> fileName{};
+    std::vector<wchar_t> fileName(kFileDialogPathBufferChars, L'\0');
     OPENFILENAMEW openFileName{};
     openFileName.lStructSize = sizeof(openFileName);
     openFileName.hwndOwner = mainWindow_;
@@ -5325,7 +5342,7 @@ std::wstring ClassicNotepadApp::ShowOpenFileDialog()
 
 std::wstring ClassicNotepadApp::ShowSaveFileDialog()
 {
-    std::array<wchar_t, 32768> fileName{};
+    std::vector<wchar_t> fileName(kFileDialogPathBufferChars, L'\0');
     if (document_.HasPath()) {
         wcsncpy_s(fileName.data(), fileName.size(), document_.Path().c_str(), _TRUNCATE);
     }
