@@ -70,9 +70,15 @@ bool ExpandWordRangeAt(const std::wstring& text, std::size_t index, TextRange& r
 
 bool RangesOverlap(std::size_t firstStart, std::size_t firstLength, std::size_t secondStart, std::size_t secondLength)
 {
-    const std::size_t firstEnd = firstStart + firstLength;
-    const std::size_t secondEnd = secondStart + secondLength;
-    return firstStart < secondEnd && secondStart < firstEnd;
+    if (firstLength == 0U || secondLength == 0U) {
+        return false;
+    }
+
+    if (firstStart <= secondStart) {
+        return (secondStart - firstStart) < firstLength;
+    }
+
+    return (firstStart - secondStart) < secondLength;
 }
 
 } // namespace classic_notepad
