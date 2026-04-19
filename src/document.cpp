@@ -9,8 +9,6 @@
 
 namespace {
 
-constexpr LONGLONG kMaxPhase3FileSize = 256LL * 1024LL * 1024LL;
-
 std::wstring GetLastErrorMessage(DWORD errorCode)
 {
     wchar_t* buffer = nullptr;
@@ -66,9 +64,15 @@ bool ReadAllBytes(const std::wstring& path, std::vector<std::uint8_t>& bytes, st
         return false;
     }
 
-    if (fileSize.QuadPart > kMaxPhase3FileSize) {
+    if (fileSize.QuadPart < 0) {
         CloseHandle(file);
-        errorMessage = L"This build limits files to 256 MB.";
+        errorMessage = L"Could not read the file size.";
+        return false;
+    }
+
+    if (static_cast<ULONGLONG>(fileSize.QuadPart) > static_cast<ULONGLONG>(SIZE_MAX)) {
+        CloseHandle(file);
+        errorMessage = L"This file is too large for this build.";
         return false;
     }
 
@@ -96,26 +100,11 @@ bool ReadAllBytes(const std::wstring& path, std::vector<std::uint8_t>& bytes, st
         totalRead += bytesRead;
     }
 
-    CloseHandle(file);
     return true;
 }
 
-bool WriteAllBytes(const std::wstring& path, const std::vector<std::uint8_t>& bytes, std::wstring& errorMessage)
+bool WriteBytesToHandle(HANDLE file, const std::vector<std::uint8_t>& bytes, std::wstring& errorMessage)
 {
-    HANDLE file = CreateFileW(
-        path.c_str(),
-        GENERIC_WRITE,
-        0,
-        nullptr,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        nullptr);
-
-    if (file == INVALID_HANDLE_VALUE) {
-        SetWindowsError(errorMessage, L"Could not open the file for writing.", GetLastError());
-        return false;
-    }
-
     std::size_t totalWritten = 0;
     while (totalWritten < bytes.size()) {
         const DWORD chunkSize = static_cast<DWORD>(
@@ -124,14 +113,11 @@ bool WriteAllBytes(const std::wstring& path, const std::vector<std::uint8_t>& by
         DWORD bytesWritten = 0;
         const BOOL writeOk = WriteFile(file, bytes.data() + totalWritten, chunkSize, &bytesWritten, nullptr);
         if (!writeOk) {
-            const DWORD error = GetLastError();
-            CloseHandle(file);
-            SetWindowsError(errorMessage, L"Could not write the file.", error);
+            SetWindowsError(errorMessage, L"Could not write the file.", GetLastError());
             return false;
         }
 
         if (bytesWritten == 0) {
-            CloseHandle(file);
             SetWindowsError(errorMessage, L"Could not write the complete file.", ERROR_WRITE_FAULT);
             return false;
         }
@@ -139,7 +125,72 @@ bool WriteAllBytes(const std::wstring& path, const std::vector<std::uint8_t>& by
         totalWritten += bytesWritten;
     }
 
+    return true;
+}
+
+std::wstring BuildTempSavePath(const std::wstring& path, int attempt)
+{
+    const std::wstring suffix = L".classic-notepad.tmp." + std::to_wstring(GetCurrentProcessId()) + L"." +
+        std::to_wstring(GetTickCount64()) + L"." + std::to_wstring(attempt);
+    return path + suffix;
+}
+
+bool WriteAllBytes(const std::wstring& path, const std::vector<std::uint8_t>& bytes, std::wstring& errorMessage)
+{
+    constexpr int kTempPathAttempts = 64;
+    std::wstring tempPath;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < kTempPathAttempts; ++attempt) {
+        tempPath = BuildTempSavePath(path, attempt);
+        file = CreateFileW(
+            tempPath.c_str(),
+            GENERIC_WRITE,
+            0,
+            nullptr,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_TEMPORARY,
+            nullptr);
+
+        if (file != INVALID_HANDLE_VALUE) {
+            break;
+        }
+
+        const DWORD error = GetLastError();
+        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) {
+            SetWindowsError(errorMessage, L"Could not create a temporary save file.", error);
+            return false;
+        }
+    }
+
+    if (file == INVALID_HANDLE_VALUE) {
+        errorMessage = L"Could not allocate a temporary save file.";
+        return false;
+    }
+
+    const bool wroteAllBytes = WriteBytesToHandle(file, bytes, errorMessage);
+    if (!wroteAllBytes) {
+        CloseHandle(file);
+        DeleteFileW(tempPath.c_str());
+        return false;
+    }
+
+    if (!FlushFileBuffers(file)) {
+        const DWORD error = GetLastError();
+        CloseHandle(file);
+        DeleteFileW(tempPath.c_str());
+        SetWindowsError(errorMessage, L"Could not flush the temporary save file.", error);
+        return false;
+    }
+
     CloseHandle(file);
+
+    if (!MoveFileExW(tempPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const DWORD error = GetLastError();
+        DeleteFileW(tempPath.c_str());
+        SetWindowsError(errorMessage, L"Could not replace the destination file.", error);
+        return false;
+    }
+
     return true;
 }
 
