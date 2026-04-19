@@ -55,6 +55,8 @@ target_link_libraries(ClassicNotepad PRIVATE
     user32
     gdi32
     ole32
+    advapi32
+    dwmapi
 )
 
 if(MSVC)

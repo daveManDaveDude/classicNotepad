@@ -26,6 +26,12 @@ private:
     void UpdateTitle();
     void UpdateMenuState(HMENU menu);
     void UpdateStatusBar();
+    void UpdateThemeFromSystem();
+    void ApplyThemeToWindows();
+    void RecreateThemeBrushes();
+    void DestroyThemeBrushes();
+    LRESULT HandleControlColor(HDC deviceContext, HWND controlWindow) const;
+    LRESULT HandleNotify(LPARAM lParam) const;
     void RefreshSpellCheck(bool immediate);
     void ScheduleSpellCheck();
     void RunSpellCheckNow();
@@ -99,6 +105,8 @@ private:
     HWND replaceDialog_ = nullptr;
     HACCEL accelerator_ = nullptr;
     HFONT editorFont_ = nullptr;
+    HBRUSH darkEditorBackgroundBrush_ = nullptr;
+    HBRUSH darkStatusBackgroundBrush_ = nullptr;
     HGLOBAL pageSetupDevMode_ = nullptr;
     HGLOBAL pageSetupDevNames_ = nullptr;
     RECT pageMarginsThousandths_ {750, 750, 750, 750};
@@ -112,6 +120,7 @@ private:
     DWORD findFlags_ = FR_DOWN;
     bool wordWrap_ = false;
     bool statusBarVisible_ = true;
+    bool darkModeEnabled_ = false;
     bool suppressEditorChange_ = false;
     bool comInitialized_ = false;
     SpellCheckService spellChecker_;

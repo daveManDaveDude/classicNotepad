@@ -6,6 +6,7 @@
 #include <cderr.h>
 #include <commdlg.h>
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <objbase.h>
 
 #include <algorithm>
@@ -33,6 +34,12 @@ constexpr UINT kSpellMenuIgnoreOnce = 50006;
 constexpr UINT kSpellMenuAddToDictionary = 50007;
 constexpr int kDefaultEditorFontPointSize = 11;
 constexpr wchar_t kDefaultEditorFontFace[] = L"Consolas";
+constexpr COLORREF kDarkEditorBackground = RGB(32, 32, 32);
+constexpr COLORREF kDarkEditorText = RGB(242, 242, 242);
+constexpr COLORREF kDarkStatusBackground = RGB(43, 43, 43);
+constexpr COLORREF kDarkStatusText = RGB(242, 242, 242);
+constexpr DWORD kDwmUseImmersiveDarkMode = 20;
+constexpr DWORD kDwmUseImmersiveDarkModeBefore20H1 = 19;
 
 struct GoToDialogState {
     int currentLine = 1;
@@ -207,6 +214,59 @@ bool IsMissingFilePath(const std::wstring& path)
     return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
 }
 
+bool IsHighContrastEnabled()
+{
+    HIGHCONTRASTW highContrast{};
+    highContrast.cbSize = sizeof(highContrast);
+    if (!SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(highContrast), &highContrast, 0)) {
+        return false;
+    }
+
+    return (highContrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
+}
+
+bool ShouldUseDarkMode()
+{
+    if (IsHighContrastEnabled()) {
+        return false;
+    }
+
+    DWORD appsUseLightTheme = 1;
+    DWORD valueSize = sizeof(appsUseLightTheme);
+    const LSTATUS result = RegGetValueW(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        L"AppsUseLightTheme",
+        RRF_RT_REG_DWORD,
+        nullptr,
+        &appsUseLightTheme,
+        &valueSize);
+
+    return result == ERROR_SUCCESS && appsUseLightTheme == 0;
+}
+
+void ApplyDarkTitleBar(HWND window, bool useDarkMode)
+{
+    if (window == nullptr) {
+        return;
+    }
+
+    const BOOL enabled = useDarkMode ? TRUE : FALSE;
+    HRESULT result = DwmSetWindowAttribute(
+        window,
+        kDwmUseImmersiveDarkMode,
+        &enabled,
+        sizeof(enabled));
+
+    if (FAILED(result)) {
+        DwmSetWindowAttribute(
+            window,
+            kDwmUseImmersiveDarkModeBefore20H1,
+            &enabled,
+            sizeof(enabled));
+    }
+}
+
 std::size_t FindWrapBreakLength(const std::wstring& text, std::size_t start, std::size_t maxLength)
 {
     if (start + maxLength >= text.size()) {
@@ -307,6 +367,8 @@ ClassicNotepadApp::ClassicNotepadApp(HINSTANCE instance)
 {
     const HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     comInitialized_ = SUCCEEDED(hr);
+    darkModeEnabled_ = ShouldUseDarkMode();
+    RecreateThemeBrushes();
 }
 
 ClassicNotepadApp::~ClassicNotepadApp()
@@ -318,6 +380,7 @@ ClassicNotepadApp::~ClassicNotepadApp()
 
     DestroyOwnedEditorFont();
     DestroyPrintDialogHandles();
+    DestroyThemeBrushes();
 
     spellChecker_.Reset();
 
@@ -411,6 +474,7 @@ bool ClassicNotepadApp::CreateMainWindow(int showCommand)
         return false;
     }
 
+    ApplyThemeToWindows();
     ShowWindow(mainWindow_, showCommand);
     UpdateWindow(mainWindow_);
     return true;
@@ -484,7 +548,98 @@ HWND ClassicNotepadApp::CreateStatusBar()
         instance_,
         nullptr);
 
+    if (statusBar != nullptr) {
+        SendMessageW(statusBar, SB_SETBKCOLOR, 0, darkModeEnabled_ ? kDarkStatusBackground : CLR_DEFAULT);
+    }
+
     return statusBar;
+}
+
+void ClassicNotepadApp::UpdateThemeFromSystem()
+{
+    const bool newDarkMode = ShouldUseDarkMode();
+    if (darkModeEnabled_ != newDarkMode) {
+        darkModeEnabled_ = newDarkMode;
+        RecreateThemeBrushes();
+    }
+
+    ApplyThemeToWindows();
+}
+
+void ClassicNotepadApp::ApplyThemeToWindows()
+{
+    ApplyDarkTitleBar(mainWindow_, darkModeEnabled_);
+
+    if (mainWindow_ != nullptr) {
+        DrawMenuBar(mainWindow_);
+        InvalidateRect(mainWindow_, nullptr, TRUE);
+    }
+
+    if (editor_ != nullptr) {
+        InvalidateRect(editor_, nullptr, TRUE);
+    }
+
+    if (statusBar_ != nullptr) {
+        SendMessageW(statusBar_, SB_SETBKCOLOR, 0, darkModeEnabled_ ? kDarkStatusBackground : CLR_DEFAULT);
+        InvalidateRect(statusBar_, nullptr, TRUE);
+    }
+}
+
+void ClassicNotepadApp::RecreateThemeBrushes()
+{
+    DestroyThemeBrushes();
+    if (darkModeEnabled_) {
+        darkEditorBackgroundBrush_ = CreateSolidBrush(kDarkEditorBackground);
+        darkStatusBackgroundBrush_ = CreateSolidBrush(kDarkStatusBackground);
+    }
+}
+
+void ClassicNotepadApp::DestroyThemeBrushes()
+{
+    if (darkEditorBackgroundBrush_ != nullptr) {
+        DeleteObject(darkEditorBackgroundBrush_);
+        darkEditorBackgroundBrush_ = nullptr;
+    }
+
+    if (darkStatusBackgroundBrush_ != nullptr) {
+        DeleteObject(darkStatusBackgroundBrush_);
+        darkStatusBackgroundBrush_ = nullptr;
+    }
+}
+
+LRESULT ClassicNotepadApp::HandleControlColor(HDC deviceContext, HWND controlWindow) const
+{
+    if (!darkModeEnabled_ || controlWindow != editor_ || darkEditorBackgroundBrush_ == nullptr) {
+        return 0;
+    }
+
+    SetTextColor(deviceContext, kDarkEditorText);
+    SetBkColor(deviceContext, kDarkEditorBackground);
+    return reinterpret_cast<LRESULT>(darkEditorBackgroundBrush_);
+}
+
+LRESULT ClassicNotepadApp::HandleNotify(LPARAM lParam) const
+{
+    const auto* header = reinterpret_cast<const NMHDR*>(lParam);
+    if (!darkModeEnabled_ || header == nullptr || header->hwndFrom != statusBar_ || header->code != NM_CUSTOMDRAW) {
+        return 0;
+    }
+
+    auto* customDraw = reinterpret_cast<NMCUSTOMDRAW*>(lParam);
+    switch (customDraw->dwDrawStage) {
+    case CDDS_PREPAINT:
+        return CDRF_NOTIFYITEMDRAW;
+
+    case CDDS_ITEMPREPAINT:
+        SetTextColor(customDraw->hdc, kDarkStatusText);
+        SetBkColor(customDraw->hdc, kDarkStatusBackground);
+        return CDRF_DODEFAULT;
+
+    default:
+        break;
+    }
+
+    return CDRF_DODEFAULT;
 }
 
 void ClassicNotepadApp::ResizeEditor()
@@ -1960,6 +2115,7 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
             MessageBoxW(mainWindow_, L"Could not create the status bar.", L"Classic Notepad", MB_OK | MB_ICONERROR);
             return -1;
         }
+        ApplyThemeToWindows();
         document_.ResetUntitled();
         spellCheckAvailable_ = comInitialized_ && spellChecker_.Initialize(L"en-GB");
         if (!spellCheckAvailable_) {
@@ -1982,11 +2138,45 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
         }
         return 0;
 
+    case WM_SETTINGCHANGE:
+    case WM_SYSCOLORCHANGE:
+    case WM_THEMECHANGED:
+        UpdateThemeFromSystem();
+        return 0;
+
+    case WM_ERASEBKGND:
+        if (darkModeEnabled_ && darkStatusBackgroundBrush_ != nullptr) {
+            RECT clientRect{};
+            GetClientRect(mainWindow_, &clientRect);
+            FillRect(reinterpret_cast<HDC>(wParam), &clientRect, darkStatusBackgroundBrush_);
+            return 1;
+        }
+        break;
+
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC: {
+        const LRESULT controlColorResult = HandleControlColor(
+            reinterpret_cast<HDC>(wParam),
+            reinterpret_cast<HWND>(lParam));
+        if (controlColorResult != 0) {
+            return controlColorResult;
+        }
+        break;
+    }
+
     case WM_INITMENUPOPUP:
         if (HIWORD(lParam) == 0) {
             UpdateMenuState(GetMenu(mainWindow_));
         }
         return 0;
+
+    case WM_NOTIFY: {
+        const LRESULT notifyResult = HandleNotify(lParam);
+        if (notifyResult != 0) {
+            return notifyResult;
+        }
+        break;
+    }
 
     case WM_COMMAND:
         if (reinterpret_cast<HWND>(lParam) == editor_ && HIWORD(wParam) == EN_CHANGE) {
