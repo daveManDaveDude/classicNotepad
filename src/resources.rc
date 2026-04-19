@@ -1,6 +1,8 @@
 #include <windows.h>
 #include "resource.h"
 
+IDI_APPICON ICON "classic_notepad_large_transparent.ico"
+
 IDR_MAINMENU MENU
 BEGIN
     POPUP "&File"
@@ -79,4 +81,16 @@ BEGIN
     EDITTEXT IDC_GOTO_LINE_EDIT, 70, 8, 109, 14, ES_AUTOHSCROLL | ES_NUMBER
     DEFPUSHBUTTON "OK", IDOK, 73, 47, 50, 14
     PUSHBUTTON "Cancel", IDCANCEL, 129, 47, 50, 14
+END
+
+IDD_ABOUT_DIALOG DIALOGEX 0, 0, 282, 146
+STYLE DS_MODALFRAME | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "About Classic Notepad"
+FONT 9, "Segoe UI"
+BEGIN
+    CONTROL "", IDC_ABOUT_ICON, "STATIC", SS_OWNERDRAW, 14, 16, 72, 72
+    LTEXT "Classic Notepad", IDC_ABOUT_TITLE, 98, 16, 170, 10
+    LTEXT "Finished native Win32 build.\r\nSingle-document editor with classic menus, file open/save, find/replace, Go To, word wrap, font selection, status bar, page setup, print, dark mode, and Windows spell checking.", IDC_ABOUT_TEXT, 98, 34, 170, 52
+    LTEXT "No tabs, cloud features, telemetry, or modern editor extras.", IDC_STATIC, 98, 94, 170, 18
+    DEFPUSHBUTTON "OK", IDOK, 218, 122, 50, 14
 END

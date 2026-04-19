@@ -180,6 +180,7 @@ private:
         UINT_PTR subclassId,
         DWORD_PTR referenceData);
     static INT_PTR CALLBACK GoToDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam);
+    static INT_PTR CALLBACK AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam);
 
     HINSTANCE instance_;
     HWND mainWindow_ = nullptr;

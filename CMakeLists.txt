@@ -38,6 +38,7 @@ if(MSVC)
 endif()
 
 add_executable(ClassicNotepad WIN32
+    classic_notepad_large_transparent.ico
     src/app.cpp
     src/app.h
     src/main.cpp
@@ -45,6 +46,10 @@ add_executable(ClassicNotepad WIN32
     src/spell_check.h
     src/resource.h
     src/resources.rc
+)
+
+target_include_directories(ClassicNotepad PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
 )
 
 target_link_libraries(ClassicNotepad PRIVATE

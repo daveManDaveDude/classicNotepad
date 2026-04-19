@@ -61,11 +61,18 @@ constexpr DWORD kDwmUseImmersiveDarkMode = 20;
 constexpr DWORD kDwmUseImmersiveDarkModeBefore20H1 = 19;
 constexpr DWORD kDwmBorderColor = 34;
 constexpr COLORREF kDwmDefaultColor = 0xFFFFFFFF;
+constexpr int kAboutIconSizePixels = 96;
 
 struct GoToDialogState {
     int currentLine = 1;
     int maxLine = 1;
     int selectedLine = 1;
+};
+
+struct AboutDialogState {
+    HINSTANCE instance = nullptr;
+    HICON largeIcon = nullptr;
+    bool ownsLargeIcon = false;
 };
 
 bool IsWordCharacter(wchar_t character)
@@ -606,12 +613,12 @@ bool ClassicNotepadApp::RegisterMainWindowClass()
     windowClass.style = CS_HREDRAW | CS_VREDRAW;
     windowClass.lpfnWndProc = ClassicNotepadApp::WindowProc;
     windowClass.hInstance = instance_;
-    windowClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    windowClass.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(IDI_APPICON));
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     windowClass.lpszMenuName = MAKEINTRESOURCEW(IDR_MAINMENU);
     windowClass.lpszClassName = kMainWindowClass;
-    windowClass.hIconSm = LoadIconW(nullptr, IDI_APPLICATION);
+    windowClass.hIconSm = LoadIconW(instance_, MAKEINTRESOURCEW(IDI_APPICON));
 
     const bool mainWindowClassRegistered =
         RegisterClassExW(&windowClass) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
@@ -2854,13 +2861,23 @@ bool ClassicNotepadApp::HandleEditorContextMenu(HWND editorWindow, LPARAM lParam
 
 void ClassicNotepadApp::ShowAboutDialog()
 {
-    constexpr wchar_t message[] =
-        L"Classic Notepad\n\n"
-        L"Finished native Win32 build.\n"
-        L"Single-document editor with classic menus, file open/save, find/replace, Go To, word wrap, font selection, status bar, page setup, print, dark mode, and Windows spell checking.\n\n"
-        L"No tabs, cloud features, telemetry, or modern editor extras.";
+    AboutDialogState state{};
+    state.instance = instance_;
 
-    MessageBoxW(mainWindow_, message, L"About Classic Notepad", MB_OK | MB_ICONINFORMATION);
+    if (DialogBoxParamW(
+            instance_,
+            MAKEINTRESOURCEW(IDD_ABOUT_DIALOG),
+            mainWindow_,
+            ClassicNotepadApp::AboutDialogProc,
+            reinterpret_cast<LPARAM>(&state)) == -1) {
+        constexpr wchar_t message[] =
+            L"Classic Notepad\n\n"
+            L"Finished native Win32 build.\n"
+            L"Single-document editor with classic menus, file open/save, find/replace, Go To, word wrap, font selection, status bar, page setup, print, dark mode, and Windows spell checking.\n\n"
+            L"No tabs, cloud features, telemetry, or modern editor extras.";
+
+        MessageBoxW(mainWindow_, message, L"About Classic Notepad", MB_OK | MB_ICONINFORMATION);
+    }
 }
 
 void ClassicNotepadApp::HandleInitialFilePath(const std::wstring& path)
@@ -4265,6 +4282,71 @@ INT_PTR CALLBACK ClassicNotepadApp::GoToDialogProc(HWND dialog, UINT message, WP
             break;
         }
         break;
+
+    default:
+        break;
+    }
+
+    return FALSE;
+}
+
+INT_PTR CALLBACK ClassicNotepadApp::AboutDialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    auto* state = reinterpret_cast<AboutDialogState*>(GetWindowLongPtrW(dialog, DWLP_USER));
+
+    switch (message) {
+    case WM_INITDIALOG:
+        state = reinterpret_cast<AboutDialogState*>(lParam);
+        SetWindowLongPtrW(dialog, DWLP_USER, reinterpret_cast<LONG_PTR>(state));
+        if (state != nullptr) {
+            state->largeIcon = static_cast<HICON>(LoadImageW(
+                state->instance,
+                MAKEINTRESOURCEW(IDI_APPICON),
+                IMAGE_ICON,
+                kAboutIconSizePixels,
+                kAboutIconSizePixels,
+                LR_DEFAULTCOLOR));
+            state->ownsLargeIcon = state->largeIcon != nullptr;
+            if (state->largeIcon == nullptr) {
+                state->largeIcon = LoadIconW(nullptr, IDI_APPLICATION);
+            }
+        }
+        return TRUE;
+
+    case WM_DRAWITEM:
+        if (wParam == IDC_ABOUT_ICON && state != nullptr && state->largeIcon != nullptr) {
+            auto* drawItem = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+            const int controlWidth = std::max(0, static_cast<int>(drawItem->rcItem.right - drawItem->rcItem.left));
+            const int controlHeight = std::max(0, static_cast<int>(drawItem->rcItem.bottom - drawItem->rcItem.top));
+            const int iconSize = std::min(kAboutIconSizePixels, std::min(controlWidth, controlHeight));
+            const int x = drawItem->rcItem.left + ((controlWidth - iconSize) / 2);
+            const int y = drawItem->rcItem.top + ((controlHeight - iconSize) / 2);
+
+            FillRect(drawItem->hDC, &drawItem->rcItem, reinterpret_cast<HBRUSH>(COLOR_3DFACE + 1));
+            DrawIconEx(drawItem->hDC, x, y, state->largeIcon, iconSize, iconSize, 0, nullptr, DI_NORMAL);
+            return TRUE;
+        }
+        break;
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDOK:
+        case IDCANCEL:
+            EndDialog(dialog, LOWORD(wParam));
+            return TRUE;
+
+        default:
+            break;
+        }
+        break;
+
+    case WM_DESTROY:
+        if (state != nullptr && state->ownsLargeIcon && state->largeIcon != nullptr) {
+            DestroyIcon(state->largeIcon);
+            state->largeIcon = nullptr;
+            state->ownsLargeIcon = false;
+        }
+        return TRUE;
 
     default:
         break;
