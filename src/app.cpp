@@ -2089,6 +2089,63 @@ void ClassicNotepadApp::ScrollCustomScrollBarToPosition(ScrollBarOrientation ori
     InvalidateRect(editor_, nullptr, FALSE);
 }
 
+bool ClassicNotepadApp::HandleMouseWheel(WPARAM wParam)
+{
+    if (editor_ == nullptr || !UseCustomScrollBars()) {
+        return false;
+    }
+
+    const int wheelDelta = GET_WHEEL_DELTA_WPARAM(wParam);
+    if (wheelDelta == 0) {
+        return true;
+    }
+
+    UINT scrollLines = 3;
+    if (!SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &scrollLines, 0)) {
+        scrollLines = 3;
+    }
+
+    if (scrollLines == 0U) {
+        mouseWheelRemainder_ = 0;
+        return true;
+    }
+
+    const ScrollBarMetrics metrics = GetCustomScrollBarMetrics(ScrollBarOrientation::Vertical);
+    const int page = std::max(1, metrics.page);
+    const int maxPosition = std::max(metrics.minimum, metrics.maximum - page + 1);
+    if (maxPosition <= metrics.minimum) {
+        mouseWheelRemainder_ = 0;
+        return true;
+    }
+
+    if (scrollLines == WHEEL_PAGESCROLL) {
+        const int wheelUnits = mouseWheelRemainder_ + wheelDelta;
+        const int pages = wheelUnits / WHEEL_DELTA;
+        mouseWheelRemainder_ = wheelUnits % WHEEL_DELTA;
+        if (pages != 0) {
+            const long long target =
+                static_cast<long long>(metrics.position) - static_cast<long long>(pages) * page;
+            ScrollCustomScrollBarToPosition(
+                ScrollBarOrientation::Vertical,
+                static_cast<int>(std::clamp(
+                    target,
+                    static_cast<long long>(std::numeric_limits<int>::min()),
+                    static_cast<long long>(std::numeric_limits<int>::max()))));
+        }
+        return true;
+    }
+
+    const int linesPerWheelDelta = static_cast<int>(std::min<UINT>(scrollLines, 1000U));
+    const int wheelUnits = mouseWheelRemainder_ + wheelDelta * linesPerWheelDelta;
+    const int lines = wheelUnits / WHEEL_DELTA;
+    mouseWheelRemainder_ = wheelUnits % WHEEL_DELTA;
+    if (lines != 0) {
+        ScrollCustomScrollBarToPosition(ScrollBarOrientation::Vertical, metrics.position - lines);
+    }
+
+    return true;
+}
+
 void ClassicNotepadApp::BeginCustomScrollBarInteraction(HWND scrollBar, LPARAM lParam)
 {
     if (scrollBar != verticalScrollBar_ && scrollBar != horizontalScrollBar_) {
@@ -4023,6 +4080,12 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
         break;
     }
 
+    case WM_MOUSEWHEEL:
+        if (HandleMouseWheel(wParam)) {
+            return 0;
+        }
+        break;
+
     case WM_COMMAND:
         if (reinterpret_cast<HWND>(lParam) == editor_ && HIWORD(wParam) == EN_CHANGE) {
             HandleEditorChanged();
@@ -4438,6 +4501,9 @@ LRESULT CALLBACK ClassicNotepadApp::ScrollBarWindowProc(HWND window, UINT messag
         return 0;
 
     case WM_MOUSEWHEEL:
+        if (app->HandleMouseWheel(wParam)) {
+            return 0;
+        }
         if (app->editor_ != nullptr) {
             SendMessageW(app->editor_, WM_MOUSEWHEEL, wParam, lParam);
             app->UpdateStatusBar();
@@ -4476,6 +4542,10 @@ LRESULT CALLBACK ClassicNotepadApp::EditorWindowProc(HWND window, UINT message, 
         }
 
         if (message == WM_SYSKEYUP && wParam == VK_MENU && app->menuKeyboardActive_) {
+            return 0;
+        }
+
+        if (message == WM_MOUSEWHEEL && app->HandleMouseWheel(wParam)) {
             return 0;
         }
     }

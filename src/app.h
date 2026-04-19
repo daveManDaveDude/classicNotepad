@@ -89,6 +89,7 @@ private:
     void PaintCustomScrollBar(HWND scrollBar, HDC deviceContext) const;
     void ScrollCustomScrollBarByPage(ScrollBarOrientation orientation, bool forward);
     void ScrollCustomScrollBarToPosition(ScrollBarOrientation orientation, int targetPosition);
+    bool HandleMouseWheel(WPARAM wParam);
     void BeginCustomScrollBarInteraction(HWND scrollBar, LPARAM lParam);
     void UpdateCustomScrollBarDrag(HWND scrollBar, LPARAM lParam);
     void EndCustomScrollBarDrag(HWND scrollBar);
@@ -239,6 +240,7 @@ private:
     int scrollBarDragStartMouse_ = 0;
     int scrollBarDragStartPosition_ = 0;
     int horizontalScrollPosition_ = 0;
+    int mouseWheelRemainder_ = 0;
     RECT lastVerticalScrollBarThumb_ {};
     RECT lastHorizontalScrollBarThumb_ {};
     bool lastVerticalScrollBarPainted_ = false;
