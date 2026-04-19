@@ -292,13 +292,15 @@ $previousVersion = Get-ClassicNotepadVersion
 $currentVersion = $previousVersion
 $versionWasIncremented = $false
 
-if ($SkipVersionIncrement) {
-    Write-Host "Version: v$currentVersion (increment skipped)"
-} else {
+if ($Configuration -eq "Release" -and !$SkipVersionIncrement) {
     $currentVersion = Get-NextPatchVersion -Version $previousVersion
     Set-ClassicNotepadVersion -Version $currentVersion
     $versionWasIncremented = $true
     Write-Host "Version: v$previousVersion -> v$currentVersion"
+} elseif ($SkipVersionIncrement) {
+    Write-Host "Version: v$currentVersion (increment skipped)"
+} else {
+    Write-Host "Version: v$currentVersion (unchanged; increments only for Release builds)"
 }
 
 try {

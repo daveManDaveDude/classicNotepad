@@ -138,6 +138,11 @@ void TestLineEndingConversion()
         "Editor text is normalized to CRLF");
 
     ExpectText(
+        classic_notepad::NormalizeLineEndingsForEditor(L"one\ntwo\nthree"),
+        L"one\r\ntwo\r\nthree",
+        "LF-only pasted text is normalized to editor line endings");
+
+    ExpectText(
         classic_notepad::ConvertLineEndingsFromEditor(L"a\r\nb\r\n", LineEndingStyle::Crlf),
         L"a\r\nb\r\n",
         "CRLF save preserves CRLF endings");

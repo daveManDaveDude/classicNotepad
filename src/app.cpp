@@ -1,6 +1,7 @@
 #include "app.h"
 
 #include "app_version.h"
+#include "line_endings.h"
 #include "resource.h"
 #include "spell_text_utils.h"
 
@@ -215,6 +216,98 @@ void CopyToFixedBuffer(std::array<wchar_t, 512>& buffer, const std::wstring& tex
 {
     buffer.fill(L'\0');
     wcsncpy_s(buffer.data(), buffer.size(), text.c_str(), _TRUNCATE);
+}
+
+class ClipboardOpenScope {
+public:
+    explicit ClipboardOpenScope(HWND owner)
+        : opened_(OpenClipboard(owner) != FALSE)
+    {
+    }
+
+    ~ClipboardOpenScope()
+    {
+        if (opened_) {
+            CloseClipboard();
+        }
+    }
+
+    ClipboardOpenScope(const ClipboardOpenScope&) = delete;
+    ClipboardOpenScope& operator=(const ClipboardOpenScope&) = delete;
+
+    bool IsOpen() const
+    {
+        return opened_;
+    }
+
+private:
+    bool opened_ = false;
+};
+
+bool ReadUnicodeClipboardText(std::wstring& text)
+{
+    HGLOBAL memory = static_cast<HGLOBAL>(GetClipboardData(CF_UNICODETEXT));
+    if (memory == nullptr) {
+        return false;
+    }
+
+    const wchar_t* clipboardText = static_cast<const wchar_t*>(GlobalLock(memory));
+    if (clipboardText == nullptr) {
+        return false;
+    }
+
+    text.assign(clipboardText);
+    GlobalUnlock(memory);
+    return true;
+}
+
+bool ReadAnsiClipboardText(std::wstring& text)
+{
+    HGLOBAL memory = static_cast<HGLOBAL>(GetClipboardData(CF_TEXT));
+    if (memory == nullptr) {
+        return false;
+    }
+
+    const char* clipboardText = static_cast<const char*>(GlobalLock(memory));
+    if (clipboardText == nullptr) {
+        return false;
+    }
+
+    const int wideLength = MultiByteToWideChar(CP_ACP, 0, clipboardText, -1, nullptr, 0);
+    if (wideLength <= 0) {
+        GlobalUnlock(memory);
+        return false;
+    }
+
+    std::wstring converted(static_cast<std::size_t>(wideLength), L'\0');
+    if (MultiByteToWideChar(CP_ACP, 0, clipboardText, -1, converted.data(), wideLength) == 0) {
+        GlobalUnlock(memory);
+        return false;
+    }
+
+    if (!converted.empty() && converted.back() == L'\0') {
+        converted.pop_back();
+    }
+    text = converted;
+
+    GlobalUnlock(memory);
+    return true;
+}
+
+bool TryReadClipboardText(HWND owner, std::wstring& text)
+{
+    text.clear();
+
+    ClipboardOpenScope clipboard(owner);
+    if (!clipboard.IsOpen()) {
+        return false;
+    }
+
+    if (IsClipboardFormatAvailable(CF_UNICODETEXT) && ReadUnicodeClipboardText(text)) {
+        return true;
+    }
+
+    return IsClipboardFormatAvailable(CF_TEXT) && ReadAnsiClipboardText(text);
 }
 
 std::vector<std::wstring> SplitPrintLines(const std::wstring& text)
@@ -3738,7 +3831,13 @@ void ClassicNotepadApp::HandleCopy()
 
 void ClassicNotepadApp::HandlePaste()
 {
-    SendMessageW(editor_, WM_PASTE, 0, 0);
+    std::wstring clipboardText;
+    if (TryReadClipboardText(mainWindow_, clipboardText)) {
+        const std::wstring normalizedText = classic_notepad::NormalizeLineEndingsForEditor(clipboardText);
+        ReplaceSelection(normalizedText);
+        SendMessageW(editor_, EM_SCROLLCARET, 0, 0);
+    }
+
     UpdateStatusBar();
     UpdateScrollBars();
     SetFocus(editor_);
@@ -5267,6 +5366,11 @@ LRESULT CALLBACK ClassicNotepadApp::EditorWindowProc(HWND window, UINT message, 
         if (app->HandleEditorContextMenu(window, lParam)) {
             return 0;
         }
+    }
+
+    if (app != nullptr && message == WM_PASTE) {
+        app->HandlePaste();
+        return 0;
     }
 
     if (app != nullptr) {

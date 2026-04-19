@@ -142,7 +142,7 @@ Build release:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 -Configuration Release
 ```
 
-Each build through `scripts\build.ps1` increments the patch number in `VERSION` and embeds it in the app. To rebuild without consuming a version number, add `-SkipVersionIncrement`.
+Release builds through `scripts\build.ps1` increment the patch number in `VERSION` and embed it in the app. Debug builds, including F5 from VS Code, leave `VERSION` unchanged. To rebuild Release without consuming a version number, add `-SkipVersionIncrement`.
 
 Clean generated files:
 
