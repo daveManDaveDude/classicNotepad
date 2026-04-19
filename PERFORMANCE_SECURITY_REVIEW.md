@@ -1,26 +1,27 @@
 # Performance & Security Code Review (Classic Notepad)
 
-Date: 2026-04-19
+Date: 2026-04-19 (updated after implementation)
 Scope: `src/` and `tests/` (manual static review; no dynamic profiling in this environment).
 
 ## Executive summary
 
-The codebase is generally careful with Win32 API usage and bounds checks, and it avoids many common unsafe C/C++ patterns (notably with fixed-size dialog buffers, explicit file-size caps, and conversion error checks). That said, there are a few notable risks:
+The codebase is generally careful with Win32 API usage and bounds checks, and it avoids many common unsafe C/C++ patterns (fixed-size dialog buffers, conversion error checks, and now atomic save replacement). The previously reported high-priority issues have been addressed in code:
 
-1. **Correctness/security-hardening risk** in range arithmetic (`RangesOverlap`) due to unchecked `size_t` addition overflow.
-2. **Data-integrity risk** from non-atomic save behavior (`CREATE_ALWAYS` directly on target path).
-3. **Performance scaling limits** from repeated full-buffer extraction and linear scan matching in find/replace and measuring logic.
+1. ✅ **Overflow-hardening** for range arithmetic (`RangesOverlap`) now avoids unchecked `size_t` addition.
+2. ✅ **Data-integrity hardening** for save now uses temp-file write + flush + atomic replace.
+3. ✅ **Performance improvements** landed for find/replace snapshot reuse (replace path) and full-line width measurement allocation reduction.
+4. ℹ️ **Large-file policy change**: the fixed 256 MB load cap was removed; file open is now bounded by practical process memory / `size_t` limits.
 
 ## What looks good
 
-- File loads are bounded to 256 MB, reducing memory-exhaustion exposure for this build.
+- File loads are no longer pinned to 256 MB; open now accepts large files until memory/`size_t` constraints.
 - UTF-8 decode uses strict invalid-char flags; ANSI encode rejects lossy fallback behavior.
 - Open/Save dialogs use large fixed buffers and path validation flags.
 - Visible-region spell checking limits scanning to a bounded character budget (`96 KiB`) and uses a debounce timer.
 
 ## Findings
 
-### 1) Potential integer overflow in overlap arithmetic
+### 1) Potential integer overflow in overlap arithmetic — **RESOLVED**
 
 **Location:** `src/spell_text_utils.cpp`
 
@@ -30,11 +31,11 @@ Why this matters:
 - Today, many callers pass bounded editor/spell offsets, so practical exploitability is low.
 - However, this function is generic utility code and should be robust against malformed or future-unbounded inputs.
 
-**Recommendation:** switch to a subtraction-based overlap check (`a_start < b_end` rewritten to avoid unchecked addition), or saturating end computation.
+**Implemented:** switched to subtraction-based overlap logic with explicit zero-length handling and added near-`size_t`-max tests.
 
 ---
 
-### 2) Save path is non-atomic (integrity / crash-safety)
+### 2) Save path is non-atomic (integrity / crash-safety) — **RESOLVED**
 
 **Location:** `src/document.cpp`
 
@@ -44,11 +45,11 @@ Why this matters:
 - This is a reliability and data-integrity issue more than a direct security bug.
 - It can still be security-relevant where file integrity is critical (logs, scripts, config files).
 
-**Recommendation:** write to a temp file in the same directory, flush, then atomically replace with `MoveFileEx(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`.
+**Implemented:** save now writes to a unique temp sibling file, flushes the handle, then replaces with `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`. Temp files are cleaned up on failure.
 
 ---
 
-### 3) Find/replace performs repeated full-document copies and O(n*m) scanning
+### 3) Find/replace performs repeated full-document copies and O(n*m) scanning — **PARTIALLY RESOLVED**
 
 **Location:** `src/app.cpp`
 
@@ -58,14 +59,13 @@ Impact:
 - On larger documents, interactive latency increases notably.
 - Multiple command paths may re-copy the same full text in one user flow.
 
-**Recommendation:**
-- Cache one immutable snapshot per command invocation and reuse it.
-- Consider Boyer-Moore/Horspool for non-whole-word cases (or an API-assisted search strategy).
-- Keep current word-boundary logic as post-filtering.
+**Implemented:** Replace-command flow now captures one snapshot and reuses it across selection-match and subsequent find when no replacement occurs, eliminating an extra full-document copy in that path.
+
+**Remaining recommendation:** algorithmic scan is still linear with per-position compare; consider Boyer-Moore/Horspool as a future optimization.
 
 ---
 
-### 4) Full-line width measurement allocates per-line substrings
+### 4) Full-line width measurement allocates per-line substrings — **RESOLVED**
 
 **Location:** `src/app.cpp`
 
@@ -74,20 +74,15 @@ Impact:
 Impact:
 - More pronounced with long files and frequent layout recalculation.
 
-**Recommendation:**
-- Iterate with index ranges and avoid temporary substring allocations.
-- Reuse a scratch buffer for tab expansion.
+**Implemented:** measurement now iterates by index range and reuses a scratch buffer for tab expansion, removing per-line `substr` allocations.
 
-## Suggested priority order
+## Suggested priority order (remaining)
 
-1. Fix overlap arithmetic hardening (`RangesOverlap`) — low effort, high confidence.
-2. Implement atomic save/replace flow.
-3. Optimize find/replace snapshot usage and search loop.
-4. Optimize full-line measuring allocations.
+1. Optional: further optimize search algorithm for very large documents.
+2. Add stress/perf benchmarks for 10MB–1GB+ files on target Windows builds.
 
 ## Validation approach for follow-up patch
 
-- Add edge-case tests for near-`size_t`-max overlap math.
-- Add a save-failure simulation test (where possible) verifying original-file preservation on write failure.
-- Add microbenchmarks (or timed debug traces) for find/replace on 10MB+ documents.
-
+- ✅ Added edge-case tests for near-`size_t`-max overlap math.
+- ⏳ Save-failure simulation test remains recommended if a deterministic fault-injection hook is introduced.
+- ⏳ Add microbenchmarks (or timed debug traces) for find/replace on 10MB+ documents.

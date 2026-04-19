@@ -46,7 +46,8 @@ The project is built with C++17, Win32, CMake, and the free Visual Studio C++ Bu
 - The Win32 edit control normalizes line endings while editing.
 - Normal Save writes the line-ending style detected when the file was opened.
 - Mixed line endings are tracked as mixed and saved using the dominant detected style.
-- This build limits opened files to 256 MB.
+- Large files are supported up to available memory and platform limits (the fixed 256 MB guard was removed).
+- Save now uses an atomic temp-file replace flow to reduce data-loss risk on interruptions.
 
 ## Spell Checking
 

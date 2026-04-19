@@ -150,10 +150,10 @@ private:
     bool HasSelection() const;
     bool CanPasteText() const;
     void SeedFindTextFromSelection();
-    bool FindNextWithFlags(DWORD flags, bool showNotFoundMessage);
+    bool FindNextWithFlags(DWORD flags, bool showNotFoundMessage, const std::wstring* textSnapshot = nullptr);
     bool ReplaceCurrentSelectionIfMatch(DWORD flags);
     void ReplaceAllMatches(DWORD flags);
-    bool SelectionMatchesFindText(DWORD flags) const;
+    bool SelectionMatchesFindText(DWORD flags, const std::wstring* textSnapshot = nullptr) const;
     bool PrintEditorText(HDC printerDc, std::wstring& errorMessage) const;
     void CloseFindReplaceDialogs();
     void DestroyOwnedEditorFont();

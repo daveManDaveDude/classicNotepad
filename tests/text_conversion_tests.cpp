@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -321,6 +322,10 @@ void TestSpellRangeOverlap()
     Expect(RangesOverlap(10U, 5U, 12U, 4U), "Overlapping ranges are detected");
     Expect(!RangesOverlap(10U, 2U, 12U, 4U), "Adjacent ranges are not overlapping");
     Expect(!RangesOverlap(0U, 0U, 5U, 3U), "Empty range does not overlap");
+
+    constexpr std::size_t nearMax = std::numeric_limits<std::size_t>::max() - 2U;
+    Expect(!RangesOverlap(nearMax, 2U, 0U, 2U), "Overflow-safe overlap check handles far-apart ranges");
+    Expect(RangesOverlap(nearMax, 3U, nearMax + 1U, 1U), "Overflow-safe overlap check handles near-max overlaps");
 }
 
 } // namespace

@@ -214,6 +214,29 @@ std::wstring ExpandTabsForPrinting(const std::wstring& line)
     return expanded;
 }
 
+void ExpandTabsForMeasurementRange(
+    const std::wstring& text,
+    std::size_t start,
+    std::size_t length,
+    std::wstring& expanded)
+{
+    expanded.clear();
+    expanded.reserve(length);
+
+    int column = 0;
+    for (std::size_t index = 0; index < length; ++index) {
+        const wchar_t character = text[start + index];
+        if (character == L'\t') {
+            const int spaces = kTabWidthSpaces - (column % kTabWidthSpaces);
+            expanded.append(static_cast<std::size_t>(spaces), L' ');
+            column += spaces;
+        } else {
+            expanded.push_back(character);
+            ++column;
+        }
+    }
+}
+
 int MeasureTextWidth(HDC deviceContext, const std::wstring& text, std::size_t start, std::size_t length)
 {
     if (length == 0U) {
@@ -1675,6 +1698,7 @@ int ClassicNotepadApp::MeasureFullEditorLineWidth() const
 
     int widestLine = 0;
     const std::wstring text = GetEditorText();
+    std::wstring expandedLine;
     std::size_t lineStart = 0;
     for (std::size_t index = 0; index <= text.size(); ++index) {
         const bool atEnd = index == text.size();
@@ -1683,14 +1707,14 @@ int ClassicNotepadApp::MeasureFullEditorLineWidth() const
             continue;
         }
 
-        const std::wstring line = ExpandTabsForPrinting(text.substr(lineStart, index - lineStart));
+        ExpandTabsForMeasurementRange(text, lineStart, index - lineStart, expandedLine);
         SIZE textSize{};
-        if (!line.empty() &&
+        if (!expandedLine.empty() &&
             GetTextExtentPoint32W(
                 deviceContext,
-                line.c_str(),
+                expandedLine.c_str(),
                 static_cast<int>(std::min<std::size_t>(
-                    line.size(),
+                    expandedLine.size(),
                     static_cast<std::size_t>(std::numeric_limits<int>::max()))),
                 &textSize)) {
             widestLine = std::max(widestLine, static_cast<int>(textSize.cx));
@@ -3468,14 +3492,15 @@ void ClassicNotepadApp::SeedFindTextFromSelection()
     }
 }
 
-bool ClassicNotepadApp::FindNextWithFlags(DWORD flags, bool showNotFoundMessage)
+bool ClassicNotepadApp::FindNextWithFlags(DWORD flags, bool showNotFoundMessage, const std::wstring* textSnapshot)
 {
     const std::wstring needle(findBuffer_.data());
     if (needle.empty()) {
         return false;
     }
 
-    const std::wstring text = GetEditorText();
+    const std::wstring ownedText = textSnapshot == nullptr ? GetEditorText() : std::wstring();
+    const std::wstring& text = textSnapshot != nullptr ? *textSnapshot : ownedText;
     if (text.empty() || needle.size() > text.size()) {
         if (showNotFoundMessage) {
             std::wstring message = L"Cannot find \"";
@@ -3544,7 +3569,7 @@ bool ClassicNotepadApp::FindNextWithFlags(DWORD flags, bool showNotFoundMessage)
 
 bool ClassicNotepadApp::ReplaceCurrentSelectionIfMatch(DWORD flags)
 {
-    if (!SelectionMatchesFindText(flags)) {
+    if (!SelectionMatchesFindText(flags, nullptr)) {
         return false;
     }
 
@@ -3595,7 +3620,7 @@ void ClassicNotepadApp::ReplaceAllMatches(DWORD flags)
     SetFocus(editor_);
 }
 
-bool ClassicNotepadApp::SelectionMatchesFindText(DWORD flags) const
+bool ClassicNotepadApp::SelectionMatchesFindText(DWORD flags, const std::wstring* textSnapshot) const
 {
     const std::wstring needle(findBuffer_.data());
     if (needle.empty()) {
@@ -3613,7 +3638,8 @@ bool ClassicNotepadApp::SelectionMatchesFindText(DWORD flags) const
         return false;
     }
 
-    const std::wstring text = GetEditorText();
+    const std::wstring ownedText = textSnapshot == nullptr ? GetEditorText() : std::wstring();
+    const std::wstring& text = textSnapshot != nullptr ? *textSnapshot : ownedText;
     if (selectionEnd > text.size()) {
         return false;
     }
@@ -3822,8 +3848,14 @@ void ClassicNotepadApp::HandleFindReplaceMessage(LPARAM lParam)
     if ((findReplace->Flags & FR_FINDNEXT) != 0) {
         FindNextWithFlags(findReplace->Flags, true);
     } else if ((findReplace->Flags & FR_REPLACE) != 0) {
-        const bool replaced = ReplaceCurrentSelectionIfMatch(findReplace->Flags);
-        FindNextWithFlags(findReplace->Flags, !replaced);
+        const std::wstring textSnapshot = GetEditorText();
+        const bool replaced = SelectionMatchesFindText(findReplace->Flags, &textSnapshot);
+        if (replaced) {
+            ReplaceSelection(std::wstring(replaceBuffer_.data()));
+            FindNextWithFlags(findReplace->Flags, false);
+        } else {
+            FindNextWithFlags(findReplace->Flags, true, &textSnapshot);
+        }
     } else if ((findReplace->Flags & FR_REPLACEALL) != 0) {
         ReplaceAllMatches(findReplace->Flags);
     }
