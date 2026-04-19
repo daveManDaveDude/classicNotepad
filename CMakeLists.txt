@@ -60,6 +60,7 @@ if(MSVC)
 endif()
 
 add_executable(ClassicNotepad WIN32
+    classic_notepad_about.ico
     classic_notepad_large_transparent.ico
     src/app.cpp
     src/app.h

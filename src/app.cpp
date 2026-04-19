@@ -4814,7 +4814,7 @@ INT_PTR CALLBACK ClassicNotepadApp::AboutDialogProc(HWND dialog, UINT message, W
         if (state != nullptr) {
             state->largeIcon = static_cast<HICON>(LoadImageW(
                 state->instance,
-                MAKEINTRESOURCEW(IDI_APPICON),
+                MAKEINTRESOURCEW(IDI_ABOUTICON),
                 IMAGE_ICON,
                 kAboutIconSizePixels,
                 kAboutIconSizePixels,
