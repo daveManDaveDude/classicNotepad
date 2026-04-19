@@ -15,6 +15,7 @@ public:
     bool SaveAs(const std::wstring& path, const std::wstring& editorText, std::wstring& errorMessage);
 
     void ResetUntitled();
+    void ResetNewFile(const std::wstring& path);
 
     bool HasPath() const;
     bool IsModified() const;

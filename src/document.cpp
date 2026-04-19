@@ -216,6 +216,12 @@ void Document::ResetUntitled()
     saveLineEnding_ = LineEndingStyle::Crlf;
 }
 
+void Document::ResetNewFile(const std::wstring& path)
+{
+    ResetUntitled();
+    path_ = path;
+}
+
 bool Document::HasPath() const
 {
     return !path_.empty();

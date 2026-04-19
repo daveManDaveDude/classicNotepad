@@ -213,6 +213,32 @@ void TestDocumentRoundTrips()
     std::filesystem::remove_all(testRoot);
 }
 
+void TestDocumentNewFilePath()
+{
+    const std::filesystem::path testRoot =
+        std::filesystem::temp_directory_path() / L"classic-notepad-new-file-tests";
+    std::filesystem::create_directories(testRoot);
+
+    const std::filesystem::path path = testRoot / L"missing.txt";
+    std::filesystem::remove(path);
+
+    Document document;
+    document.ResetNewFile(path.wstring());
+
+    Expect(document.HasPath(), "New file document stores the requested path");
+    ExpectText(document.Path(), path.wstring(), "New file document exposes the requested path");
+    ExpectText(document.DisplayName(), L"missing.txt", "New file document display name uses the file name");
+    Expect(!document.IsModified(), "New file document starts unmodified");
+    Expect(!std::filesystem::exists(path), "New file document does not create the file before saving");
+
+    std::wstring error;
+    Expect(document.Save(L"", error), "New file document saves to the requested path");
+    Expect(std::filesystem::exists(path), "New file document creates the file on save");
+    ExpectBytes(ReadBinary(path), {}, "Empty new file saves as an empty file");
+
+    std::filesystem::remove_all(testRoot);
+}
+
 void TestSpellWordExpansion()
 {
     using classic_notepad::ExpandWordRangeAt;
@@ -248,6 +274,7 @@ int main()
     TestLineEndingAnalysis();
     TestLineEndingConversion();
     TestDocumentRoundTrips();
+    TestDocumentNewFilePath();
     TestSpellWordExpansion();
     TestSpellRangeOverlap();
 

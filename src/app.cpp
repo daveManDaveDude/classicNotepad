@@ -31,6 +31,8 @@ constexpr UINT kSpellMenuSuggestionMax = 50004;
 constexpr UINT kSpellMenuNoSuggestions = 50005;
 constexpr UINT kSpellMenuIgnoreOnce = 50006;
 constexpr UINT kSpellMenuAddToDictionary = 50007;
+constexpr int kDefaultEditorFontPointSize = 11;
+constexpr wchar_t kDefaultEditorFontFace[] = L"Consolas";
 
 struct GoToDialogState {
     int currentLine = 1;
@@ -194,6 +196,17 @@ bool IsPrintWrapBreak(wchar_t character)
     return character == L' ' || character == L'-';
 }
 
+bool IsMissingFilePath(const std::wstring& path)
+{
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+
+    const DWORD error = GetLastError();
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+}
+
 std::size_t FindWrapBreakLength(const std::wstring& text, std::size_t start, std::size_t maxLength)
 {
     if (start + maxLength >= text.size()) {
@@ -242,6 +255,27 @@ RECT BuildPrintableTextRect(HDC printerDc, const RECT& marginsThousandths)
     }
 
     return textRect;
+}
+
+HFONT CreateDefaultEditorFont(HWND ownerWindow)
+{
+    HDC deviceContext = GetDC(ownerWindow);
+    const int dpiY = deviceContext != nullptr ? std::max(1, GetDeviceCaps(deviceContext, LOGPIXELSY)) : 96;
+    if (deviceContext != nullptr) {
+        ReleaseDC(ownerWindow, deviceContext);
+    }
+
+    LOGFONTW logFont{};
+    logFont.lfHeight = -MulDiv(kDefaultEditorFontPointSize, dpiY, 72);
+    logFont.lfWeight = FW_NORMAL;
+    logFont.lfCharSet = DEFAULT_CHARSET;
+    logFont.lfOutPrecision = OUT_DEFAULT_PRECIS;
+    logFont.lfClipPrecision = CLIP_DEFAULT_PRECIS;
+    logFont.lfQuality = CLEARTYPE_QUALITY;
+    logFont.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
+    wcscpy_s(logFont.lfFaceName, kDefaultEditorFontFace);
+
+    return CreateFontIndirectW(&logFont);
 }
 
 HFONT CreatePrinterFont(HDC printerDc, HFONT sourceFont, HWND ownerWindow)
@@ -302,7 +336,7 @@ int ClassicNotepadApp::Run(int showCommand, const std::wstring& initialFilePath)
     accelerator_ = LoadAcceleratorsW(instance_, MAKEINTRESOURCEW(IDR_ACCELERATORS));
 
     if (!initialFilePath.empty()) {
-        LoadDocument(initialFilePath);
+        HandleInitialFilePath(initialFilePath);
     } else {
         UpdateTitle();
     }
@@ -410,8 +444,12 @@ HWND ClassicNotepadApp::CreateEditor()
     }
 
     if (editorFont_ == nullptr) {
-        editorFont_ = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-        ownsEditorFont_ = false;
+        editorFont_ = CreateDefaultEditorFont(mainWindow_);
+        ownsEditorFont_ = editorFont_ != nullptr;
+        if (editorFont_ == nullptr) {
+            editorFont_ = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+            ownsEditorFont_ = false;
+        }
     }
 
     SendMessageW(editor, WM_SETFONT, reinterpret_cast<WPARAM>(editorFont_), TRUE);
@@ -846,6 +884,42 @@ void ClassicNotepadApp::ShowAboutDialog()
         L"Single editor window, classic menu bar, file open/save, classic edit commands, word wrap, font selection, status bar, page setup, print, and no modern extras apart from spell checking.";
 
     MessageBoxW(mainWindow_, message, L"About Classic Notepad", MB_OK | MB_ICONINFORMATION);
+}
+
+void ClassicNotepadApp::HandleInitialFilePath(const std::wstring& path)
+{
+    if (IsMissingFilePath(path)) {
+        if (ConfirmCreateMissingFile(path)) {
+            CreateNewDocumentForPath(path);
+        } else {
+            UpdateTitle();
+            SetFocus(editor_);
+        }
+        return;
+    }
+
+    LoadDocument(path);
+}
+
+void ClassicNotepadApp::CreateNewDocumentForPath(const std::wstring& path)
+{
+    document_.ResetNewFile(path);
+    SetEditorText(L"");
+    UpdateTitle();
+    SetFocus(editor_);
+}
+
+bool ClassicNotepadApp::ConfirmCreateMissingFile(const std::wstring& path) const
+{
+    std::wstring prompt = L"Cannot find the ";
+    prompt += path;
+    prompt += L" file.\n\nDo you want to create a new file?";
+
+    return MessageBoxW(
+        mainWindow_,
+        prompt.c_str(),
+        L"Classic Notepad",
+        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1) == IDYES;
 }
 
 void ClassicNotepadApp::HandleEditorChanged()

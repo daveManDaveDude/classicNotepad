@@ -34,6 +34,9 @@ private:
     void ShowSpellingUnavailableMessage();
     void ShowAboutDialog();
 
+    void HandleInitialFilePath(const std::wstring& path);
+    void CreateNewDocumentForPath(const std::wstring& path);
+    bool ConfirmCreateMissingFile(const std::wstring& path) const;
     void HandleEditorChanged();
     void HandleNew();
     void HandleOpen();
