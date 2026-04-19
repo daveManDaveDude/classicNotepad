@@ -94,6 +94,8 @@ struct AboutDialogState {
     HINSTANCE instance = nullptr;
     HICON largeIcon = nullptr;
     bool ownsLargeIcon = false;
+    bool darkMode = false;
+    HBRUSH backgroundBrush = nullptr;
 };
 
 struct FontFamilySearch {
@@ -1116,6 +1118,66 @@ bool DrawMessageDialogButton(MessageDialogState& state, DRAWITEMSTRUCT* drawItem
     }
 
     return true;
+}
+
+void DrawThemedPushButton(
+    HDC deviceContext,
+    const RECT& rect,
+    const std::wstring& text,
+    HFONT font,
+    bool darkMode,
+    bool defaultButton,
+    UINT itemState,
+    HWND scaleWindow)
+{
+    const bool pressed = (itemState & ODS_SELECTED) != 0;
+    const bool focused = (itemState & ODS_FOCUS) != 0;
+    const bool disabled = (itemState & ODS_DISABLED) != 0;
+    const COLORREF fillColor = darkMode
+        ? (pressed ? kDarkMenuActiveBackground : kDarkMenuHotBackground)
+        : GetSysColor(pressed ? COLOR_3DSHADOW : COLOR_BTNFACE);
+    const COLORREF borderColor = defaultButton
+        ? RGB(0, 120, 215)
+        : (darkMode ? kDarkMenuSeparator : GetSysColor(COLOR_3DSHADOW));
+    const COLORREF textColor = disabled
+        ? (darkMode ? kDarkMenuDisabledText : GetSysColor(COLOR_GRAYTEXT))
+        : MessageDialogTextColor(darkMode);
+
+    HBRUSH fillBrush = CreateSolidBrush(fillColor);
+    FillRect(deviceContext, &rect, fillBrush);
+    DeleteObject(fillBrush);
+
+    RECT borderRect = rect;
+    HBRUSH borderBrush = CreateSolidBrush(borderColor);
+    FrameRect(deviceContext, &borderRect, borderBrush);
+    if (defaultButton) {
+        InflateRect(&borderRect, -1, -1);
+        FrameRect(deviceContext, &borderRect, borderBrush);
+    }
+    DeleteObject(borderBrush);
+
+    RECT textRect = rect;
+    InflateRect(&textRect, -ScalePixelsForWindow(scaleWindow, 8), 0);
+    SetBkMode(deviceContext, TRANSPARENT);
+    SetTextColor(deviceContext, textColor);
+    HGDIOBJ previousFont = SelectObject(
+        deviceContext,
+        font != nullptr ? reinterpret_cast<HGDIOBJ>(font) : GetStockObject(DEFAULT_GUI_FONT));
+    DrawTextW(
+        deviceContext,
+        text.c_str(),
+        -1,
+        &textRect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if (previousFont != nullptr) {
+        SelectObject(deviceContext, previousFont);
+    }
+
+    if (focused) {
+        RECT focusRect = rect;
+        InflateRect(&focusRect, -ScalePixelsForWindow(scaleWindow, 4), -ScalePixelsForWindow(scaleWindow, 4));
+        DrawFocusRect(deviceContext, &focusRect);
+    }
 }
 
 void PaintMessageDialog(HWND window, MessageDialogState& state)
@@ -4175,6 +4237,7 @@ void ClassicNotepadApp::ShowAboutDialog()
 {
     AboutDialogState state{};
     state.instance = instance_;
+    state.darkMode = darkModeEnabled_;
 
     if (DialogBoxParamW(
             instance_,
@@ -5642,9 +5705,28 @@ INT_PTR CALLBACK ClassicNotepadApp::AboutDialogProc(HWND dialog, UINT message, W
         SetWindowLongPtrW(dialog, DWLP_USER, reinterpret_cast<LONG_PTR>(state));
         SetDlgItemTextW(dialog, IDC_ABOUT_VERSION, CLASSIC_NOTEPAD_VERSION_DISPLAY_W);
         if (state != nullptr) {
+            if (state->darkMode) {
+                ApplyDarkTitleBar(dialog, true);
+                state->backgroundBrush = CreateSolidBrush(MessageDialogBackgroundColor(true));
+
+                HWND okButton = GetDlgItem(dialog, IDOK);
+                if (okButton != nullptr) {
+                    const LONG_PTR style = GetWindowLongPtrW(okButton, GWL_STYLE);
+                    SetWindowLongPtrW(okButton, GWL_STYLE, (style & ~BS_TYPEMASK) | BS_OWNERDRAW);
+                    SetWindowPos(
+                        okButton,
+                        nullptr,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+                }
+            }
+
             state->largeIcon = static_cast<HICON>(LoadImageW(
                 state->instance,
-                MAKEINTRESOURCEW(IDI_ABOUTICON),
+                MAKEINTRESOURCEW(IDI_APPICON),
                 IMAGE_ICON,
                 kAboutIconSizePixels,
                 kAboutIconSizePixels,
@@ -5656,6 +5738,22 @@ INT_PTR CALLBACK ClassicNotepadApp::AboutDialogProc(HWND dialog, UINT message, W
         }
         return TRUE;
 
+    case WM_CTLCOLORDLG:
+        if (state != nullptr && state->darkMode && state->backgroundBrush != nullptr) {
+            return reinterpret_cast<INT_PTR>(state->backgroundBrush);
+        }
+        break;
+
+    case WM_CTLCOLORBTN:
+    case WM_CTLCOLORSTATIC:
+        if (state != nullptr && state->darkMode && state->backgroundBrush != nullptr) {
+            HDC deviceContext = reinterpret_cast<HDC>(wParam);
+            SetTextColor(deviceContext, MessageDialogTextColor(true));
+            SetBkMode(deviceContext, TRANSPARENT);
+            return reinterpret_cast<INT_PTR>(state->backgroundBrush);
+        }
+        break;
+
     case WM_DRAWITEM:
         if (wParam == IDC_ABOUT_ICON && state != nullptr && state->largeIcon != nullptr) {
             auto* drawItem = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
@@ -5665,9 +5763,31 @@ INT_PTR CALLBACK ClassicNotepadApp::AboutDialogProc(HWND dialog, UINT message, W
             const int x = drawItem->rcItem.left + ((controlWidth - iconSize) / 2);
             const int y = drawItem->rcItem.top + ((controlHeight - iconSize) / 2);
 
-            FillRect(drawItem->hDC, &drawItem->rcItem, reinterpret_cast<HBRUSH>(COLOR_3DFACE + 1));
+            HBRUSH backgroundBrush = state->darkMode && state->backgroundBrush != nullptr
+                ? state->backgroundBrush
+                : reinterpret_cast<HBRUSH>(COLOR_3DFACE + 1);
+            FillRect(drawItem->hDC, &drawItem->rcItem, backgroundBrush);
             DrawIconEx(drawItem->hDC, x, y, state->largeIcon, iconSize, iconSize, 0, nullptr, DI_NORMAL);
             return TRUE;
+        }
+
+        if (wParam == IDOK && state != nullptr) {
+            auto* drawItem = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+            if (drawItem != nullptr && drawItem->hDC != nullptr) {
+                std::array<wchar_t, 64> buttonText{};
+                GetWindowTextW(drawItem->hwndItem, buttonText.data(), static_cast<int>(buttonText.size()));
+                HFONT buttonFont = reinterpret_cast<HFONT>(SendMessageW(drawItem->hwndItem, WM_GETFONT, 0, 0));
+                DrawThemedPushButton(
+                    drawItem->hDC,
+                    drawItem->rcItem,
+                    buttonText.data(),
+                    buttonFont,
+                    state->darkMode,
+                    true,
+                    drawItem->itemState,
+                    dialog);
+                return TRUE;
+            }
         }
         break;
 
@@ -5688,6 +5808,10 @@ INT_PTR CALLBACK ClassicNotepadApp::AboutDialogProc(HWND dialog, UINT message, W
             DestroyIcon(state->largeIcon);
             state->largeIcon = nullptr;
             state->ownsLargeIcon = false;
+        }
+        if (state != nullptr && state->backgroundBrush != nullptr) {
+            DeleteObject(state->backgroundBrush);
+            state->backgroundBrush = nullptr;
         }
         return TRUE;
 
