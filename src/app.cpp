@@ -2856,8 +2856,9 @@ void ClassicNotepadApp::ShowAboutDialog()
 {
     constexpr wchar_t message[] =
         L"Classic Notepad\n\n"
-        L"Phase 6 native Win32 build.\n"
-        L"Single editor window, classic menu bar, file open/save, classic edit commands, word wrap, font selection, status bar, page setup, print, and no modern extras apart from spell checking.";
+        L"Finished native Win32 build.\n"
+        L"Single-document editor with classic menus, file open/save, find/replace, Go To, word wrap, font selection, status bar, page setup, print, dark mode, and Windows spell checking.\n\n"
+        L"No tabs, cloud features, telemetry, or modern editor extras.";
 
     MessageBoxW(mainWindow_, message, L"About Classic Notepad", MB_OK | MB_ICONINFORMATION);
 }
