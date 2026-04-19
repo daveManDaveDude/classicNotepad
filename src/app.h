@@ -94,6 +94,7 @@ private:
     void UpdateTitle();
     void UpdateMenuState(HMENU menu);
     void UpdateStatusBar();
+    void UpdateStatusBarPartLayout();
     void SetStatusCharacterCountFromText(const std::wstring& text);
     std::size_t GetStatusCharacterCount();
     void UpdateStatusBarSizeGripStyle();
@@ -239,7 +240,7 @@ private:
     UINT findReplaceMessage_ = 0;
     Document document_;
     FINDREPLACEW findReplace_ {};
-    std::wstring statusBarText_;
+    std::array<std::wstring, 4> statusBarParts_ {};
     std::array<wchar_t, 512> findBuffer_ {};
     std::array<wchar_t, 512> replaceBuffer_ {};
     std::vector<std::unique_ptr<OwnerDrawMenuItem>> mainOwnerDrawMenuItems_;

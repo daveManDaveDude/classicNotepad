@@ -46,7 +46,9 @@ constexpr wchar_t kDefaultEditorFontFace[] = L"Consolas";
 constexpr COLORREF kDarkEditorBackground = RGB(32, 32, 32);
 constexpr COLORREF kDarkEditorText = RGB(242, 242, 242);
 constexpr COLORREF kDarkStatusBackground = RGB(43, 43, 43);
-constexpr COLORREF kDarkStatusText = RGB(242, 242, 242);
+constexpr COLORREF kDarkStatusText = RGB(216, 216, 216);
+constexpr COLORREF kDarkStatusSeparator = RGB(68, 68, 68);
+constexpr COLORREF kLightStatusSeparator = RGB(210, 210, 210);
 constexpr COLORREF kDarkKeyLine = RGB(0, 0, 0);
 constexpr COLORREF kDarkResizeGrip = kDarkKeyLine;
 constexpr COLORREF kDarkMenuBackground = RGB(38, 38, 38);
@@ -73,6 +75,10 @@ constexpr DWORD kDwmUseImmersiveDarkModeBefore20H1 = 19;
 constexpr DWORD kDwmBorderColor = 34;
 constexpr COLORREF kDwmDefaultColor = 0xFFFFFFFF;
 constexpr int kAboutIconSizePixels = 72;
+constexpr int kStatusBarPartCount = 4;
+constexpr int kStatusBarHorizontalPadding = 12;
+constexpr int kStatusBarSeparatorInset = 7;
+constexpr int kStatusBarMinHeight = 32;
 
 struct GoToDialogState {
     int currentLine = 1;
@@ -432,9 +438,26 @@ std::wstring FormatLineEnding(Document::LineEndingStyle lineEnding)
     }
 }
 
+std::wstring FormatNumberWithSeparators(std::size_t value)
+{
+    const std::wstring digits = std::to_wstring(value);
+    std::wstring formatted;
+    formatted.reserve(digits.size() + ((digits.size() - 1U) / 3U));
+
+    for (std::size_t index = 0; index < digits.size(); ++index) {
+        if (index > 0U && ((digits.size() - index) % 3U) == 0U) {
+            formatted += L',';
+        }
+
+        formatted += digits[index];
+    }
+
+    return formatted;
+}
+
 std::wstring FormatCharacterCount(std::size_t count)
 {
-    std::wstring text = std::to_wstring(count);
+    std::wstring text = FormatNumberWithSeparators(count);
     text += count == 1U ? L" character" : L" characters";
     return text;
 }
@@ -960,6 +983,10 @@ HWND ClassicNotepadApp::CreateStatusBar()
         nullptr);
 
     if (statusBar != nullptr) {
+        if (menuFont_ != nullptr) {
+            SendMessageW(statusBar, WM_SETFONT, reinterpret_cast<WPARAM>(menuFont_), FALSE);
+        }
+        SendMessageW(statusBar, SB_SETMINHEIGHT, static_cast<WPARAM>(ScalePixelsForWindow(mainWindow_, kStatusBarMinHeight)), 0);
         SendMessageW(statusBar, SB_SETBKCOLOR, 0, darkModeEnabled_ ? kDarkStatusBackground : CLR_DEFAULT);
         SetWindowSubclass(
             statusBar,
@@ -1571,7 +1598,7 @@ LRESULT ClassicNotepadApp::HandleDrawItem(WPARAM controlId, LPARAM lParam) const
         return TRUE;
     }
 
-    if (!darkModeEnabled_ || controlId != ID_VIEW_STATUS_BAR || statusBar_ == nullptr) {
+    if (controlId != ID_VIEW_STATUS_BAR || statusBar_ == nullptr) {
         return 0;
     }
 
@@ -1579,24 +1606,67 @@ LRESULT ClassicNotepadApp::HandleDrawItem(WPARAM controlId, LPARAM lParam) const
         return 0;
     }
 
-    RECT statusRect{};
-    GetClientRect(statusBar_, &statusRect);
-    FillRect(drawItem->hDC, &statusRect, darkStatusBackgroundBrush_ != nullptr
-        ? darkStatusBackgroundBrush_
-        : reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+    std::size_t partIndex = static_cast<std::size_t>(drawItem->itemID);
+    if (partIndex >= statusBarParts_.size() && drawItem->itemData < statusBarParts_.size()) {
+        partIndex = static_cast<std::size_t>(drawItem->itemData);
+    }
+
+    if (partIndex >= statusBarParts_.size()) {
+        return TRUE;
+    }
+
+    const COLORREF backgroundColor = darkModeEnabled_ ? kDarkStatusBackground : GetSysColor(COLOR_3DFACE);
+    const COLORREF textColor = darkModeEnabled_ ? kDarkStatusText : GetSysColor(COLOR_BTNTEXT);
+    const COLORREF separatorColor = darkModeEnabled_ ? kDarkStatusSeparator : kLightStatusSeparator;
+
+    HBRUSH backgroundBrush = CreateSolidBrush(backgroundColor);
+    if (backgroundBrush != nullptr) {
+        FillRect(drawItem->hDC, &drawItem->rcItem, backgroundBrush);
+        DeleteObject(backgroundBrush);
+    }
+
+    if (partIndex > 0U) {
+        HPEN separatorPen = CreatePen(PS_SOLID, 1, separatorColor);
+        HGDIOBJ previousPen = separatorPen != nullptr ? SelectObject(drawItem->hDC, separatorPen) : nullptr;
+        const int separatorInset = ScalePixelsForWindow(statusBar_, kStatusBarSeparatorInset);
+        const int separatorX = drawItem->rcItem.left;
+        MoveToEx(drawItem->hDC, separatorX, drawItem->rcItem.top + separatorInset, nullptr);
+        LineTo(drawItem->hDC, separatorX, std::max(drawItem->rcItem.top + separatorInset, drawItem->rcItem.bottom - separatorInset));
+        if (previousPen != nullptr) {
+            SelectObject(drawItem->hDC, previousPen);
+        }
+        if (separatorPen != nullptr) {
+            DeleteObject(separatorPen);
+        }
+    }
+
+    HGDIOBJ previousFont = SelectObject(
+        drawItem->hDC,
+        menuFont_ != nullptr ? menuFont_ : GetStockObject(DEFAULT_GUI_FONT));
 
     RECT itemRect = drawItem->rcItem;
-    itemRect.left += 4;
+    const int horizontalPadding = ScalePixelsForWindow(statusBar_, kStatusBarHorizontalPadding);
+    itemRect.left += horizontalPadding;
+    itemRect.right -= horizontalPadding;
+    if (partIndex + 1U == statusBarParts_.size()) {
+        const RECT gripRect = GetStatusBarResizeGripRect();
+        if (!IsRectEmpty(&gripRect)) {
+            itemRect.right = std::min(itemRect.right, gripRect.left - horizontalPadding);
+        }
+    }
+
     SetBkMode(drawItem->hDC, TRANSPARENT);
-    SetTextColor(drawItem->hDC, kDarkStatusText);
+    SetTextColor(drawItem->hDC, textColor);
     DrawTextW(
         drawItem->hDC,
-        statusBarText_.c_str(),
+        statusBarParts_[partIndex].c_str(),
         -1,
         &itemRect,
-        DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+        DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
 
-    DrawDarkStatusBarChrome(drawItem->hDC);
+    if (previousFont != nullptr) {
+        SelectObject(drawItem->hDC, previousFont);
+    }
     return TRUE;
 }
 
@@ -2779,19 +2849,62 @@ void ClassicNotepadApp::UpdateStatusBar()
     const int column = caretPosition >= lineStartPosition
         ? static_cast<int>(caretPosition - lineStartPosition) + 1
         : 1;
-    statusBarText_ = L"Ln ";
-    statusBarText_ += std::to_wstring(line);
-    statusBarText_ += L", Col ";
-    statusBarText_ += std::to_wstring(column);
-    statusBarText_ += L" | ";
-    statusBarText_ += FormatCharacterCount(GetStatusCharacterCount());
-    statusBarText_ += L" | ";
-    statusBarText_ += FormatLineEnding(document_.LineEnding());
-    statusBarText_ += L" | ";
-    statusBarText_ += FormatEncoding(document_.Encoding());
+    statusBarParts_[0] = L"Ln ";
+    statusBarParts_[0] += FormatNumberWithSeparators(static_cast<std::size_t>(std::max(1, line)));
+    statusBarParts_[0] += L", Col ";
+    statusBarParts_[0] += FormatNumberWithSeparators(static_cast<std::size_t>(std::max(1, column)));
+    statusBarParts_[1] = FormatCharacterCount(GetStatusCharacterCount());
+    statusBarParts_[2] = FormatLineEnding(document_.LineEnding());
+    statusBarParts_[3] = FormatEncoding(document_.Encoding());
 
-    const WPARAM part = darkModeEnabled_ ? (SBT_OWNERDRAW | SBT_NOBORDERS) : 0;
-    SendMessageW(statusBar_, SB_SETTEXTW, part, reinterpret_cast<LPARAM>(statusBarText_.c_str()));
+    UpdateStatusBarPartLayout();
+
+    for (std::size_t index = 0; index < statusBarParts_.size(); ++index) {
+        const WPARAM part = static_cast<WPARAM>(index) | SBT_OWNERDRAW | SBT_NOBORDERS;
+        SendMessageW(statusBar_, SB_SETTEXTW, part, static_cast<LPARAM>(index));
+    }
+}
+
+void ClassicNotepadApp::UpdateStatusBarPartLayout()
+{
+    if (statusBar_ == nullptr) {
+        return;
+    }
+
+    HDC deviceContext = GetDC(statusBar_);
+    HGDIOBJ previousFont = nullptr;
+    if (deviceContext != nullptr) {
+        previousFont = SelectObject(
+            deviceContext,
+            menuFont_ != nullptr ? menuFont_ : GetStockObject(DEFAULT_GUI_FONT));
+    }
+
+    std::array<int, kStatusBarPartCount> partRights{};
+    int right = 0;
+    const int horizontalPadding = ScalePixelsForWindow(statusBar_, kStatusBarHorizontalPadding);
+    for (int index = 0; index < kStatusBarPartCount; ++index) {
+        if (index + 1 == kStatusBarPartCount) {
+            partRights[static_cast<std::size_t>(index)] = -1;
+            break;
+        }
+
+        const SIZE textSize = MeasureText(deviceContext, statusBarParts_[static_cast<std::size_t>(index)]);
+        right += textSize.cx + (horizontalPadding * 2);
+        partRights[static_cast<std::size_t>(index)] = right;
+    }
+
+    if (previousFont != nullptr) {
+        SelectObject(deviceContext, previousFont);
+    }
+    if (deviceContext != nullptr) {
+        ReleaseDC(statusBar_, deviceContext);
+    }
+
+    SendMessageW(
+        statusBar_,
+        SB_SETPARTS,
+        static_cast<WPARAM>(partRights.size()),
+        reinterpret_cast<LPARAM>(partRights.data()));
 }
 
 void ClassicNotepadApp::SetStatusCharacterCountFromText(const std::wstring& text)
@@ -2958,7 +3071,7 @@ void ClassicNotepadApp::DrawDarkStatusBarChrome(HDC deviceContext) const
 
     DrawDarkResizeGrip(deviceContext);
 
-    HBRUSH lineBrush = CreateSolidBrush(kDarkKeyLine);
+    HBRUSH lineBrush = CreateSolidBrush(kDarkStatusSeparator);
     if (lineBrush != nullptr) {
         RECT topLine = statusRect;
         topLine.bottom = topLine.top + 1;
