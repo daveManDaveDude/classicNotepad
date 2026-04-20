@@ -1,5 +1,8 @@
 # Classic Notepad
 
+<img width="931" height="300" alt="image" src="https://github.com/user-attachments/assets/2fa66227-88b2-4052-9a6d-071b25944fbf" />
+
+
 Classic Notepad is a finished single-document Win32/C++ recreation of classic Windows Notepad. It keeps the plain local editor feel: one window, one text document, native Windows dialogs, no tabs, no cloud features, no telemetry, and no editor extras that would pull it away from the classic experience.
 
 The project is built with C++17, Win32, CMake, and the free Visual Studio C++ Build Tools. It is intended to be opened, built, tested, and debugged from Visual Studio Code.
