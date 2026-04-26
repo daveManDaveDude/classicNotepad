@@ -1,8 +1,8 @@
 build/
+build-ubuntu/
 .vs/
 out/
 *.user
 *.suo
 *.VC.db
 *.VC.VC.opendb
-

@@ -2,6 +2,7 @@
 #include "encoding.h"
 #include "line_endings.h"
 #include "spell_text_utils.h"
+#include "text_metadata.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -277,6 +278,38 @@ void TestDocumentMetadata()
     std::filesystem::remove_all(testRoot);
 }
 
+void TestTextMetadataFormatting()
+{
+    using classic_notepad::LineEndingStyle;
+    using classic_notepad::TextEncoding;
+
+    ExpectText(classic_notepad::FormatEncoding(TextEncoding::Utf8NoBom), L"UTF-8", "UTF-8 label formats");
+    ExpectText(
+        classic_notepad::FormatEncoding(TextEncoding::Utf8Bom),
+        L"UTF-8 with BOM",
+        "UTF-8 BOM label formats");
+    ExpectText(classic_notepad::FormatEncoding(TextEncoding::Utf16LeBom), L"UTF-16 LE", "UTF-16 label formats");
+    ExpectText(classic_notepad::FormatEncoding(TextEncoding::Ansi), L"ANSI", "ANSI label formats");
+
+    ExpectText(
+        classic_notepad::FormatLineEnding(LineEndingStyle::Crlf),
+        L"Windows (CRLF)",
+        "CRLF label formats");
+    ExpectText(classic_notepad::FormatLineEnding(LineEndingStyle::Lf), L"Unix (LF)", "LF label formats");
+    ExpectText(classic_notepad::FormatLineEnding(LineEndingStyle::Cr), L"Macintosh (CR)", "CR label formats");
+    ExpectText(classic_notepad::FormatLineEnding(LineEndingStyle::Mixed), L"Mixed", "Mixed label formats");
+
+    ExpectText(classic_notepad::FormatNumberWithSeparators(0U), L"0", "Zero number formats");
+    ExpectText(classic_notepad::FormatNumberWithSeparators(1234567U), L"1,234,567", "Large number formats");
+    ExpectText(classic_notepad::FormatCharacterCount(1U), L"1 character", "Singular character count formats");
+    ExpectText(classic_notepad::FormatCharacterCount(1000U), L"1,000 characters", "Plural character count formats");
+
+    Expect(classic_notepad::CountStatusCharacters(L"a\r\nb") == 3U, "CRLF counts as one status character");
+    Expect(
+        classic_notepad::CountStatusCharacters(std::wstring(L"a") + wchar_t(0xD83D) + wchar_t(0xDE00) + L"b") == 3U,
+        "UTF-16 surrogate pair counts as one status character");
+}
+
 void TestDocumentNewFilePath()
 {
     const std::filesystem::path testRoot =
@@ -343,6 +376,7 @@ int main()
     TestLineEndingConversion();
     TestDocumentRoundTrips();
     TestDocumentMetadata();
+    TestTextMetadataFormatting();
     TestDocumentNewFilePath();
     TestSpellWordExpansion();
     TestSpellRangeOverlap();

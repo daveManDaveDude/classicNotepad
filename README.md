@@ -139,6 +139,29 @@ Run tests after building:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1 -Configuration Debug
 ```
 
+Build and test the shared core under Ubuntu/WSL:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-ubuntu.ps1 -Distro Ubuntu-24.04
+```
+
+The Ubuntu build verifies the cross-platform shared core, console tests, and, when GTK4 development packages are installed, builds the early native GTK app target.
+
+Run the Ubuntu GTK app from an Ubuntu shell:
+
+```bash
+cd /mnt/c/vibe/classicNotepad
+./build-ubuntu/ClassicNotepadGtk
+```
+
+You can pass a first file path argument to open it through the shared document loader:
+
+```bash
+./build-ubuntu/ClassicNotepadGtk README.md
+```
+
+Current GTK target scope is intentionally small: native window, text editor surface, status metadata, and first-argument file load. Save/open menus and parity workflows are still future slices.
+
 Build release:
 
 ```powershell
@@ -207,13 +230,20 @@ Install **English (United Kingdom)** language support in Windows Settings, inclu
 
 ```text
 src/
-  app.cpp, app.h              Win32 application, menus, dialogs, editor, printing, theme, spell UI
-  document.cpp, document.h    Document path, modified state, load/save behavior
-  encoding.cpp, encoding.h    UTF-8, UTF-16 LE, and ANSI conversion
-  line_endings.cpp, .h        Line-ending detection and conversion
-  spell_check.cpp, .h         Windows Spell Checking API wrapper
-  spell_text_utils.cpp, .h    Word range and spelling range helpers
-  resources.rc               Menus, accelerators, and Go To dialog resource
+  document.cpp, document.h       Document path, modified state, load/save behavior
+  encoding.cpp, encoding.h       UTF-8, UTF-16 LE, and ANSI conversion
+  line_endings.cpp, .h           Line-ending detection and conversion
+  text_metadata.cpp, .h          Shared status metadata labels and character counts
+  spell_text_utils.cpp, .h       Word range and spelling range helpers
+  file_io.h, ansi_encoding.h     Platform seams used by the shared core
+  platform/
+    portable/                    Portable fallback file/ANSI helpers
+    windows/
+      app.cpp, app.h             Win32 application, menus, dialogs, editor, printing, theme, spell UI
+      main.cpp                   Win32 entry point
+      spell_check.cpp, .h        Windows Spell Checking API wrapper
+      resources.rc, resource.h   Menus, accelerators, dialogs, and version/icon resources
+      win32_platform.h           Common Win32 compile definitions
 
 assets/
   icons/                     Application icon resources
@@ -239,8 +269,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 -Configu
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1 -Configuration Debug
 ```
 
-CTest should report one passing test target:
+CTest should report these passing test targets on Windows:
 
 ```text
 TextConversionTests
+TextConversionPortableSmokeTests
 ```

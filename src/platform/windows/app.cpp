@@ -4,6 +4,7 @@
 #include "line_endings.h"
 #include "resource.h"
 #include "spell_text_utils.h"
+#include "text_metadata.h"
 
 #include <cderr.h>
 #include <commdlg.h>
@@ -538,83 +539,6 @@ void ApplyDarkTitleBar(HWND window, bool useDarkMode)
         kDwmBorderColor,
         &borderColor,
         sizeof(borderColor));
-}
-
-std::wstring FormatEncoding(Document::TextEncoding encoding)
-{
-    switch (encoding) {
-    case Document::TextEncoding::Utf8NoBom:
-        return L"UTF-8";
-    case Document::TextEncoding::Utf8Bom:
-        return L"UTF-8 with BOM";
-    case Document::TextEncoding::Utf16LeBom:
-        return L"UTF-16 LE";
-    case Document::TextEncoding::Ansi:
-        return L"ANSI";
-    default:
-        return L"UTF-8";
-    }
-}
-
-std::wstring FormatLineEnding(Document::LineEndingStyle lineEnding)
-{
-    switch (lineEnding) {
-    case Document::LineEndingStyle::Crlf:
-        return L"Windows (CRLF)";
-    case Document::LineEndingStyle::Lf:
-        return L"Unix (LF)";
-    case Document::LineEndingStyle::Cr:
-        return L"Macintosh (CR)";
-    case Document::LineEndingStyle::Mixed:
-        return L"Mixed";
-    default:
-        return L"Windows (CRLF)";
-    }
-}
-
-std::wstring FormatNumberWithSeparators(std::size_t value)
-{
-    const std::wstring digits = std::to_wstring(value);
-    std::wstring formatted;
-    formatted.reserve(digits.size() + ((digits.size() - 1U) / 3U));
-
-    for (std::size_t index = 0; index < digits.size(); ++index) {
-        if (index > 0U && ((digits.size() - index) % 3U) == 0U) {
-            formatted += L',';
-        }
-
-        formatted += digits[index];
-    }
-
-    return formatted;
-}
-
-std::wstring FormatCharacterCount(std::size_t count)
-{
-    std::wstring text = FormatNumberWithSeparators(count);
-    text += count == 1U ? L" character" : L" characters";
-    return text;
-}
-
-std::size_t CountStatusCharacters(const std::wstring& text)
-{
-    std::size_t count = 0;
-    for (std::size_t index = 0; index < text.size(); ++index) {
-        if (text[index] == L'\r' && index + 1U < text.size() && text[index + 1U] == L'\n') {
-            ++index;
-        } else if (
-            text[index] >= 0xD800 &&
-            text[index] <= 0xDBFF &&
-            index + 1U < text.size() &&
-            text[index + 1U] >= 0xDC00 &&
-            text[index + 1U] <= 0xDFFF) {
-            ++index;
-        }
-
-        ++count;
-    }
-
-    return count;
 }
 
 std::wstring StripMenuMnemonics(const std::wstring& text)
@@ -3613,12 +3537,14 @@ void ClassicNotepadApp::UpdateStatusBar()
         ? static_cast<int>(caretPosition - lineStartPosition) + 1
         : 1;
     statusBarParts_[0] = L"Ln ";
-    statusBarParts_[0] += FormatNumberWithSeparators(static_cast<std::size_t>(std::max(1, line)));
+    statusBarParts_[0] += classic_notepad::FormatNumberWithSeparators(
+        static_cast<std::size_t>(std::max(1, line)));
     statusBarParts_[0] += L", Col ";
-    statusBarParts_[0] += FormatNumberWithSeparators(static_cast<std::size_t>(std::max(1, column)));
-    statusBarParts_[1] = FormatCharacterCount(GetStatusCharacterCount());
-    statusBarParts_[2] = FormatLineEnding(document_.LineEnding());
-    statusBarParts_[3] = FormatEncoding(document_.Encoding());
+    statusBarParts_[0] += classic_notepad::FormatNumberWithSeparators(
+        static_cast<std::size_t>(std::max(1, column)));
+    statusBarParts_[1] = classic_notepad::FormatCharacterCount(GetStatusCharacterCount());
+    statusBarParts_[2] = classic_notepad::FormatLineEnding(document_.LineEnding());
+    statusBarParts_[3] = classic_notepad::FormatEncoding(document_.Encoding());
 
     UpdateStatusBarPartLayout();
 
@@ -3698,7 +3624,7 @@ void ClassicNotepadApp::UpdateStatusBarPartLayout()
 
 void ClassicNotepadApp::SetStatusCharacterCountFromText(const std::wstring& text)
 {
-    statusCharacterCount_ = CountStatusCharacters(text);
+    statusCharacterCount_ = classic_notepad::CountStatusCharacters(text);
     statusCharacterTextLength_ = static_cast<int>(std::min<std::size_t>(
         text.size(),
         static_cast<std::size_t>(std::numeric_limits<int>::max())));
@@ -3723,7 +3649,7 @@ std::size_t ClassicNotepadApp::GetStatusCharacterCount()
     if (textLength > kExactStatusCharacterCountLimit) {
         statusCharacterCount_ = static_cast<std::size_t>(textLength);
     } else {
-        statusCharacterCount_ = CountStatusCharacters(GetEditorText());
+        statusCharacterCount_ = classic_notepad::CountStatusCharacters(GetEditorText());
     }
 
     statusCharacterCountDirty_ = false;
