@@ -9,6 +9,10 @@ class SpellCapabilityTests(unittest.TestCase):
         with ClassicNotepadDriver(automation_binary(), automation_platform()) as app:
             capabilities = app.command("getCapabilities")["capabilities"]
             available = capabilities["spellCheck"]
+            self.assertIn(
+                capabilities.get("spellCapability", "Available" if available else "DisabledByBuild"),
+                {"Available", "MissingBackend", "MissingDictionary", "DisabledByBuild"},
+            )
 
             response = app.command("checkSpelling", text="teh")
             self.assertEqual(response["available"], available)
@@ -33,6 +37,21 @@ class SpellCapabilityTests(unittest.TestCase):
                 self.assertEqual(response["errors"], [])
                 app.command("setText", text="editor remains usable")
                 self.assertEqual(app.command("getText")["text"], "editor remains usable")
+
+    def test_british_english_examples_when_available(self):
+        with ClassicNotepadDriver(automation_binary(), automation_platform()) as app:
+            if not app.command("getCapabilities")["capabilities"]["spellCheck"]:
+                self.skipTest("Spell checking is unavailable on this platform/configuration.")
+
+            response = app.command("checkSpelling", text="teh colour centre recieve")
+            error_words = {error["text"].lower() for error in response["errors"]}
+            self.assertIn("teh", error_words)
+            self.assertIn("recieve", error_words)
+            self.assertNotIn("colour", error_words)
+            self.assertNotIn("centre", error_words)
+
+            us_variant_response = app.command("checkSpelling", text="color center")
+            self.assertIsInstance(us_variant_response["errors"], list)
 
 
 if __name__ == "__main__":

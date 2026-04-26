@@ -40,12 +40,12 @@ Completed so far:
   - Page Setup and Print menu actions backed by GTK print/page setup APIs
   - Help > About Classic Notepad
   - automation `pageSetup` and `printToTestSink` commands for deterministic print validation
-  - spell-check automation capability reporting, with Linux v1 gracefully unavailable
+  - spell-check automation capability reporting, with optional GTK/libspelling support when available
   - shared JSON-lines automation coverage through phase 10
 
-Accepted v1 platform differences in `ClassicNotepadGtk`:
+Accepted v1 platform differences in `ClassicNotepadGtk` before the spelling parity follow-up:
 
-- No native Linux spell-check provider is enabled in v1. The app reports `spellCheck == false` and spelling commands return graceful unavailable results.
+- Linux spell checking was initially unavailable in v1. The follow-up spelling phase enables optional `libspelling` support while preserving graceful unavailable results when the backend or dictionary is missing.
 - Linux dark mode is out of cross-platform v1 scope. The app reports `darkMode == false`.
 
 ## Definition Of Done
@@ -144,10 +144,11 @@ The Linux binary is feature-compatible when:
 ### Spell Checking
 
 - Windows currently supports `en-GB` through the Windows Spell Checking API.
-- Linux v1 may expose spell checking as unavailable unless a native-friendly strategy is chosen.
+- Linux supports optional GTK/libspelling spell checking when `libspelling-1` and `hunspell-en-gb` are present.
 - Tests should treat spell checking as a capability:
   - `spellCheck == true` on configured Windows machines with `en-GB`.
-  - `spellCheck == false` is acceptable on Linux v1 if documented and graceful.
+  - `spellCheck == true` on configured Linux builds with `libspelling-1` and `hunspell-en-gb`.
+  - `spellCheck == false` remains acceptable when the Linux backend or dictionary is missing, as long as it is documented and graceful.
 
 ## Automation Strategy
 
@@ -611,7 +612,7 @@ Verification results:
 
 Accepted capability differences:
 
-- Linux spell checking remains unavailable in v1 (`spellCheck: false`).
+- Linux spell checking is optional after the spelling follow-up (`spellCheck: true` when `libspelling-1` and `hunspell-en-gb` are present; graceful unavailable otherwise).
 - Linux dark mode remains unavailable in v1 (`darkMode: false`).
 
 ## Suggested Commands For Future Context

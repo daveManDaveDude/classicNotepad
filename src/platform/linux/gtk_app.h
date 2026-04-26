@@ -1,11 +1,23 @@
 #pragma once
 
 #include "document.h"
+#include "spelling.h"
 
 #include <gtk/gtk.h>
 
 #include <cstddef>
+#include <vector>
 #include <string>
+
+#ifndef CLASSIC_NOTEPAD_HAS_LIBSPELLING
+#define CLASSIC_NOTEPAD_HAS_LIBSPELLING 0
+#endif
+
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+#include "gtk_spelling.h"
+
+#include <memory>
+#endif
 
 namespace classic_notepad::linux_ui {
 
@@ -34,6 +46,13 @@ public:
         int top = 750;
         int right = 750;
         int bottom = 750;
+    };
+
+    struct AutomationSpellingIssue {
+        std::size_t start = 0;
+        std::size_t length = 0;
+        std::wstring replacement;
+        std::wstring action;
     };
 
     explicit GtkNotepadApp(std::wstring initialPath);
@@ -120,7 +139,13 @@ public:
     bool SetPageMargins(const AutomationPageMargins& margins, std::wstring& errorMessage);
     AutomationPageMargins GetPageMargins() const;
     bool PrintToTestSink(const std::wstring& path, std::wstring& errorMessage) const;
+    classic_notepad::SpellCapability SpellCheckCapability() const;
+    std::wstring SpellCheckLanguage() const;
     bool SpellCheckAvailable() const;
+    std::vector<AutomationSpellingIssue> CheckSpelling(const std::wstring& text) const;
+    std::vector<std::wstring> SuggestSpelling(const std::wstring& word, std::size_t limit) const;
+    bool IgnoreSpelling(const std::wstring& word, std::wstring& errorMessage);
+    bool AddSpelling(const std::wstring& word, bool dryRun, std::wstring& errorMessage);
 
     void OnBufferChanged();
     void OnCursorMoved();
@@ -165,6 +190,10 @@ private:
     GtkCssProvider* fontProvider_ = nullptr;
     GtkPageSetup* pageSetup_ = nullptr;
     GtkPrintSettings* printSettings_ = nullptr;
+
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    std::unique_ptr<GtkSpellingService> spelling_;
+#endif
 
     bool suppressChange_ = false;
     bool automationMode_ = false;

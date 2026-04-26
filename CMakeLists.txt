@@ -38,6 +38,8 @@ set(CLASSIC_NOTEPAD_SHARED_CORE_SOURCES
     src/file_io.h
     src/line_endings.cpp
     src/line_endings.h
+    src/spelling.cpp
+    src/spelling.h
     src/spell_text_utils.cpp
     src/spell_text_utils.h
     src/text_metadata.cpp
@@ -144,14 +146,17 @@ if(WIN32)
     )
 endif()
 
+enable_testing()
+
 if(UNIX AND NOT APPLE)
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
         pkg_check_modules(GTK4 QUIET IMPORTED_TARGET gtk4)
+        pkg_check_modules(SPELLING QUIET IMPORTED_TARGET libspelling-1)
     endif()
 
     if(GTK4_FOUND)
-        add_executable(ClassicNotepadGtk
+        set(CLASSIC_NOTEPAD_GTK_SOURCES
             src/platform/linux/gtk_actions.cpp
             src/platform/linux/gtk_actions.h
             src/platform/linux/gtk_app.cpp
@@ -161,6 +166,17 @@ if(UNIX AND NOT APPLE)
             src/platform/linux/gtk_dialogs.cpp
             src/platform/linux/gtk_dialogs.h
             src/platform/linux/gtk_main.cpp
+        )
+
+        if(SPELLING_FOUND)
+            list(APPEND CLASSIC_NOTEPAD_GTK_SOURCES
+                src/platform/linux/gtk_spelling.cpp
+                src/platform/linux/gtk_spelling.h
+            )
+        endif()
+
+        add_executable(ClassicNotepadGtk
+            ${CLASSIC_NOTEPAD_GTK_SOURCES}
         )
 
         target_compile_features(ClassicNotepadGtk PRIVATE cxx_std_17)
@@ -177,12 +193,67 @@ if(UNIX AND NOT APPLE)
             ClassicNotepadCore
             PkgConfig::GTK4
         )
+
+        if(SPELLING_FOUND)
+            target_compile_definitions(ClassicNotepadGtk PRIVATE
+                CLASSIC_NOTEPAD_HAS_LIBSPELLING=1
+            )
+            target_link_libraries(ClassicNotepadGtk PRIVATE
+                PkgConfig::SPELLING
+            )
+        else()
+            target_compile_definitions(ClassicNotepadGtk PRIVATE
+                CLASSIC_NOTEPAD_HAS_LIBSPELLING=0
+            )
+            message(STATUS "libspelling-1 development package not found; building ClassicNotepadGtk without Linux spell checking.")
+        endif()
     else()
         message(STATUS "GTK4 development package not found; skipping ClassicNotepadGtk target.")
     endif()
+
+    if(SPELLING_FOUND)
+        add_executable(LinuxSpellingProbe
+            tests/linux_spelling_probe.cpp
+        )
+
+        target_compile_features(LinuxSpellingProbe PRIVATE cxx_std_17)
+
+        target_link_libraries(LinuxSpellingProbe PRIVATE
+            PkgConfig::SPELLING
+        )
+
+        add_test(NAME LinuxSpellingProbe COMMAND $<TARGET_FILE:LinuxSpellingProbe>)
+    endif()
 endif()
 
-enable_testing()
+if(APPLE)
+    enable_language(OBJCXX)
+
+    add_library(ClassicNotepadMacSpelling STATIC
+        src/platform/macos/mac_spelling.h
+        src/platform/macos/mac_spelling.mm
+    )
+
+    target_compile_features(ClassicNotepadMacSpelling PUBLIC cxx_std_17)
+
+    target_include_directories(ClassicNotepadMacSpelling PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+
+    target_link_libraries(ClassicNotepadMacSpelling PUBLIC
+        "-framework AppKit"
+    )
+
+    add_executable(MacSpellingCompileTests
+        tests/macos_spelling_compile.mm
+    )
+
+    target_link_libraries(MacSpellingCompileTests PRIVATE
+        ClassicNotepadMacSpelling
+    )
+
+    add_test(NAME MacSpellingCompileTests COMMAND $<TARGET_FILE:MacSpellingCompileTests>)
+endif()
 
 add_executable(TextConversionTests
     tests/text_conversion_tests.cpp

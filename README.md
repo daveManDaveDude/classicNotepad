@@ -50,7 +50,7 @@ The Linux target builds as `ClassicNotepadGtk` on Ubuntu/WSL with GTK4. It now c
 
 Accepted Linux v1 capability differences:
 
-- Spell checking is not backed by a native Linux provider yet. `getCapabilities` reports `spellCheck: false`, and spelling automation commands return graceful unavailable results.
+- Spell checking is optional on Linux. With `libspelling-1-dev` and `hunspell-en-gb`, `getCapabilities` reports `spellCheck: true`; without them, spelling commands return graceful unavailable results.
 - Dark mode is out of the cross-platform v1 scope. `getCapabilities` reports `darkMode: false`.
 
 ## Text File Behavior
@@ -71,11 +71,11 @@ Accepted Linux v1 capability differences:
 
 ## Spell Checking
 
-Classic Notepad uses the Windows Spell Checking API, not a bundled dictionary. On startup it tries to create an `en-GB` spell checker.
+Classic Notepad uses platform spell-checking services, not bundled dictionaries. Windows uses the Windows Spell Checking API and tries to create an `en-GB` spell checker on startup. Linux/GTK uses `libspelling` with the system Hunspell/Enchant British English dictionary when `libspelling-1-dev` and `hunspell-en-gb` are installed.
 
 If British English spell checking is installed, misspelled words in the visible editor area are underlined and right-clicking a marked word opens spelling suggestions.
 
-If British English spell checking is not installed, the app shows one informational message and keeps the editor fully usable without spell checking.
+If British English spell checking is not installed, the app keeps the editor fully usable without spell checking.
 
 To install the language support on Windows 10 or Windows 11:
 
@@ -164,6 +164,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-ubuntu.ps1 -
 
 The Ubuntu build verifies the cross-platform shared core, console tests, and native GTK app target. Linux setup instructions live in [docs/LINUX_BUILD_ENVIRONMENT.md](docs/LINUX_BUILD_ENVIRONMENT.md).
 
+When `libspelling-1-dev` and `hunspell-en-gb` are installed, the GTK target enables British English spelling through `libspelling`. If those packages are missing, the app still builds and runs with spelling reported as unavailable.
+
 Run the Ubuntu GTK app from an Ubuntu shell:
 
 ```bash
@@ -251,7 +253,14 @@ build\Debug\ClassicNotepad.exe
 
 ### Spell checking is unavailable
 
-Install **English (United Kingdom)** language support in Windows Settings, including typing or proofing features, then restart Classic Notepad.
+On Windows, install **English (United Kingdom)** language support in Windows Settings, including typing or proofing features, then restart Classic Notepad.
+
+On Ubuntu/WSL, install the documented spelling packages:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libspelling-1-dev hunspell-en-gb
+```
 
 ## Project Layout
 
@@ -277,6 +286,7 @@ src/
       gtk_automation.cpp, .h     Linux JSON-lines automation controller
       gtk_dialogs.cpp, .h        GTK file, find, replace, go-to, font, error, and About dialogs
       gtk_main.cpp               GTK entry point
+      gtk_spelling.cpp, .h       Optional GTK/libspelling British English spell service
 
 assets/
   icons/                     Application icon resources
@@ -287,6 +297,7 @@ docs/
 
 tests/
   text_conversion_tests.cpp   Console tests for text/document/spell utility behavior
+  linux_spelling_probe.cpp    Ubuntu-only libspelling/dictionary probe when available
   automation/                 Shared Windows/Linux semantic automation suite
 
 scripts/

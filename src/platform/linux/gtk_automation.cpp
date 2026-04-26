@@ -529,8 +529,66 @@ std::string BuildStringArray(const std::vector<std::wstring>& values)
     return output.str();
 }
 
-std::string BuildCapabilitiesObject()
+std::size_t WideIndexFromUtf16Offset(const std::wstring& text, std::size_t utf16Offset)
 {
+    std::size_t wideIndex = 0;
+    std::size_t currentUtf16Offset = 0;
+    while (wideIndex < text.size() && currentUtf16Offset < utf16Offset) {
+        std::size_t codeUnitLength = 1U;
+        if constexpr (sizeof(wchar_t) != 2U) {
+            const auto codePoint = static_cast<std::uint32_t>(text[wideIndex]);
+            codeUnitLength = codePoint > 0xFFFFU ? 2U : 1U;
+        }
+
+        if (currentUtf16Offset + codeUnitLength > utf16Offset) {
+            break;
+        }
+
+        currentUtf16Offset += codeUnitLength;
+        ++wideIndex;
+    }
+
+    return wideIndex;
+}
+
+std::string BuildSpellingErrorsArray(
+    const std::vector<GtkNotepadApp::AutomationSpellingIssue>& errors,
+    const std::wstring& text)
+{
+    std::ostringstream output;
+    output << "[";
+    for (std::size_t index = 0; index < errors.size(); ++index) {
+        const GtkNotepadApp::AutomationSpellingIssue& error = errors[index];
+        if (index > 0U) {
+            output << ",";
+        }
+
+        const std::size_t start = WideIndexFromUtf16Offset(text, error.start);
+        const std::size_t end = WideIndexFromUtf16Offset(text, error.start + error.length);
+        const std::wstring misspelling = start <= text.size() && end <= text.size() && end >= start
+            ? text.substr(start, end - start)
+            : std::wstring();
+
+        output << "{"
+               << "\"start\":" << error.start
+               << ",\"length\":" << error.length
+               << ",\"text\":" << EscapeJsonString(misspelling)
+               << ",\"replacement\":" << EscapeJsonString(error.replacement)
+               << ",\"action\":" << EscapeJsonString(error.action)
+               << "}";
+    }
+    output << "]";
+    return output.str();
+}
+
+std::wstring SpellCapabilityName(classic_notepad::SpellCapability capability)
+{
+    return classic_notepad::SpellCapabilityLabel(capability);
+}
+
+std::string BuildCapabilitiesObject(const GtkNotepadApp& app)
+{
+    const classic_notepad::SpellCapability capability = app.SpellCheckCapability();
     std::ostringstream output;
     output << "{"
            << "\"platform\":\"linux\""
@@ -538,7 +596,9 @@ std::string BuildCapabilitiesObject()
            << ",\"printing\":true"
            << ",\"pageSetup\":true"
            << ",\"fontChooser\":true"
-           << ",\"spellCheck\":false"
+           << ",\"spellCheck\":" << (app.SpellCheckAvailable() ? "true" : "false")
+           << ",\"spellCapability\":" << EscapeJsonString(SpellCapabilityName(capability))
+           << ",\"spellLanguage\":" << EscapeJsonString(app.SpellCheckLanguage())
            << ",\"darkMode\":false"
            << "}";
     return output.str();
@@ -579,7 +639,7 @@ std::string HandleCommand(GtkNotepadApp& app, std::wstring& testClipboard, const
 
     if (name == L"getCapabilities") {
         ResponseWriter response(id, true);
-        response.AddRaw("capabilities", BuildCapabilitiesObject());
+        response.AddRaw("capabilities", BuildCapabilitiesObject(app));
         return response.Finish();
     }
 
@@ -887,9 +947,14 @@ std::string HandleCommand(GtkNotepadApp& app, std::wstring& testClipboard, const
     }
 
     if (name == L"checkSpelling") {
+        const std::wstring text = GetString(request, "text").value_or(app.GetText());
         ResponseWriter response(id, true);
         response.AddBool("available", app.SpellCheckAvailable());
-        response.AddRaw("errors", "[]");
+        response.AddRaw(
+            "errors",
+            app.SpellCheckAvailable()
+                ? BuildSpellingErrorsArray(app.CheckSpelling(text), text)
+                : std::string("[]"));
         return response.Finish();
     }
 
@@ -899,25 +964,51 @@ std::string HandleCommand(GtkNotepadApp& app, std::wstring& testClipboard, const
             return BuildErrorResponse(id, errorMessage);
         }
 
-        (void)word;
+        const long long requestedLimit = GetNumber(request, "limit").value_or(5);
+        const std::size_t limit = requestedLimit <= 0
+            ? 0U
+            : static_cast<std::size_t>(std::min<long long>(requestedLimit, 20));
         ResponseWriter response(id, true);
         response.AddBool("available", app.SpellCheckAvailable());
-        response.AddRaw("suggestions", BuildStringArray(std::vector<std::wstring>{}));
+        response.AddRaw(
+            "suggestions",
+            app.SpellCheckAvailable()
+                ? BuildStringArray(app.SuggestSpelling(word, limit))
+                : std::string("[]"));
         return response.Finish();
     }
 
-    if (name == L"ignoreSpelling" || name == L"addSpelling") {
+    if (name == L"ignoreSpelling") {
         std::wstring word;
         if (!RequireString(request, "word", word, errorMessage)) {
             return BuildErrorResponse(id, errorMessage);
         }
 
-        (void)word;
-        ResponseWriter response(id, true);
-        response.AddBool("available", app.SpellCheckAvailable());
-        if (name == L"addSpelling") {
-            response.AddBool("persisted", false);
+        const bool available = app.SpellCheckAvailable();
+        if (available && !app.IgnoreSpelling(word, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
         }
+
+        ResponseWriter response(id, true);
+        response.AddBool("available", available);
+        return response.Finish();
+    }
+
+    if (name == L"addSpelling") {
+        std::wstring word;
+        if (!RequireString(request, "word", word, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        const bool dryRun = GetBool(request, "dryRun", true);
+        const bool available = app.SpellCheckAvailable();
+        if (available && !app.AddSpelling(word, dryRun, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        ResponseWriter response(id, true);
+        response.AddBool("available", available);
+        response.AddBool("persisted", available && !dryRun);
         return response.Finish();
     }
 

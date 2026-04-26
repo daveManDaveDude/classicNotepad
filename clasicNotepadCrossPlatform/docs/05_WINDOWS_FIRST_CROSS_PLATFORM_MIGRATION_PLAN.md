@@ -126,8 +126,8 @@ Ubuntu/WSL checkpoint:
 - Current Ubuntu target coverage: `ClassicNotepadCore`, `TextConversionTests`, and feature-parity `ClassicNotepadGtk`.
 - Expected Ubuntu CTest target: `TextConversionTests`.
 - The Windows GUI target is intentionally not built on Ubuntu.
-- The GTK target currently provides native File/Edit/Format/View/Help menus, file workflow, edit commands, find/replace/go-to, word wrap, font metadata, status bar, About dialog, page setup, print, and automation coverage.
-- Linux v1 does not enable a native spell-check provider. The GTK target reports `spellCheck: false` and spelling commands return graceful unavailable responses.
+- The GTK target currently provides native File/Edit/Format/View/Help menus, file workflow, edit commands, find/replace/go-to, word wrap, font metadata, status bar, About dialog, page setup, print, optional GTK/libspelling spell checking, and automation coverage.
+- Linux spell checking is enabled when `libspelling-1` and the GB Hunspell dictionary are present. Missing backend or dictionary states report graceful unavailable responses.
 
 Detailed Linux setup instructions are maintained in `../../docs/LINUX_BUILD_ENVIRONMENT.md`.
 

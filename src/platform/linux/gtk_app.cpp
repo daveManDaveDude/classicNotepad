@@ -1449,8 +1449,83 @@ bool GtkNotepadApp::PrintToTestSink(const std::wstring& path, std::wstring& erro
     return WriteUtf8TextFile(path, sinkText, errorMessage);
 }
 
+classic_notepad::SpellCapability GtkNotepadApp::SpellCheckCapability() const
+{
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    return spelling_ == nullptr ? classic_notepad::SpellCapability::MissingBackend : spelling_->Capability();
+#else
+    return classic_notepad::SpellCapability::DisabledByBuild;
+#endif
+}
+
+std::wstring GtkNotepadApp::SpellCheckLanguage() const
+{
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    return spelling_ == nullptr ? std::wstring() : WideFromUtf8(spelling_->LanguageCode());
+#else
+    return {};
+#endif
+}
+
 bool GtkNotepadApp::SpellCheckAvailable() const
 {
+    return SpellCheckCapability() == classic_notepad::SpellCapability::Available;
+}
+
+std::vector<GtkNotepadApp::AutomationSpellingIssue> GtkNotepadApp::CheckSpelling(const std::wstring& text) const
+{
+    std::vector<AutomationSpellingIssue> issues;
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (spelling_ == nullptr || !SpellCheckAvailable()) {
+        return issues;
+    }
+
+    for (const classic_notepad::SpellIssue& issue : spelling_->CheckText(text)) {
+        issues.push_back({ issue.startUtf16, issue.lengthUtf16, {}, L"spell" });
+    }
+#else
+    (void)text;
+#endif
+    return issues;
+}
+
+std::vector<std::wstring> GtkNotepadApp::SuggestSpelling(const std::wstring& word, std::size_t limit) const
+{
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (spelling_ != nullptr && SpellCheckAvailable()) {
+        return spelling_->Suggest(word, limit);
+    }
+#else
+    (void)word;
+    (void)limit;
+#endif
+    return {};
+}
+
+bool GtkNotepadApp::IgnoreSpelling(const std::wstring& word, std::wstring& errorMessage)
+{
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (spelling_ != nullptr && spelling_->IgnoreOnce(word)) {
+        return true;
+    }
+#else
+    (void)word;
+#endif
+    errorMessage = L"Spell checking is unavailable.";
+    return false;
+}
+
+bool GtkNotepadApp::AddSpelling(const std::wstring& word, bool dryRun, std::wstring& errorMessage)
+{
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (spelling_ != nullptr && spelling_->AddToDictionary(word, dryRun)) {
+        return true;
+    }
+#else
+    (void)word;
+    (void)dryRun;
+#endif
+    errorMessage = L"Spell checking is unavailable.";
     return false;
 }
 
@@ -1461,6 +1536,11 @@ void GtkNotepadApp::OnBufferChanged()
     }
 
     document_.SetModified(true);
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (spelling_ != nullptr) {
+        spelling_->InvalidateAll();
+    }
+#endif
     UpdateTitle();
     UpdateStatus();
 }
@@ -1472,6 +1552,9 @@ void GtkNotepadApp::OnCursorMoved()
 
 void GtkNotepadApp::OnWindowDestroyed()
 {
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    spelling_.reset();
+#endif
     window_ = nullptr;
     textView_ = nullptr;
     buffer_ = nullptr;
@@ -1607,6 +1690,16 @@ void GtkNotepadApp::InstallContextMenu()
     }
 
     GMenu* menu = g_menu_new();
+    GMenuModel* spellingMenuModel = nullptr;
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (spelling_ != nullptr) {
+        spellingMenuModel = spelling_->ContextMenuModel();
+    }
+#endif
+    if (spellingMenuModel != nullptr) {
+        g_menu_append_section(menu, nullptr, spellingMenuModel);
+    }
+
     GMenu* undoSection = g_menu_new();
     GMenu* clipboardSection = g_menu_new();
     GMenu* selectSection = g_menu_new();
@@ -1650,7 +1743,12 @@ void GtkNotepadApp::BuildWindow(GtkApplication* application)
     gtk_widget_set_hexpand(scrolledWindow, TRUE);
     gtk_box_append(GTK_BOX(root), scrolledWindow);
 
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    spelling_ = std::make_unique<GtkSpellingService>();
+    textView_ = spelling_->CreatePlainTextView();
+#else
     textView_ = gtk_text_view_new();
+#endif
     gtk_widget_add_css_class(textView_, "classic-notepad-editor");
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(textView_), TRUE);
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(textView_), wordWrap_ ? GTK_WRAP_WORD_CHAR : GTK_WRAP_NONE);
@@ -1661,6 +1759,11 @@ void GtkNotepadApp::BuildWindow(GtkApplication* application)
     gtk_text_buffer_set_max_undo_levels(buffer_, 100);
     g_signal_connect(buffer_, "changed", G_CALLBACK(OnBufferChangedSignal), this);
     g_signal_connect(buffer_, "notify::cursor-position", G_CALLBACK(OnCursorMovedSignal), this);
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (spelling_ != nullptr) {
+        spelling_->Attach(buffer_);
+    }
+#endif
     InstallContextMenu();
     ApplyFont();
 
@@ -1694,6 +1797,11 @@ void GtkNotepadApp::SetBufferText(const std::wstring& text, bool markModified)
     suppressChange_ = false;
 
     document_.SetModified(markModified);
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (spelling_ != nullptr) {
+        spelling_->InvalidateAll();
+    }
+#endif
 }
 
 void GtkNotepadApp::SetInitialTitleAndStatus()

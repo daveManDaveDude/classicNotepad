@@ -7,7 +7,7 @@ Current implementation status:
 - Windows remains the full native Win32 app.
 - Linux builds as the native GTK4 `ClassicNotepadGtk` target on Ubuntu/WSL.
 - The shared JSON-lines automation suite now passes against both Windows Debug and Linux Debug binaries.
-- Linux v1 deliberately reports `spellCheck: false`; spelling commands are graceful no-ops until a native-friendly provider is chosen.
+- Linux now uses optional GTK/libspelling British English spell checking when `libspelling-1-dev` and `hunspell-en-gb` are installed; missing packages or dictionaries remain graceful unavailable states.
 - Dark mode remains out of cross-platform v1 scope.
 
 Current contents:

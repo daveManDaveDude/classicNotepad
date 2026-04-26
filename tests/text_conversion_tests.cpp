@@ -1,6 +1,7 @@
 #include "document.h"
 #include "encoding.h"
 #include "line_endings.h"
+#include "spelling.h"
 #include "spell_text_utils.h"
 #include "text_metadata.h"
 
@@ -339,6 +340,7 @@ void TestDocumentNewFilePath()
 void TestSpellWordExpansion()
 {
     using classic_notepad::ExpandWordRangeAt;
+    using classic_notepad::FindSpellCheckWordRanges;
     using classic_notepad::TextRange;
 
     const std::wstring text = L"can't re-enter foo_bar end-";
@@ -351,6 +353,13 @@ void TestSpellWordExpansion()
     Expect(range.start == 6U && range.length == 8U, "Word expansion includes internal hyphen");
 
     Expect(!ExpandWordRangeAt(text, text.size() - 1U, range), "Trailing hyphen is not treated as a word");
+
+    const std::vector<TextRange> ranges = FindSpellCheckWordRanges(L"teh, colour; can't re-enter -");
+    Expect(ranges.size() == 4U, "Spell word range scan finds standalone spelling words");
+    Expect(ranges[0].start == 0U && ranges[0].length == 3U, "Spell word scan captures first word");
+    Expect(ranges[1].start == 5U && ranges[1].length == 6U, "Spell word scan skips punctuation");
+    Expect(ranges[2].start == 13U && ranges[2].length == 5U, "Spell word scan keeps apostrophes inside words");
+    Expect(ranges[3].start == 19U && ranges[3].length == 8U, "Spell word scan keeps internal hyphens");
 }
 
 void TestSpellRangeOverlap()
@@ -364,6 +373,28 @@ void TestSpellRangeOverlap()
     constexpr std::size_t nearMax = std::numeric_limits<std::size_t>::max() - 2U;
     Expect(!RangesOverlap(nearMax, 2U, 0U, 2U), "Overflow-safe overlap check handles far-apart ranges");
     Expect(RangesOverlap(nearMax, 3U, nearMax + 1U, 1U), "Overflow-safe overlap check handles near-max overlaps");
+}
+
+void TestSpellCapabilityLabels()
+{
+    using classic_notepad::SpellCapability;
+
+    ExpectText(
+        classic_notepad::SpellCapabilityLabel(SpellCapability::Available),
+        L"Available",
+        "Available spell capability label formats");
+    ExpectText(
+        classic_notepad::SpellCapabilityLabel(SpellCapability::MissingBackend),
+        L"MissingBackend",
+        "Missing backend spell capability label formats");
+    ExpectText(
+        classic_notepad::SpellCapabilityLabel(SpellCapability::MissingDictionary),
+        L"MissingDictionary",
+        "Missing dictionary spell capability label formats");
+    ExpectText(
+        classic_notepad::SpellCapabilityLabel(SpellCapability::DisabledByBuild),
+        L"DisabledByBuild",
+        "Disabled build spell capability label formats");
 }
 
 } // namespace
@@ -380,6 +411,7 @@ int main()
     TestDocumentNewFilePath();
     TestSpellWordExpansion();
     TestSpellRangeOverlap();
+    TestSpellCapabilityLabels();
 
     if (g_failureCount != 0) {
         std::cerr << g_failureCount << " test failure(s).\n";
