@@ -1,69 +1,131 @@
 #include "encoding.h"
 
-#include "win32_platform.h"
+#include "ansi_encoding.h"
 
-#include <windows.h>
-
-#include <limits>
+#include <cstdint>
 
 namespace classic_notepad {
 namespace {
 
-bool FitsInInt(std::size_t value)
+bool AppendCodePointToWide(std::uint32_t codePoint, std::wstring& text)
 {
-    return value <= static_cast<std::size_t>(std::numeric_limits<int>::max());
-}
+    if (codePoint > 0x10FFFFU || (codePoint >= 0xD800U && codePoint <= 0xDFFFU)) {
+        return false;
+    }
 
-bool DecodeMultiByte(UINT codePage, DWORD flags, const std::uint8_t* data, std::size_t size, std::wstring& text)
-{
-    text.clear();
-    if (size == 0U) {
+    if constexpr (sizeof(wchar_t) == 2U) {
+        if (codePoint <= 0xFFFFU) {
+            text.push_back(static_cast<wchar_t>(codePoint));
+            return true;
+        }
+
+        const std::uint32_t adjusted = codePoint - 0x10000U;
+        text.push_back(static_cast<wchar_t>(0xD800U + (adjusted >> 10U)));
+        text.push_back(static_cast<wchar_t>(0xDC00U + (adjusted & 0x3FFU)));
+        return true;
+    } else {
+        text.push_back(static_cast<wchar_t>(codePoint));
         return true;
     }
-
-    if (!FitsInInt(size)) {
-        return false;
-    }
-
-    const int byteCount = static_cast<int>(size);
-    const int wideLength = MultiByteToWideChar(
-        codePage,
-        flags,
-        reinterpret_cast<const char*>(data),
-        byteCount,
-        nullptr,
-        0);
-
-    if (wideLength <= 0) {
-        return false;
-    }
-
-    text.resize(static_cast<std::size_t>(wideLength));
-    const int convertedLength = MultiByteToWideChar(
-        codePage,
-        flags,
-        reinterpret_cast<const char*>(data),
-        byteCount,
-        text.data(),
-        wideLength);
-
-    return convertedLength == wideLength;
 }
 
-bool DecodeUtf16Le(const std::uint8_t* data, std::size_t size, std::wstring& text)
+bool ReadWideCodePoint(const std::wstring& text, std::size_t& index, std::uint32_t& codePoint)
 {
-    text.clear();
-    if ((size % 2U) != 0U) {
+    if (index >= text.size()) {
         return false;
     }
 
-    text.reserve(size / 2U);
-    for (std::size_t index = 0; index < size; index += 2U) {
-        const auto value = static_cast<wchar_t>(data[index] | (data[index + 1U] << 8U));
-        text.push_back(value);
+    if constexpr (sizeof(wchar_t) == 2U) {
+        const std::uint32_t first = static_cast<std::uint16_t>(text[index++]);
+        if (first >= 0xD800U && first <= 0xDBFFU) {
+            if (index >= text.size()) {
+                return false;
+            }
+
+            const std::uint32_t second = static_cast<std::uint16_t>(text[index++]);
+            if (second < 0xDC00U || second > 0xDFFFU) {
+                return false;
+            }
+
+            codePoint = 0x10000U + (((first - 0xD800U) << 10U) | (second - 0xDC00U));
+            return true;
+        }
+
+        if (first >= 0xDC00U && first <= 0xDFFFU) {
+            return false;
+        }
+
+        codePoint = first;
+        return true;
+    } else {
+        codePoint = static_cast<std::uint32_t>(text[index++]);
+        return codePoint <= 0x10FFFFU && (codePoint < 0xD800U || codePoint > 0xDFFFU);
+    }
+}
+
+bool DecodeUtf8(const std::uint8_t* data, std::size_t size, std::wstring& text)
+{
+    text.clear();
+    text.reserve(size);
+
+    for (std::size_t index = 0; index < size;) {
+        const std::uint8_t lead = data[index++];
+        std::uint32_t codePoint = 0;
+        std::uint32_t minimum = 0;
+        int continuationCount = 0;
+
+        if (lead <= 0x7FU) {
+            codePoint = lead;
+        } else if (lead >= 0xC2U && lead <= 0xDFU) {
+            codePoint = lead & 0x1FU;
+            minimum = 0x80U;
+            continuationCount = 1;
+        } else if (lead >= 0xE0U && lead <= 0xEFU) {
+            codePoint = lead & 0x0FU;
+            minimum = 0x800U;
+            continuationCount = 2;
+        } else if (lead >= 0xF0U && lead <= 0xF4U) {
+            codePoint = lead & 0x07U;
+            minimum = 0x10000U;
+            continuationCount = 3;
+        } else {
+            return false;
+        }
+
+        for (int offset = 0; offset < continuationCount; ++offset) {
+            if (index >= size || (data[index] & 0xC0U) != 0x80U) {
+                return false;
+            }
+
+            codePoint = (codePoint << 6U) | (data[index] & 0x3FU);
+            ++index;
+        }
+
+        if (codePoint < minimum || !AppendCodePointToWide(codePoint, text)) {
+            return false;
+        }
     }
 
     return true;
+}
+
+void AppendUtf8CodePoint(std::uint32_t codePoint, std::vector<std::uint8_t>& bytes)
+{
+    if (codePoint <= 0x7FU) {
+        bytes.push_back(static_cast<std::uint8_t>(codePoint));
+    } else if (codePoint <= 0x7FFU) {
+        bytes.push_back(static_cast<std::uint8_t>(0xC0U | (codePoint >> 6U)));
+        bytes.push_back(static_cast<std::uint8_t>(0x80U | (codePoint & 0x3FU)));
+    } else if (codePoint <= 0xFFFFU) {
+        bytes.push_back(static_cast<std::uint8_t>(0xE0U | (codePoint >> 12U)));
+        bytes.push_back(static_cast<std::uint8_t>(0x80U | ((codePoint >> 6U) & 0x3FU)));
+        bytes.push_back(static_cast<std::uint8_t>(0x80U | (codePoint & 0x3FU)));
+    } else {
+        bytes.push_back(static_cast<std::uint8_t>(0xF0U | (codePoint >> 18U)));
+        bytes.push_back(static_cast<std::uint8_t>(0x80U | ((codePoint >> 12U) & 0x3FU)));
+        bytes.push_back(static_cast<std::uint8_t>(0x80U | ((codePoint >> 6U) & 0x3FU)));
+        bytes.push_back(static_cast<std::uint8_t>(0x80U | (codePoint & 0x3FU)));
+    }
 }
 
 bool EncodeUtf8(const std::wstring& text, bool includeBom, std::vector<std::uint8_t>& bytes, std::wstring& errorMessage)
@@ -75,114 +137,87 @@ bool EncodeUtf8(const std::wstring& text, bool includeBom, std::vector<std::uint
         bytes.push_back(0xBFU);
     }
 
-    if (text.empty()) {
-        return true;
-    }
+    std::size_t index = 0;
+    while (index < text.size()) {
+        std::uint32_t codePoint = 0;
+        if (!ReadWideCodePoint(text, index, codePoint)) {
+            errorMessage = L"The document contains invalid Unicode text and cannot be saved as UTF-8.";
+            return false;
+        }
 
-    if (!FitsInInt(text.size())) {
-        errorMessage = L"The document is too large to encode as UTF-8.";
-        return false;
-    }
-
-    const int wideCount = static_cast<int>(text.size());
-    const int byteLength = WideCharToMultiByte(
-        CP_UTF8,
-        WC_ERR_INVALID_CHARS,
-        text.c_str(),
-        wideCount,
-        nullptr,
-        0,
-        nullptr,
-        nullptr);
-
-    if (byteLength <= 0) {
-        errorMessage = L"The document contains invalid Unicode text and cannot be saved as UTF-8.";
-        return false;
-    }
-
-    const std::size_t offset = bytes.size();
-    bytes.resize(offset + static_cast<std::size_t>(byteLength));
-
-    const int convertedLength = WideCharToMultiByte(
-        CP_UTF8,
-        WC_ERR_INVALID_CHARS,
-        text.c_str(),
-        wideCount,
-        reinterpret_cast<char*>(bytes.data() + offset),
-        byteLength,
-        nullptr,
-        nullptr);
-
-    if (convertedLength != byteLength) {
-        errorMessage = L"The document could not be encoded as UTF-8.";
-        return false;
+        AppendUtf8CodePoint(codePoint, bytes);
     }
 
     return true;
 }
 
-bool EncodeUtf16Le(const std::wstring& text, std::vector<std::uint8_t>& bytes)
+bool DecodeUtf16Le(const std::uint8_t* data, std::size_t size, std::wstring& text)
+{
+    text.clear();
+    if ((size % 2U) != 0U) {
+        return false;
+    }
+
+    text.reserve(size / 2U);
+    for (std::size_t index = 0; index < size; index += 2U) {
+        const std::uint32_t first = data[index] | (static_cast<std::uint32_t>(data[index + 1U]) << 8U);
+
+        if constexpr (sizeof(wchar_t) == 2U) {
+            text.push_back(static_cast<wchar_t>(first));
+        } else {
+            if (first >= 0xD800U && first <= 0xDBFFU) {
+                if (index + 3U >= size) {
+                    return false;
+                }
+
+                const std::uint32_t second =
+                    data[index + 2U] | (static_cast<std::uint32_t>(data[index + 3U]) << 8U);
+                if (second < 0xDC00U || second > 0xDFFFU) {
+                    return false;
+                }
+
+                const std::uint32_t codePoint =
+                    0x10000U + (((first - 0xD800U) << 10U) | (second - 0xDC00U));
+                text.push_back(static_cast<wchar_t>(codePoint));
+                index += 2U;
+            } else if (first >= 0xDC00U && first <= 0xDFFFU) {
+                return false;
+            } else {
+                text.push_back(static_cast<wchar_t>(first));
+            }
+        }
+    }
+
+    return true;
+}
+
+bool EncodeUtf16Le(const std::wstring& text, std::vector<std::uint8_t>& bytes, std::wstring& errorMessage)
 {
     bytes.clear();
     bytes.reserve((text.size() * 2U) + 2U);
     bytes.push_back(0xFFU);
     bytes.push_back(0xFEU);
 
-    for (const wchar_t character : text) {
-        const auto value = static_cast<unsigned int>(character);
-        bytes.push_back(static_cast<std::uint8_t>(value & 0xFFU));
-        bytes.push_back(static_cast<std::uint8_t>((value >> 8U) & 0xFFU));
-    }
+    std::size_t index = 0;
+    while (index < text.size()) {
+        std::uint32_t codePoint = 0;
+        if (!ReadWideCodePoint(text, index, codePoint)) {
+            errorMessage = L"The document contains invalid Unicode text and cannot be saved as UTF-16 LE.";
+            return false;
+        }
 
-    return true;
-}
-
-bool EncodeAnsi(const std::wstring& text, std::vector<std::uint8_t>& bytes, std::wstring& errorMessage)
-{
-    bytes.clear();
-    if (text.empty()) {
-        return true;
-    }
-
-    if (!FitsInInt(text.size())) {
-        errorMessage = L"The document is too large to encode as ANSI text.";
-        return false;
-    }
-
-    BOOL usedDefaultChar = FALSE;
-    const int wideCount = static_cast<int>(text.size());
-    const int byteLength = WideCharToMultiByte(
-        CP_ACP,
-        WC_NO_BEST_FIT_CHARS,
-        text.c_str(),
-        wideCount,
-        nullptr,
-        0,
-        nullptr,
-        &usedDefaultChar);
-
-    if (byteLength <= 0 || usedDefaultChar) {
-        errorMessage =
-            L"The document contains characters that cannot be saved in the system ANSI code page. "
-            L"Use Save As in a later encoding-aware build, or remove those characters before saving this ANSI file.";
-        return false;
-    }
-
-    bytes.resize(static_cast<std::size_t>(byteLength));
-    usedDefaultChar = FALSE;
-    const int convertedLength = WideCharToMultiByte(
-        CP_ACP,
-        WC_NO_BEST_FIT_CHARS,
-        text.c_str(),
-        wideCount,
-        reinterpret_cast<char*>(bytes.data()),
-        byteLength,
-        nullptr,
-        &usedDefaultChar);
-
-    if (convertedLength != byteLength || usedDefaultChar) {
-        errorMessage = L"The document contains characters that cannot be saved in the system ANSI code page.";
-        return false;
+        if (codePoint <= 0xFFFFU) {
+            bytes.push_back(static_cast<std::uint8_t>(codePoint & 0xFFU));
+            bytes.push_back(static_cast<std::uint8_t>((codePoint >> 8U) & 0xFFU));
+        } else {
+            const std::uint32_t adjusted = codePoint - 0x10000U;
+            const std::uint32_t high = 0xD800U + (adjusted >> 10U);
+            const std::uint32_t low = 0xDC00U + (adjusted & 0x3FFU);
+            bytes.push_back(static_cast<std::uint8_t>(high & 0xFFU));
+            bytes.push_back(static_cast<std::uint8_t>((high >> 8U) & 0xFFU));
+            bytes.push_back(static_cast<std::uint8_t>(low & 0xFFU));
+            bytes.push_back(static_cast<std::uint8_t>((low >> 8U) & 0xFFU));
+        }
     }
 
     return true;
@@ -200,7 +235,7 @@ bool DecodeTextBytes(
 
     if (bytes.size() >= 3U && bytes[0] == 0xEFU && bytes[1] == 0xBBU && bytes[2] == 0xBFU) {
         result.encoding = TextEncoding::Utf8Bom;
-        if (!DecodeMultiByte(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data() + 3U, bytes.size() - 3U, result.text)) {
+        if (!DecodeUtf8(bytes.data() + 3U, bytes.size() - 3U, result.text)) {
             errorMessage = L"The file has a UTF-8 BOM but could not be decoded as UTF-8.";
             return false;
         }
@@ -216,13 +251,13 @@ bool DecodeTextBytes(
         return true;
     }
 
-    if (DecodeMultiByte(CP_UTF8, MB_ERR_INVALID_CHARS, bytes.data(), bytes.size(), result.text)) {
+    if (DecodeUtf8(bytes.data(), bytes.size(), result.text)) {
         result.encoding = TextEncoding::Utf8NoBom;
         return true;
     }
 
     result.encoding = TextEncoding::Ansi;
-    if (!DecodeMultiByte(CP_ACP, 0, bytes.data(), bytes.size(), result.text)) {
+    if (!DecodeAnsiBytes(bytes.data(), bytes.size(), result.text)) {
         errorMessage = L"The file could not be decoded as text.";
         return false;
     }
@@ -244,9 +279,9 @@ bool EncodeTextBytes(
     case TextEncoding::Utf8Bom:
         return EncodeUtf8(text, true, bytes, errorMessage);
     case TextEncoding::Utf16LeBom:
-        return EncodeUtf16Le(text, bytes);
+        return EncodeUtf16Le(text, bytes, errorMessage);
     case TextEncoding::Ansi:
-        return EncodeAnsi(text, bytes, errorMessage);
+        return EncodeAnsiText(text, bytes, errorMessage);
     default:
         errorMessage = L"Unknown text encoding.";
         return false;

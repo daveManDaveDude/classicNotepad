@@ -1,8 +1,11 @@
 build/
+build-ubuntu/
+build-ubuntu-release/
 .vs/
 out/
 *.user
 *.suo
 *.VC.db
 *.VC.VC.opendb
-
+__pycache__/
+*.pyc
