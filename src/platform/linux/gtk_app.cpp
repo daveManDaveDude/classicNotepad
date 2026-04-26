@@ -1,11 +1,13 @@
 #include "gtk_app.h"
 
+#include "app_version.h"
 #include "gtk_actions.h"
 #include "gtk_automation.h"
 #include "gtk_dialogs.h"
 #include "text_metadata.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <ctime>
 #include <cwctype>
@@ -14,6 +16,8 @@
 #include <sstream>
 #include <utility>
 #include <vector>
+
+#include <pango/pangocairo.h>
 
 namespace classic_notepad::linux_ui {
 namespace {
@@ -230,6 +234,140 @@ std::wstring ReadClipboardText(GtkWidget* widget)
     return classic_notepad::NormalizeLineEndingsForEditor(state.text);
 }
 
+std::wstring TextForNativePrinting(const std::wstring& text)
+{
+    std::wstring normalized;
+    normalized.reserve(text.size());
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        if (text[index] == L'\r') {
+            if (index + 1U < text.size() && text[index + 1U] == L'\n') {
+                ++index;
+            }
+            normalized.push_back(L'\n');
+            continue;
+        }
+
+        normalized.push_back(text[index]);
+    }
+
+    return normalized;
+}
+
+std::wstring BuildPrintSinkText(
+    const wchar_t* platform,
+    const std::wstring& fontDescription,
+    const GtkNotepadApp::AutomationPageMargins& margins,
+    const std::wstring& text)
+{
+    std::wstring output;
+    output += L"Classic Notepad Print Sink\r\n";
+    output += L"Platform: ";
+    output += platform;
+    output += L"\r\n";
+    output += L"Font: ";
+    output += fontDescription;
+    output += L"\r\n";
+    output += L"Margins (thousandths inch): ";
+    output += std::to_wstring(margins.left);
+    output += L",";
+    output += std::to_wstring(margins.top);
+    output += L",";
+    output += std::to_wstring(margins.right);
+    output += L",";
+    output += std::to_wstring(margins.bottom);
+    output += L"\r\n";
+    output += L"Pages: 1\r\n";
+    output += L"--- Page 1 ---\r\n";
+    output += text;
+    if (!text.empty() && text.back() != L'\n' && text.back() != L'\r') {
+        output += L"\r\n";
+    }
+    return output;
+}
+
+bool WriteUtf8TextFile(const std::wstring& path, const std::wstring& text, std::wstring& errorMessage)
+{
+    const std::string utf8Path = Utf8FromWide(path);
+    if (utf8Path.empty()) {
+        errorMessage = L"Print sink path cannot be empty.";
+        return false;
+    }
+
+    const std::string utf8Text = Utf8FromWide(text);
+    GError* error = nullptr;
+    const gboolean saved = g_file_set_contents(
+        utf8Path.c_str(),
+        utf8Text.data(),
+        static_cast<gssize>(utf8Text.size()),
+        &error);
+    if (saved != FALSE) {
+        return true;
+    }
+
+    errorMessage = L"The print sink could not be written.";
+    if (error != nullptr) {
+        errorMessage += L"\n\n";
+        errorMessage += WideFromUtf8(error->message);
+        g_error_free(error);
+    }
+    return false;
+}
+
+PangoLayout* CreatePrintLayout(GtkPrintContext* context, const GtkNotepadApp& app)
+{
+    PangoLayout* layout = gtk_print_context_create_pango_layout(context);
+    const std::wstring printText = TextForNativePrinting(app.GetText());
+    const std::string utf8Text = Utf8FromWide(printText);
+    pango_layout_set_text(layout, utf8Text.c_str(), static_cast<int>(utf8Text.size()));
+    pango_layout_set_width(
+        layout,
+        static_cast<int>(std::max(1.0, gtk_print_context_get_width(context)) * PANGO_SCALE));
+    pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+
+    const std::string utf8Font = Utf8FromWide(app.GetFont());
+    PangoFontDescription* description = pango_font_description_from_string(
+        utf8Font.empty() ? "Monospace 11" : utf8Font.c_str());
+    if (description != nullptr) {
+        pango_layout_set_font_description(layout, description);
+        pango_font_description_free(description);
+    }
+
+    return layout;
+}
+
+void OnBeginPrint(GtkPrintOperation* operation, GtkPrintContext* context, gpointer userData)
+{
+    const auto* app = static_cast<const GtkNotepadApp*>(userData);
+    PangoLayout* layout = CreatePrintLayout(context, *app);
+
+    int layoutHeight = 0;
+    pango_layout_get_size(layout, nullptr, &layoutHeight);
+    const double height = static_cast<double>(layoutHeight) / static_cast<double>(PANGO_SCALE);
+    const double pageHeight = std::max(1.0, gtk_print_context_get_height(context));
+    const int pages = std::max(1, static_cast<int>(std::ceil(height / pageHeight)));
+    gtk_print_operation_set_n_pages(operation, pages);
+
+    g_object_unref(layout);
+}
+
+void OnDrawPrintPage(GtkPrintOperation*, GtkPrintContext* context, int pageNumber, gpointer userData)
+{
+    const auto* app = static_cast<const GtkNotepadApp*>(userData);
+    PangoLayout* layout = CreatePrintLayout(context, *app);
+    cairo_t* cairo = gtk_print_context_get_cairo_context(context);
+    const double width = gtk_print_context_get_width(context);
+    const double pageHeight = std::max(1.0, gtk_print_context_get_height(context));
+
+    cairo_save(cairo);
+    cairo_rectangle(cairo, 0, 0, width, pageHeight);
+    cairo_clip(cairo);
+    cairo_translate(cairo, 0, -static_cast<double>(pageNumber) * pageHeight);
+    pango_cairo_show_layout(cairo, layout);
+    cairo_restore(cairo);
+
+    g_object_unref(layout);
+}
+
 } // namespace
 
 std::wstring WideFromUtf8(const char* text)
@@ -287,6 +425,16 @@ GtkNotepadApp::~GtkNotepadApp()
     if (fontProvider_ != nullptr) {
         g_object_unref(fontProvider_);
         fontProvider_ = nullptr;
+    }
+
+    if (pageSetup_ != nullptr) {
+        g_object_unref(pageSetup_);
+        pageSetup_ = nullptr;
+    }
+
+    if (printSettings_ != nullptr) {
+        g_object_unref(printSettings_);
+        printSettings_ = nullptr;
     }
 
     if (application_ != nullptr) {
@@ -439,6 +587,64 @@ bool GtkNotepadApp::HandleSaveAs()
     return true;
 }
 
+void GtkNotepadApp::HandlePageSetup()
+{
+    if (automationMode_) {
+        return;
+    }
+
+    GtkPageSetup* selected = gtk_print_run_page_setup_dialog(
+        Window(),
+        EnsurePageSetup(),
+        EnsurePrintSettings());
+    if (selected == nullptr) {
+        return;
+    }
+
+    if (pageSetup_ != nullptr) {
+        g_object_unref(pageSetup_);
+    }
+    pageSetup_ = selected;
+    StorePageSetup(pageSetup_);
+}
+
+void GtkNotepadApp::HandlePrint()
+{
+    if (automationMode_) {
+        return;
+    }
+
+    GtkPrintOperation* operation = gtk_print_operation_new();
+    gtk_print_operation_set_default_page_setup(operation, EnsurePageSetup());
+    gtk_print_operation_set_print_settings(operation, EnsurePrintSettings());
+    gtk_print_operation_set_job_name(operation, "Classic Notepad");
+    g_signal_connect(operation, "begin-print", G_CALLBACK(OnBeginPrint), this);
+    g_signal_connect(operation, "draw-page", G_CALLBACK(OnDrawPrintPage), this);
+
+    GError* error = nullptr;
+    const GtkPrintOperationResult result = gtk_print_operation_run(
+        operation,
+        GTK_PRINT_OPERATION_ACTION_PRINT_DIALOG,
+        Window(),
+        &error);
+
+    if (error != nullptr) {
+        ShowError(WideFromUtf8(error->message));
+        g_error_free(error);
+    } else if (result == GTK_PRINT_OPERATION_RESULT_APPLY) {
+        GtkPrintSettings* settings = gtk_print_operation_get_print_settings(operation);
+        if (settings != nullptr) {
+            g_object_ref(settings);
+            if (printSettings_ != nullptr) {
+                g_object_unref(printSettings_);
+            }
+            printSettings_ = settings;
+        }
+    }
+
+    g_object_unref(operation);
+}
+
 void GtkNotepadApp::HandleExit()
 {
     if (!ConfirmDiscard()) {
@@ -587,6 +793,15 @@ void GtkNotepadApp::HandleChooseFont()
 void GtkNotepadApp::HandleToggleStatusBar()
 {
     SetStatusBarVisible(!statusBarVisible_);
+}
+
+void GtkNotepadApp::HandleAbout()
+{
+    if (automationMode_) {
+        return;
+    }
+
+    ShowAboutDialog(Window(), CLASSIC_NOTEPAD_VERSION_DISPLAY_W);
 }
 
 bool GtkNotepadApp::NewDocument()
@@ -1191,6 +1406,38 @@ std::wstring GtkNotepadApp::GetFont() const
     return fontDescription_;
 }
 
+bool GtkNotepadApp::SetPageMargins(const AutomationPageMargins& margins, std::wstring& errorMessage)
+{
+    if (margins.left < 0 || margins.top < 0 || margins.right < 0 || margins.bottom < 0) {
+        errorMessage = L"Page margins must be non-negative.";
+        return false;
+    }
+
+    pageMargins_ = margins;
+    GtkPageSetup* pageSetup = EnsurePageSetup();
+    gtk_page_setup_set_left_margin(pageSetup, static_cast<double>(pageMargins_.left) / 1000.0, GTK_UNIT_INCH);
+    gtk_page_setup_set_top_margin(pageSetup, static_cast<double>(pageMargins_.top) / 1000.0, GTK_UNIT_INCH);
+    gtk_page_setup_set_right_margin(pageSetup, static_cast<double>(pageMargins_.right) / 1000.0, GTK_UNIT_INCH);
+    gtk_page_setup_set_bottom_margin(pageSetup, static_cast<double>(pageMargins_.bottom) / 1000.0, GTK_UNIT_INCH);
+    return true;
+}
+
+GtkNotepadApp::AutomationPageMargins GtkNotepadApp::GetPageMargins() const
+{
+    return pageMargins_;
+}
+
+bool GtkNotepadApp::PrintToTestSink(const std::wstring& path, std::wstring& errorMessage) const
+{
+    const std::wstring sinkText = BuildPrintSinkText(L"linux", fontDescription_, pageMargins_, GetText());
+    return WriteUtf8TextFile(path, sinkText, errorMessage);
+}
+
+bool GtkNotepadApp::SpellCheckAvailable() const
+{
+    return false;
+}
+
 void GtkNotepadApp::OnBufferChanged()
 {
     if (suppressChange_) {
@@ -1260,6 +1507,40 @@ int GtkNotepadApp::MaxLine() const
     }
 
     return std::max(1, lineCount);
+}
+
+GtkPageSetup* GtkNotepadApp::EnsurePageSetup()
+{
+    if (pageSetup_ == nullptr) {
+        pageSetup_ = gtk_page_setup_new();
+    }
+
+    gtk_page_setup_set_left_margin(pageSetup_, static_cast<double>(pageMargins_.left) / 1000.0, GTK_UNIT_INCH);
+    gtk_page_setup_set_top_margin(pageSetup_, static_cast<double>(pageMargins_.top) / 1000.0, GTK_UNIT_INCH);
+    gtk_page_setup_set_right_margin(pageSetup_, static_cast<double>(pageMargins_.right) / 1000.0, GTK_UNIT_INCH);
+    gtk_page_setup_set_bottom_margin(pageSetup_, static_cast<double>(pageMargins_.bottom) / 1000.0, GTK_UNIT_INCH);
+    return pageSetup_;
+}
+
+GtkPrintSettings* GtkNotepadApp::EnsurePrintSettings()
+{
+    if (printSettings_ == nullptr) {
+        printSettings_ = gtk_print_settings_new();
+    }
+
+    return printSettings_;
+}
+
+void GtkNotepadApp::StorePageSetup(GtkPageSetup* pageSetup)
+{
+    if (pageSetup == nullptr) {
+        return;
+    }
+
+    pageMargins_.left = static_cast<int>(std::lround(gtk_page_setup_get_left_margin(pageSetup, GTK_UNIT_INCH) * 1000.0));
+    pageMargins_.top = static_cast<int>(std::lround(gtk_page_setup_get_top_margin(pageSetup, GTK_UNIT_INCH) * 1000.0));
+    pageMargins_.right = static_cast<int>(std::lround(gtk_page_setup_get_right_margin(pageSetup, GTK_UNIT_INCH) * 1000.0));
+    pageMargins_.bottom = static_cast<int>(std::lround(gtk_page_setup_get_bottom_margin(pageSetup, GTK_UNIT_INCH) * 1000.0));
 }
 
 void GtkNotepadApp::ApplyFont()

@@ -25,6 +25,16 @@ void OnSaveAs(GSimpleAction*, GVariant*, gpointer userData)
     static_cast<GtkNotepadApp*>(userData)->HandleSaveAs();
 }
 
+void OnPageSetup(GSimpleAction*, GVariant*, gpointer userData)
+{
+    static_cast<GtkNotepadApp*>(userData)->HandlePageSetup();
+}
+
+void OnPrint(GSimpleAction*, GVariant*, gpointer userData)
+{
+    static_cast<GtkNotepadApp*>(userData)->HandlePrint();
+}
+
 void OnExit(GSimpleAction*, GVariant*, gpointer userData)
 {
     static_cast<GtkNotepadApp*>(userData)->HandleExit();
@@ -100,11 +110,18 @@ void OnStatusBar(GSimpleAction*, GVariant*, gpointer userData)
     static_cast<GtkNotepadApp*>(userData)->HandleToggleStatusBar();
 }
 
+void OnAbout(GSimpleAction*, GVariant*, gpointer userData)
+{
+    static_cast<GtkNotepadApp*>(userData)->HandleAbout();
+}
+
 const GActionEntry kActions[] = {
     {"new", OnNew, nullptr, nullptr, nullptr},
     {"open", OnOpen, nullptr, nullptr, nullptr},
     {"save", OnSave, nullptr, nullptr, nullptr},
     {"save-as", OnSaveAs, nullptr, nullptr, nullptr},
+    {"page-setup", OnPageSetup, nullptr, nullptr, nullptr},
+    {"print", OnPrint, nullptr, nullptr, nullptr},
     {"exit", OnExit, nullptr, nullptr, nullptr},
     {"undo", OnUndo, nullptr, nullptr, nullptr},
     {"cut", OnCut, nullptr, nullptr, nullptr},
@@ -120,6 +137,7 @@ const GActionEntry kActions[] = {
     {"word-wrap", OnWordWrap, nullptr, nullptr, nullptr},
     {"font", OnFont, nullptr, nullptr, nullptr},
     {"status-bar", OnStatusBar, nullptr, nullptr, nullptr},
+    {"about", OnAbout, nullptr, nullptr, nullptr},
 };
 
 void SetAccels(GtkApplication* application, const char* action, const char* first, const char* second = nullptr)
@@ -142,6 +160,7 @@ void InstallAppActions(GtkNotepadApp& app)
     SetAccels(app.Application(), "win.open", "<Primary>o");
     SetAccels(app.Application(), "win.save", "<Primary>s");
     SetAccels(app.Application(), "win.save-as", "<Primary><Shift>s");
+    SetAccels(app.Application(), "win.print", "<Primary>p");
     SetAccels(app.Application(), "win.exit", "<Primary>q", "<Alt>F4");
     SetAccels(app.Application(), "win.undo", "<Primary>z");
     SetAccels(app.Application(), "win.cut", "<Primary>x");
@@ -161,6 +180,7 @@ GtkWidget* CreateMenuBar()
     GMenu* bar = g_menu_new();
     GMenu* fileMenu = g_menu_new();
     GMenu* filePrimarySection = g_menu_new();
+    GMenu* filePrintSection = g_menu_new();
     GMenu* fileExitSection = g_menu_new();
     GMenu* editMenu = g_menu_new();
     GMenu* editUndoSection = g_menu_new();
@@ -169,12 +189,17 @@ GtkWidget* CreateMenuBar()
     GMenu* editOtherSection = g_menu_new();
     GMenu* formatMenu = g_menu_new();
     GMenu* viewMenu = g_menu_new();
+    GMenu* helpMenu = g_menu_new();
 
     g_menu_append(filePrimarySection, "New", "win.new");
     g_menu_append(filePrimarySection, "Open...", "win.open");
     g_menu_append(filePrimarySection, "Save", "win.save");
     g_menu_append(filePrimarySection, "Save As...", "win.save-as");
     g_menu_append_section(fileMenu, nullptr, G_MENU_MODEL(filePrimarySection));
+
+    g_menu_append(filePrintSection, "Page Setup...", "win.page-setup");
+    g_menu_append(filePrintSection, "Print...", "win.print");
+    g_menu_append_section(fileMenu, nullptr, G_MENU_MODEL(filePrintSection));
 
     g_menu_append(fileExitSection, "Exit", "win.exit");
     g_menu_append_section(fileMenu, nullptr, G_MENU_MODEL(fileExitSection));
@@ -202,13 +227,16 @@ GtkWidget* CreateMenuBar()
     g_menu_append(formatMenu, "Font...", "win.font");
 
     g_menu_append(viewMenu, "Status Bar", "win.status-bar");
+    g_menu_append(helpMenu, "About Classic Notepad", "win.about");
 
     g_menu_append_submenu(bar, "File", G_MENU_MODEL(fileMenu));
     g_menu_append_submenu(bar, "Edit", G_MENU_MODEL(editMenu));
     g_menu_append_submenu(bar, "Format", G_MENU_MODEL(formatMenu));
     g_menu_append_submenu(bar, "View", G_MENU_MODEL(viewMenu));
+    g_menu_append_submenu(bar, "Help", G_MENU_MODEL(helpMenu));
 
     GtkWidget* menuBar = gtk_popover_menu_bar_new_from_model(G_MENU_MODEL(bar));
+    g_object_unref(helpMenu);
     g_object_unref(viewMenu);
     g_object_unref(formatMenu);
     g_object_unref(editOtherSection);
@@ -217,6 +245,7 @@ GtkWidget* CreateMenuBar()
     g_object_unref(editUndoSection);
     g_object_unref(editMenu);
     g_object_unref(fileExitSection);
+    g_object_unref(filePrintSection);
     g_object_unref(filePrimarySection);
     g_object_unref(fileMenu);
     g_object_unref(bar);

@@ -120,13 +120,16 @@ Expected CTest targets:
 Ubuntu/WSL checkpoint:
 
 - Ubuntu distro used: `Ubuntu-24.04`.
-- CMake, `pkg-config`, and GTK4 development packages installed through Ubuntu package manager.
+- CMake, Ninja, `pkg-config`, Python 3, and GTK4 development packages installed through Ubuntu package manager.
 - Build directory: `build-ubuntu/`.
-- Current Ubuntu target coverage: `ClassicNotepadCore`, `TextConversionTests`, and early `ClassicNotepadGtk`.
+- Release-style build directory: `build-ubuntu-release/`.
+- Current Ubuntu target coverage: `ClassicNotepadCore`, `TextConversionTests`, and feature-parity `ClassicNotepadGtk`.
 - Expected Ubuntu CTest target: `TextConversionTests`.
 - The Windows GUI target is intentionally not built on Ubuntu.
-- The GTK target currently provides a native window, text editor surface, status metadata, and first-argument file load.
-- Save/open menus and full Classic Notepad parity remain future Linux adapter slices.
+- The GTK target currently provides native File/Edit/Format/View/Help menus, file workflow, edit commands, find/replace/go-to, word wrap, font metadata, status bar, About dialog, page setup, print, and automation coverage.
+- Linux v1 does not enable a native spell-check provider. The GTK target reports `spellCheck: false` and spelling commands return graceful unavailable responses.
+
+Detailed Linux setup instructions are maintained in `../../docs/LINUX_BUILD_ENVIRONMENT.md`.
 
 Run the current Ubuntu GTK binary from an Ubuntu shell:
 

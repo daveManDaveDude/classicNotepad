@@ -13,6 +13,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -557,6 +558,78 @@ std::string BuildSelectionObject(const ClassicNotepadApp::AutomationSelection& s
     return output.str();
 }
 
+std::string BuildMarginsObject(const RECT& margins)
+{
+    std::ostringstream output;
+    output << "{"
+           << "\"left\":" << margins.left
+           << ",\"top\":" << margins.top
+           << ",\"right\":" << margins.right
+           << ",\"bottom\":" << margins.bottom
+           << "}";
+    return output.str();
+}
+
+const wchar_t* CorrectiveActionName(CORRECTIVE_ACTION action)
+{
+    switch (action) {
+    case CORRECTIVE_ACTION_GET_SUGGESTIONS:
+        return L"suggestions";
+    case CORRECTIVE_ACTION_REPLACE:
+        return L"replace";
+    case CORRECTIVE_ACTION_DELETE:
+        return L"delete";
+    case CORRECTIVE_ACTION_NONE:
+    default:
+        return L"none";
+    }
+}
+
+std::string BuildStringArray(const std::vector<std::wstring>& values)
+{
+    std::ostringstream output;
+    output << "[";
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index > 0U) {
+            output << ",";
+        }
+        output << EscapeJsonString(values[index]);
+    }
+    output << "]";
+    return output.str();
+}
+
+std::string BuildSpellingErrorsArray(
+    const std::vector<SpellingErrorRange>& errors,
+    const std::wstring& text)
+{
+    std::ostringstream output;
+    output << "[";
+    for (std::size_t index = 0; index < errors.size(); ++index) {
+        const SpellingErrorRange& error = errors[index];
+        if (index > 0U) {
+            output << ",";
+        }
+
+        std::wstring misspelling;
+        const std::size_t start = static_cast<std::size_t>(error.start);
+        const std::size_t length = static_cast<std::size_t>(error.length);
+        if (start <= text.size() && length <= text.size() - start) {
+            misspelling = text.substr(start, length);
+        }
+
+        output << "{"
+               << "\"start\":" << error.start
+               << ",\"length\":" << error.length
+               << ",\"text\":" << EscapeJsonString(misspelling)
+               << ",\"replacement\":" << EscapeJsonString(error.replacement)
+               << ",\"action\":" << EscapeJsonString(CorrectiveActionName(error.action))
+               << "}";
+    }
+    output << "]";
+    return output.str();
+}
+
 std::string BuildCapabilitiesObject(const ClassicNotepadApp& app)
 {
     std::ostringstream output;
@@ -581,7 +654,20 @@ DWORD ClampSelectionValue(long long value)
     return static_cast<DWORD>(std::min<long long>(value, static_cast<long long>(0x7fffffff)));
 }
 
-std::string HandleCommand(ClassicNotepadApp& app, const JsonObject& request, bool& shouldClose)
+std::wstring SelectedText(const ClassicNotepadApp& app)
+{
+    const ClassicNotepadApp::AutomationSelection selection = app.AutomationGetSelection();
+    const std::wstring text = app.AutomationGetText();
+    const std::size_t start = std::min<std::size_t>(selection.start, text.size());
+    const std::size_t end = std::min<std::size_t>(selection.end, text.size());
+    return start < end ? text.substr(start, end - start) : std::wstring();
+}
+
+std::string HandleCommand(
+    ClassicNotepadApp& app,
+    std::wstring& testClipboard,
+    const JsonObject& request,
+    bool& shouldClose)
 {
     const long long id = GetNumber(request, "id").value_or(0);
     const std::optional<std::wstring> command = GetString(request, "command");
@@ -716,17 +802,18 @@ std::string HandleCommand(ClassicNotepadApp& app, const JsonObject& request, boo
     }
 
     if (name == L"cut") {
-        app.AutomationCut();
+        testClipboard = SelectedText(app);
+        app.AutomationDeleteSelection();
         return ResponseWriter(id, true).Finish();
     }
 
     if (name == L"copy") {
-        app.AutomationCopy();
+        testClipboard = SelectedText(app);
         return ResponseWriter(id, true).Finish();
     }
 
     if (name == L"paste") {
-        app.AutomationPaste();
+        app.AutomationInsertText(testClipboard);
         return ResponseWriter(id, true).Finish();
     }
 
@@ -857,6 +944,115 @@ std::string HandleCommand(ClassicNotepadApp& app, const JsonObject& request, boo
         return response.Finish();
     }
 
+    if (name == L"pageSetup") {
+        RECT margins = app.AutomationGetPageMarginsThousandths();
+        const std::optional<long long> left = GetNumber(request, "left");
+        const std::optional<long long> top = GetNumber(request, "top");
+        const std::optional<long long> right = GetNumber(request, "right");
+        const std::optional<long long> bottom = GetNumber(request, "bottom");
+        if (left.has_value() || top.has_value() || right.has_value() || bottom.has_value()) {
+            if (!left.has_value() || !top.has_value() || !right.has_value() || !bottom.has_value()) {
+                return BuildErrorResponse(id, L"Page setup requires left, top, right, and bottom margins.");
+            }
+
+            margins.left = static_cast<LONG>(*left);
+            margins.top = static_cast<LONG>(*top);
+            margins.right = static_cast<LONG>(*right);
+            margins.bottom = static_cast<LONG>(*bottom);
+            if (!app.AutomationSetPageMarginsThousandths(margins, errorMessage)) {
+                return BuildErrorResponse(id, errorMessage);
+            }
+        }
+
+        ResponseWriter response(id, true);
+        response.AddRaw("margins", BuildMarginsObject(app.AutomationGetPageMarginsThousandths()));
+        return response.Finish();
+    }
+
+    if (name == L"printToTestSink") {
+        std::wstring path;
+        if (!RequireString(request, "path", path, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        if (!app.AutomationPrintToTestSink(path, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        ResponseWriter response(id, true);
+        response.AddString("path", path);
+        response.AddNumber("pages", 1);
+        response.AddString("font", app.AutomationGetFont());
+        response.AddRaw("margins", BuildMarginsObject(app.AutomationGetPageMarginsThousandths()));
+        return response.Finish();
+    }
+
+    if (name == L"checkSpelling") {
+        const std::wstring text = GetString(request, "text").value_or(app.AutomationGetText());
+        ResponseWriter response(id, true);
+        response.AddBool("available", app.AutomationSpellCheckAvailable());
+        response.AddRaw(
+            "errors",
+            app.AutomationSpellCheckAvailable()
+                ? BuildSpellingErrorsArray(app.AutomationCheckSpelling(text), text)
+                : std::string("[]"));
+        return response.Finish();
+    }
+
+    if (name == L"suggestSpelling") {
+        std::wstring word;
+        if (!RequireString(request, "word", word, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        const long long requestedLimit = GetNumber(request, "limit").value_or(5);
+        const std::size_t limit = requestedLimit <= 0
+            ? 0U
+            : static_cast<std::size_t>(std::min<long long>(requestedLimit, 20));
+        ResponseWriter response(id, true);
+        response.AddBool("available", app.AutomationSpellCheckAvailable());
+        response.AddRaw(
+            "suggestions",
+            app.AutomationSpellCheckAvailable()
+                ? BuildStringArray(app.AutomationSuggestSpelling(word, limit))
+                : std::string("[]"));
+        return response.Finish();
+    }
+
+    if (name == L"ignoreSpelling") {
+        std::wstring word;
+        if (!RequireString(request, "word", word, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        const bool available = app.AutomationSpellCheckAvailable();
+        if (available && !app.AutomationIgnoreSpelling(word, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        ResponseWriter response(id, true);
+        response.AddBool("available", available);
+        return response.Finish();
+    }
+
+    if (name == L"addSpelling") {
+        std::wstring word;
+        if (!RequireString(request, "word", word, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        const bool dryRun = GetBool(request, "dryRun", true);
+        const bool available = app.AutomationSpellCheckAvailable();
+        if (available && !app.AutomationAddSpelling(word, dryRun, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        ResponseWriter response(id, true);
+        response.AddBool("available", available);
+        response.AddBool("persisted", available && !dryRun);
+        return response.Finish();
+    }
+
     if (name == L"close") {
         shouldClose = true;
         return ResponseWriter(id, true).Finish();
@@ -877,6 +1073,7 @@ WindowsAutomationController::WindowsAutomationController(ClassicNotepadApp& app)
 int WindowsAutomationController::Run()
 {
     bool shouldClose = false;
+    std::wstring testClipboard;
     std::string line;
 
     while (!shouldClose && std::getline(std::cin, line)) {
@@ -888,7 +1085,7 @@ int WindowsAutomationController::Run()
         if (!parser.ParseObject(request, parseError)) {
             response = BuildErrorResponse(0, Utf8ToWide(parseError));
         } else {
-            response = HandleCommand(app_, request, shouldClose);
+            response = HandleCommand(app_, testClipboard, request, shouldClose);
         }
 
         std::cout << response << '\n';

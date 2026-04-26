@@ -2,6 +2,7 @@
 
 #include "app_version.h"
 #include "automation.h"
+#include "encoding.h"
 #include "line_endings.h"
 #include "resource.h"
 #include "spell_text_utils.h"
@@ -392,6 +393,87 @@ std::wstring ExpandTabsForPrinting(const std::wstring& line)
     }
 
     return expanded;
+}
+
+std::wstring BuildPrintSinkText(
+    const wchar_t* platform,
+    const std::wstring& fontDescription,
+    const RECT& margins,
+    const std::wstring& text)
+{
+    std::wstring output;
+    output += L"Classic Notepad Print Sink\r\n";
+    output += L"Platform: ";
+    output += platform;
+    output += L"\r\n";
+    output += L"Font: ";
+    output += fontDescription;
+    output += L"\r\n";
+    output += L"Margins (thousandths inch): ";
+    output += std::to_wstring(margins.left);
+    output += L",";
+    output += std::to_wstring(margins.top);
+    output += L",";
+    output += std::to_wstring(margins.right);
+    output += L",";
+    output += std::to_wstring(margins.bottom);
+    output += L"\r\n";
+    output += L"Pages: 1\r\n";
+    output += L"--- Page 1 ---\r\n";
+    output += text;
+    if (!text.empty() && text.back() != L'\n' && text.back() != L'\r') {
+        output += L"\r\n";
+    }
+    return output;
+}
+
+bool WriteUtf8TextFile(const std::wstring& path, const std::wstring& text, std::wstring& errorMessage)
+{
+    if (path.empty()) {
+        errorMessage = L"Print sink path cannot be empty.";
+        return false;
+    }
+
+    std::vector<std::uint8_t> bytes;
+    if (!classic_notepad::EncodeTextBytes(text, classic_notepad::TextEncoding::Utf8NoBom, bytes, errorMessage)) {
+        return false;
+    }
+
+    HANDLE file = CreateFileW(
+        path.c_str(),
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        errorMessage = L"The print sink could not be opened for writing.";
+        return false;
+    }
+
+    bool ok = true;
+    std::size_t offset = 0;
+    while (offset < bytes.size()) {
+        const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(
+            bytes.size() - offset,
+            static_cast<std::size_t>(std::numeric_limits<DWORD>::max())));
+        DWORD written = 0;
+        if (!WriteFile(file, bytes.data() + offset, chunk, &written, nullptr) || written != chunk) {
+            errorMessage = L"The print sink could not be written.";
+            ok = false;
+            break;
+        }
+
+        offset += written;
+    }
+
+    if (!CloseHandle(file) && ok) {
+        errorMessage = L"The print sink could not be closed.";
+        ok = false;
+    }
+
+    return ok;
 }
 
 void ExpandTabsForMeasurementRange(
@@ -5143,9 +5225,74 @@ std::wstring ClassicNotepadApp::AutomationGetFont() const
     return description;
 }
 
+bool ClassicNotepadApp::AutomationSetPageMarginsThousandths(const RECT& margins, std::wstring& errorMessage)
+{
+    if (margins.left < 0 || margins.top < 0 || margins.right < 0 || margins.bottom < 0) {
+        errorMessage = L"Page margins must be non-negative.";
+        return false;
+    }
+
+    pageMarginsThousandths_ = margins;
+    return true;
+}
+
+RECT ClassicNotepadApp::AutomationGetPageMarginsThousandths() const
+{
+    return pageMarginsThousandths_;
+}
+
+bool ClassicNotepadApp::AutomationPrintToTestSink(const std::wstring& path, std::wstring& errorMessage) const
+{
+    const std::wstring sinkText = BuildPrintSinkText(
+        L"windows",
+        AutomationGetFont(),
+        pageMarginsThousandths_,
+        GetEditorText());
+    return WriteUtf8TextFile(path, sinkText, errorMessage);
+}
+
 bool ClassicNotepadApp::AutomationSpellCheckAvailable() const
 {
     return spellCheckAvailable_;
+}
+
+std::vector<SpellingErrorRange> ClassicNotepadApp::AutomationCheckSpelling(const std::wstring& text) const
+{
+    return spellChecker_.Check(text);
+}
+
+std::vector<std::wstring> ClassicNotepadApp::AutomationSuggestSpelling(
+    const std::wstring& word,
+    std::size_t limit) const
+{
+    return spellChecker_.Suggest(word, limit);
+}
+
+bool ClassicNotepadApp::AutomationIgnoreSpelling(const std::wstring& word, std::wstring& errorMessage)
+{
+    if (!spellCheckAvailable_) {
+        errorMessage = L"Spell checking is unavailable.";
+        return false;
+    }
+
+    spellChecker_.Ignore(word);
+    return true;
+}
+
+bool ClassicNotepadApp::AutomationAddSpelling(
+    const std::wstring& word,
+    bool dryRun,
+    std::wstring& errorMessage)
+{
+    if (!spellCheckAvailable_) {
+        errorMessage = L"Spell checking is unavailable.";
+        return false;
+    }
+
+    if (!dryRun) {
+        spellChecker_.Add(word);
+    }
+    return true;
 }
 
 bool ClassicNotepadApp::AutomationDarkModeEnabled() const

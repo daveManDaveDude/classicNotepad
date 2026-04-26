@@ -2,7 +2,7 @@
 
 Date: 2026-04-26
 
-Status: next-phase handoff plan after initial cross-platform branch work.
+Status: Phase 10 parity gate completed for Debug builds; Release sanity builds pass on Windows and Ubuntu.
 
 ## Goal
 
@@ -37,12 +37,16 @@ Completed so far:
   - editor context menu entries for common editing commands
   - Find/Find Next/Replace/Replace All/Go To support
   - word-wrap, font metadata, and status-bar visibility controls
-  - shared JSON-lines automation coverage through phase 7
+  - Page Setup and Print menu actions backed by GTK print/page setup APIs
+  - Help > About Classic Notepad
+  - automation `pageSetup` and `printToTestSink` commands for deterministic print validation
+  - spell-check automation capability reporting, with Linux v1 gracefully unavailable
+  - shared JSON-lines automation coverage through phase 10
 
-Major gaps in `ClassicNotepadGtk`:
+Accepted v1 platform differences in `ClassicNotepadGtk`:
 
-- No page setup or print.
-- No Linux spell-check strategy.
+- No native Linux spell-check provider is enabled in v1. The app reports `spellCheck == false` and spelling commands return graceful unavailable results.
+- Linux dark mode is out of cross-platform v1 scope. The app reports `darkMode == false`.
 
 ## Definition Of Done
 
@@ -125,6 +129,11 @@ The Linux binary is feature-compatible when:
 - Status bar character count.
 - Status bar encoding and line-ending metadata.
 
+### Help
+
+- Help menu.
+- About Classic Notepad dialog.
+
 ### Print
 
 - Page Setup.
@@ -137,8 +146,8 @@ The Linux binary is feature-compatible when:
 - Windows currently supports `en-GB` through the Windows Spell Checking API.
 - Linux v1 may expose spell checking as unavailable unless a native-friendly strategy is chosen.
 - Tests should treat spell checking as a capability:
-  - `spellCheck.available == true` on configured Windows machines with `en-GB`.
-  - `spellCheck.available == false` is acceptable on Linux v1 if documented and graceful.
+  - `spellCheck == true` on configured Windows machines with `en-GB`.
+  - `spellCheck == false` is acceptable on Linux v1 if documented and graceful.
 
 ## Automation Strategy
 
@@ -258,8 +267,8 @@ Linux v1 may report:
 {
   "platform": "linux",
   "nativeUi": "gtk4",
-  "printing": false,
-  "pageSetup": false,
+  "printing": true,
+  "pageSetup": true,
   "fontChooser": true,
   "spellCheck": false,
   "darkMode": false
@@ -572,21 +581,38 @@ Acceptance:
 
 Tasks:
 
-1. Run Windows Debug build.
-2. Run Windows CTest.
-3. Run Windows automation suite.
-4. Run Ubuntu build.
-5. Run Ubuntu CTest.
-6. Run Ubuntu automation suite.
-7. Run Windows Release build/test.
-8. Run Ubuntu Release-style build if added.
-9. Update README and known-gaps docs.
+1. Run Windows Debug build. Completed 2026-04-26.
+2. Run Windows CTest. Completed 2026-04-26.
+3. Run Windows automation suite. Completed 2026-04-26.
+4. Run Ubuntu build. Completed 2026-04-26.
+5. Run Ubuntu CTest. Completed 2026-04-26.
+6. Run Ubuntu automation suite. Completed 2026-04-26.
+7. Run Windows Release build/test. Completed 2026-04-26 with `-SkipVersionIncrement`.
+8. Run Ubuntu Release-style build. Completed 2026-04-26 with `-Configuration Release` and `build-ubuntu-release/`.
+9. Update README, Linux setup, and known-gaps docs. Completed 2026-04-26.
 
 Acceptance:
 
 - Same automation suite passes against both binaries.
 - No unapproved skips remain.
 - Known accepted gaps are documented as platform capabilities.
+
+Verification results:
+
+- Windows Debug build: passed.
+- Windows Debug CTest: `TextConversionTests` and `TextConversionPortableSmokeTests` passed.
+- Windows Debug automation: 20 tests passed.
+- Ubuntu Debug build: passed.
+- Ubuntu Debug CTest: `TextConversionTests` passed.
+- Ubuntu Debug automation: 20 tests passed.
+- Windows Release build with `-SkipVersionIncrement`: passed.
+- Windows Release CTest: `TextConversionTests` and `TextConversionPortableSmokeTests` passed.
+- Ubuntu Release-style build and CTest: passed.
+
+Accepted capability differences:
+
+- Linux spell checking remains unavailable in v1 (`spellCheck: false`).
+- Linux dark mode remains unavailable in v1 (`darkMode: false`).
 
 ## Suggested Commands For Future Context
 
@@ -601,6 +627,7 @@ Ubuntu:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-ubuntu.ps1 -Distro Ubuntu-24.04
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-ubuntu.ps1 -Distro Ubuntu-24.04 -BuildDir build-ubuntu-release -Configuration Release
 ```
 
 Run current GTK binary manually:
@@ -621,11 +648,13 @@ python tests\automation\run_automation_tests.py --binary build\Debug\ClassicNote
 python3 tests/automation/run_automation_tests.py --binary build-ubuntu/ClassicNotepadGtk --platform linux
 ```
 
+Linux build environment setup is documented in `../../docs/LINUX_BUILD_ENVIRONMENT.md`.
+
 ## Risks And Notes
 
 - GTK native dialogs and Win32 native dialogs will differ visually; tests should assert behavior, not pixels.
 - Clipboard tests need isolation. Prefer a test clipboard abstraction in automation mode, with one smaller native clipboard smoke test per platform.
-- Printing tests need a deterministic print sink before native print-dialog parity can be reliable.
+- Printing tests use a deterministic print sink before native print-dialog behavior is relied on.
 - WSLg may emit Mesa/EGL warnings. Treat them as non-fatal if the app stays running and tests can connect.
 - Building under `/mnt/c` may produce occasional Make clock-skew warnings. A future improvement is building inside the Ubuntu filesystem and copying artifacts only when needed.
 - The automation protocol must not become a second implementation path. It should route through the same commands the UI uses.

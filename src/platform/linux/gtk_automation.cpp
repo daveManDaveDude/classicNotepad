@@ -503,14 +503,40 @@ std::string BuildSelectionObject(const GtkNotepadApp::AutomationSelection& selec
     return output.str();
 }
 
+std::string BuildMarginsObject(const GtkNotepadApp::AutomationPageMargins& margins)
+{
+    std::ostringstream output;
+    output << "{"
+           << "\"left\":" << margins.left
+           << ",\"top\":" << margins.top
+           << ",\"right\":" << margins.right
+           << ",\"bottom\":" << margins.bottom
+           << "}";
+    return output.str();
+}
+
+std::string BuildStringArray(const std::vector<std::wstring>& values)
+{
+    std::ostringstream output;
+    output << "[";
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index > 0U) {
+            output << ",";
+        }
+        output << EscapeJsonString(values[index]);
+    }
+    output << "]";
+    return output.str();
+}
+
 std::string BuildCapabilitiesObject()
 {
     std::ostringstream output;
     output << "{"
            << "\"platform\":\"linux\""
            << ",\"nativeUi\":\"gtk4\""
-           << ",\"printing\":false"
-           << ",\"pageSetup\":false"
+           << ",\"printing\":true"
+           << ",\"pageSetup\":true"
            << ",\"fontChooser\":true"
            << ",\"spellCheck\":false"
            << ",\"darkMode\":false"
@@ -814,6 +840,84 @@ std::string HandleCommand(GtkNotepadApp& app, std::wstring& testClipboard, const
     if (name == L"getFont") {
         ResponseWriter response(id, true);
         response.AddString("font", app.GetFont());
+        return response.Finish();
+    }
+
+    if (name == L"pageSetup") {
+        GtkNotepadApp::AutomationPageMargins margins = app.GetPageMargins();
+        const std::optional<long long> left = GetNumber(request, "left");
+        const std::optional<long long> top = GetNumber(request, "top");
+        const std::optional<long long> right = GetNumber(request, "right");
+        const std::optional<long long> bottom = GetNumber(request, "bottom");
+        if (left.has_value() || top.has_value() || right.has_value() || bottom.has_value()) {
+            if (!left.has_value() || !top.has_value() || !right.has_value() || !bottom.has_value()) {
+                return BuildErrorResponse(id, L"Page setup requires left, top, right, and bottom margins.");
+            }
+
+            margins.left = static_cast<int>(*left);
+            margins.top = static_cast<int>(*top);
+            margins.right = static_cast<int>(*right);
+            margins.bottom = static_cast<int>(*bottom);
+            if (!app.SetPageMargins(margins, errorMessage)) {
+                return BuildErrorResponse(id, errorMessage);
+            }
+        }
+
+        ResponseWriter response(id, true);
+        response.AddRaw("margins", BuildMarginsObject(app.GetPageMargins()));
+        return response.Finish();
+    }
+
+    if (name == L"printToTestSink") {
+        std::wstring path;
+        if (!RequireString(request, "path", path, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        if (!app.PrintToTestSink(path, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        ResponseWriter response(id, true);
+        response.AddString("path", path);
+        response.AddNumber("pages", 1);
+        response.AddString("font", app.GetFont());
+        response.AddRaw("margins", BuildMarginsObject(app.GetPageMargins()));
+        return response.Finish();
+    }
+
+    if (name == L"checkSpelling") {
+        ResponseWriter response(id, true);
+        response.AddBool("available", app.SpellCheckAvailable());
+        response.AddRaw("errors", "[]");
+        return response.Finish();
+    }
+
+    if (name == L"suggestSpelling") {
+        std::wstring word;
+        if (!RequireString(request, "word", word, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        (void)word;
+        ResponseWriter response(id, true);
+        response.AddBool("available", app.SpellCheckAvailable());
+        response.AddRaw("suggestions", BuildStringArray(std::vector<std::wstring>{}));
+        return response.Finish();
+    }
+
+    if (name == L"ignoreSpelling" || name == L"addSpelling") {
+        std::wstring word;
+        if (!RequireString(request, "word", word, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        (void)word;
+        ResponseWriter response(id, true);
+        response.AddBool("available", app.SpellCheckAvailable());
+        if (name == L"addSpelling") {
+            response.AddBool("persisted", false);
+        }
         return response.Finish();
     }
 

@@ -1,5 +1,6 @@
 build/
 build-ubuntu/
+build-ubuntu-release/
 .vs/
 out/
 *.user

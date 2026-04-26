@@ -3,7 +3,7 @@
 <img width="931" height="300" alt="image" src="https://github.com/user-attachments/assets/2fa66227-88b2-4052-9a6d-071b25944fbf" />
 
 
-Classic Notepad is a finished single-document Win32/C++ recreation of classic Windows Notepad. It keeps the plain local editor feel: one window, one text document, native Windows dialogs, no tabs, no cloud features, no telemetry, and no editor extras that would pull it away from the classic experience.
+Classic Notepad is a finished single-document Win32/C++ recreation of classic Windows Notepad, with a native GTK4 Linux parity target in the same repository. It keeps the plain local editor feel: one window, one text document, native desktop dialogs, no tabs, no cloud features, no telemetry, and no editor extras that would pull it away from the classic experience.
 
 The project is built with C++17, Win32, CMake, and the free Visual Studio C++ Build Tools. It is intended to be opened, built, tested, and debugged from Visual Studio Code.
 
@@ -35,6 +35,23 @@ The project is built with C++17, Win32, CMake, and the free Visual Studio C++ Bu
 - Spell check context actions include suggestions, Ignore Once, and Add to Dictionary.
 - Keyboard accelerators: `Ctrl+N`, `Ctrl+O`, `Ctrl+S`, `Ctrl+Shift+S`, `Ctrl+F`, `F3`, `Ctrl+H`, `Ctrl+G`, `Ctrl+A`, `F5`, `Ctrl+Z`, `Ctrl+X`, `Ctrl+C`, `Ctrl+V`, and `Del`.
 - Focused console tests for encoding, line-ending, document round-trip, metadata, new-file, and spelling text utility behavior.
+- Shared JSON-lines automation suite for Windows and Linux feature parity.
+
+## Linux GTK Parity Target
+
+The Linux target builds as `ClassicNotepadGtk` on Ubuntu/WSL with GTK4. It now covers the same automated feature groups as the Windows binary:
+
+- File workflow, command-line open, missing command-line file creation, dirty title metadata, and save/open behavior.
+- Encoding and line-ending round trips through the shared document core.
+- Edit commands, find/replace/go-to, word wrap, font metadata, status bar, and status metadata.
+- `File > Page Setup...` and `File > Print...` with native GTK print/page setup APIs plus deterministic automation print sink coverage.
+- `Help > About Classic Notepad`.
+- Automation capability reporting for platform differences.
+
+Accepted Linux v1 capability differences:
+
+- Spell checking is not backed by a native Linux provider yet. `getCapabilities` reports `spellCheck: false`, and spelling automation commands return graceful unavailable results.
+- Dark mode is out of the cross-platform v1 scope. `getCapabilities` reports `darkMode: false`.
 
 ## Text File Behavior
 
@@ -139,13 +156,13 @@ Run tests after building:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1 -Configuration Debug
 ```
 
-Build and test the shared core under Ubuntu/WSL:
+Build and test the native GTK target under Ubuntu/WSL:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-ubuntu.ps1 -Distro Ubuntu-24.04
 ```
 
-The Ubuntu build verifies the cross-platform shared core, console tests, and, when GTK4 development packages are installed, builds the early native GTK app target.
+The Ubuntu build verifies the cross-platform shared core, console tests, and native GTK app target. Linux setup instructions live in [docs/LINUX_BUILD_ENVIRONMENT.md](docs/LINUX_BUILD_ENVIRONMENT.md).
 
 Run the Ubuntu GTK app from an Ubuntu shell:
 
@@ -160,7 +177,17 @@ You can pass a first file path argument to open it through the shared document l
 ./build-ubuntu/ClassicNotepadGtk README.md
 ```
 
-Current GTK target scope is intentionally small: native window, text editor surface, status metadata, and first-argument file load. Save/open menus and parity workflows are still future slices.
+Run the Linux automation suite after building:
+
+```powershell
+wsl.exe -d Ubuntu-24.04 -- bash -lc "cd /mnt/c/vibe/classicNotepad && python3 tests/automation/run_automation_tests.py --binary build-ubuntu/ClassicNotepadGtk --platform linux"
+```
+
+Build a Release-style Linux target in a separate directory:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-ubuntu.ps1 -Distro Ubuntu-24.04 -BuildDir build-ubuntu-release -Configuration Release
+```
 
 Build release:
 
@@ -244,29 +271,39 @@ src/
       spell_check.cpp, .h        Windows Spell Checking API wrapper
       resources.rc, resource.h   Menus, accelerators, dialogs, and version/icon resources
       win32_platform.h           Common Win32 compile definitions
+    linux/
+      gtk_app.cpp, .h            GTK application, menus, dialogs, editor, printing, status, and About UI
+      gtk_actions.cpp, .h        GTK action and menu wiring
+      gtk_automation.cpp, .h     Linux JSON-lines automation controller
+      gtk_dialogs.cpp, .h        GTK file, find, replace, go-to, font, error, and About dialogs
+      gtk_main.cpp               GTK entry point
 
 assets/
   icons/                     Application icon resources
 
 docs/
   README.md                  Index for planning, research, and review notes
+  LINUX_BUILD_ENVIRONMENT.md Ubuntu/WSL setup and Linux verification commands
 
 tests/
   text_conversion_tests.cpp   Console tests for text/document/spell utility behavior
+  automation/                 Shared Windows/Linux semantic automation suite
 
 scripts/
   build.ps1                  Configure and build with CMake
+  build-ubuntu.ps1           Configure, build, and test under Ubuntu/WSL
   test.ps1                   Run CTest
   clean.ps1                  Remove generated build output
 ```
 
 ## Verification
 
-The expected verification pass is:
+The expected Windows verification pass is:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 -Configuration Debug
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1 -Configuration Debug
+python .\tests\automation\run_automation_tests.py --binary .\build\Debug\ClassicNotepad.exe --platform windows
 ```
 
 CTest should report these passing test targets on Windows:
@@ -274,4 +311,19 @@ CTest should report these passing test targets on Windows:
 ```text
 TextConversionTests
 TextConversionPortableSmokeTests
+```
+
+The expected Linux parity verification pass is:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-ubuntu.ps1 -Distro Ubuntu-24.04
+wsl.exe -d Ubuntu-24.04 -- bash -lc "cd /mnt/c/vibe/classicNotepad && python3 tests/automation/run_automation_tests.py --binary build-ubuntu/ClassicNotepadGtk --platform linux"
+```
+
+Release sanity checks:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 -Configuration Release -SkipVersionIncrement
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1 -Configuration Release
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-ubuntu.ps1 -Distro Ubuntu-24.04 -BuildDir build-ubuntu-release -Configuration Release
 ```

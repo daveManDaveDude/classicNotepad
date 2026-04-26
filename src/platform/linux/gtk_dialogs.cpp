@@ -691,4 +691,23 @@ void ShowErrorDialog(GtkWindow* parent, const std::wstring& message)
         GTK_RESPONSE_CANCEL);
 }
 
+void ShowAboutDialog(GtkWindow* parent, const std::wstring& version)
+{
+    std::wstring message = L"Classic Notepad\n";
+    message += version;
+    message += L"\n\nNative GTK build with classic menus, local files, find/replace, Go To, word wrap, font selection, status metadata, page setup, and printing.";
+    message += L"\n\nNo tabs, cloud features, telemetry, or modern editor extras.";
+
+    RunMessageDialog(
+        parent,
+        "About Classic Notepad",
+        message,
+        "OK",
+        GTK_RESPONSE_OK,
+        nullptr,
+        GTK_RESPONSE_CANCEL,
+        nullptr,
+        GTK_RESPONSE_CANCEL);
+}
+
 } // namespace classic_notepad::linux_ui

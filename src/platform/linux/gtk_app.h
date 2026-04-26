@@ -29,6 +29,13 @@ public:
         std::size_t end = 0;
     };
 
+    struct AutomationPageMargins {
+        int left = 750;
+        int top = 750;
+        int right = 750;
+        int bottom = 750;
+    };
+
     explicit GtkNotepadApp(std::wstring initialPath);
     ~GtkNotepadApp();
 
@@ -48,6 +55,8 @@ public:
     void HandleOpen();
     bool HandleSave();
     bool HandleSaveAs();
+    void HandlePageSetup();
+    void HandlePrint();
     void HandleExit();
     void HandleUndo();
     void HandleCut();
@@ -63,6 +72,7 @@ public:
     void HandleToggleWordWrap();
     void HandleChooseFont();
     void HandleToggleStatusBar();
+    void HandleAbout();
 
     bool NewDocument();
     bool OpenFile(const std::wstring& path, std::wstring& errorMessage);
@@ -107,6 +117,10 @@ public:
     bool GetStatusBarVisible() const;
     bool SetFont(const std::wstring& fontDescription, std::wstring& errorMessage);
     std::wstring GetFont() const;
+    bool SetPageMargins(const AutomationPageMargins& margins, std::wstring& errorMessage);
+    AutomationPageMargins GetPageMargins() const;
+    bool PrintToTestSink(const std::wstring& path, std::wstring& errorMessage) const;
+    bool SpellCheckAvailable() const;
 
     void OnBufferChanged();
     void OnCursorMoved();
@@ -126,6 +140,9 @@ private:
     int MaxLine() const;
     void ApplyFont();
     void InstallContextMenu();
+    GtkPageSetup* EnsurePageSetup();
+    GtkPrintSettings* EnsurePrintSettings();
+    void StorePageSetup(GtkPageSetup* pageSetup);
 
     Document document_;
     std::wstring initialPath_;
@@ -145,12 +162,15 @@ private:
     GtkWidget* statusBar_ = nullptr;
     GtkWidget* statusLabel_ = nullptr;
     GtkCssProvider* fontProvider_ = nullptr;
+    GtkPageSetup* pageSetup_ = nullptr;
+    GtkPrintSettings* printSettings_ = nullptr;
 
     bool suppressChange_ = false;
     bool automationMode_ = false;
     bool automationVisible_ = false;
     bool wordWrap_ = false;
     bool statusBarVisible_ = true;
+    AutomationPageMargins pageMargins_;
 };
 
 } // namespace classic_notepad::linux_ui

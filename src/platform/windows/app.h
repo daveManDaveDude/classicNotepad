@@ -76,7 +76,14 @@ public:
     bool AutomationGetStatusBarVisible() const;
     bool AutomationSetFont(const std::wstring& fontDescription, std::wstring& errorMessage);
     std::wstring AutomationGetFont() const;
+    bool AutomationSetPageMarginsThousandths(const RECT& margins, std::wstring& errorMessage);
+    RECT AutomationGetPageMarginsThousandths() const;
+    bool AutomationPrintToTestSink(const std::wstring& path, std::wstring& errorMessage) const;
     bool AutomationSpellCheckAvailable() const;
+    std::vector<SpellingErrorRange> AutomationCheckSpelling(const std::wstring& text) const;
+    std::vector<std::wstring> AutomationSuggestSpelling(const std::wstring& word, std::size_t limit) const;
+    bool AutomationIgnoreSpelling(const std::wstring& word, std::wstring& errorMessage);
+    bool AutomationAddSpelling(const std::wstring& word, bool dryRun, std::wstring& errorMessage);
     bool AutomationDarkModeEnabled() const;
 
 private:

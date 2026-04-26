@@ -1,6 +1,8 @@
 param(
     [string]$Distro = "Ubuntu-24.04",
     [string]$BuildDir = "build-ubuntu",
+    [ValidateSet("Debug", "Release", "RelWithDebInfo", "MinSizeRel")]
+    [string]$Configuration = "Debug",
     [int]$Parallel = 2,
     [ValidateSet("Auto", "Ninja", "Unix Makefiles")]
     [string]$Generator = "Auto",
@@ -76,12 +78,14 @@ if ($Fresh) {
 }
 
 $configure = "cd '$RepoRootForWsl' && $freshPrefix" + "cmake$freshConfigure -S . -B '$BuildDir' -G '$selectedGenerator'"
+$configure += " -DCMAKE_BUILD_TYPE='$Configuration'"
 $build = "cd '$RepoRootForWsl' && cmake --build '$BuildDir' --parallel $Parallel"
 $test = "cd '$RepoRootForWsl' && ctest --test-dir '$BuildDir' --output-on-failure"
 
 Write-Host "Repository: $RepoRoot"
 Write-Host "WSL distro: $Distro"
 Write-Host "Ubuntu build dir: $BuildDir"
+Write-Host "Build type: $Configuration"
 Write-Host "CMake generator: $selectedGenerator"
 
 Invoke-Wsl $configure

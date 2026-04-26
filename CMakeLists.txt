@@ -164,6 +164,10 @@ if(UNIX AND NOT APPLE)
 
         target_compile_features(ClassicNotepadGtk PRIVATE cxx_std_17)
 
+        target_include_directories(ClassicNotepadGtk PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        )
+
         target_link_libraries(ClassicNotepadGtk PRIVATE
             ClassicNotepadCore
             PkgConfig::GTK4

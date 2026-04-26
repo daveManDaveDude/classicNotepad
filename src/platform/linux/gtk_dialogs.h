@@ -55,5 +55,6 @@ ReplaceDialogResult ShowReplaceDialog(
 bool ShowGoToDialog(GtkWindow* parent, int currentLine, int maxLine, int& selectedLine);
 std::wstring ShowFontDialog(GtkWindow* parent, const std::wstring& currentFont);
 void ShowErrorDialog(GtkWindow* parent, const std::wstring& message);
+void ShowAboutDialog(GtkWindow* parent, const std::wstring& version);
 
 } // namespace classic_notepad::linux_ui
