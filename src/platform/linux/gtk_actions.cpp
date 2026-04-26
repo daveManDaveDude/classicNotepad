@@ -105,9 +105,24 @@ void OnFont(GSimpleAction*, GVariant*, gpointer userData)
     static_cast<GtkNotepadApp*>(userData)->HandleChooseFont();
 }
 
-void OnStatusBar(GSimpleAction*, GVariant*, gpointer userData)
+void OnStatusBar(GSimpleAction* action, GVariant*, gpointer)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleToggleStatusBar();
+    GVariant* state = g_action_get_state(G_ACTION(action));
+    const bool visible = state == nullptr || g_variant_get_boolean(state) == FALSE;
+    if (state != nullptr) {
+        g_variant_unref(state);
+    }
+
+    g_action_change_state(G_ACTION(action), g_variant_new_boolean(visible));
+}
+
+void OnStatusBarChangeState(GSimpleAction*, GVariant* value, gpointer userData)
+{
+    if (value == nullptr) {
+        return;
+    }
+
+    static_cast<GtkNotepadApp*>(userData)->SetStatusBarVisible(g_variant_get_boolean(value) != FALSE);
 }
 
 void OnAbout(GSimpleAction*, GVariant*, gpointer userData)
@@ -136,7 +151,7 @@ const GActionEntry kActions[] = {
     {"time-date", OnTimeDate, nullptr, nullptr, nullptr},
     {"word-wrap", OnWordWrap, nullptr, nullptr, nullptr},
     {"font", OnFont, nullptr, nullptr, nullptr},
-    {"status-bar", OnStatusBar, nullptr, nullptr, nullptr},
+    {"status-bar", OnStatusBar, nullptr, "true", OnStatusBarChangeState},
     {"about", OnAbout, nullptr, nullptr, nullptr},
 };
 

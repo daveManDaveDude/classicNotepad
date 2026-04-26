@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 set(CLASSIC_NOTEPAD_VERSION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 set(CLASSIC_NOTEPAD_VERSION "1.0.0")
 set(CLASSIC_NOTEPAD_APP_ICON "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/classic_notepad_large_transparent.ico")
+set(CLASSIC_NOTEPAD_APP_ICON_PNG "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/classic_notepad_large_transparent.png")
 
 if(EXISTS "${CLASSIC_NOTEPAD_VERSION_FILE}")
     file(READ "${CLASSIC_NOTEPAD_VERSION_FILE}" CLASSIC_NOTEPAD_VERSION)
@@ -166,6 +167,10 @@ if(UNIX AND NOT APPLE)
 
         target_include_directories(ClassicNotepadGtk PRIVATE
             "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        )
+
+        target_compile_definitions(ClassicNotepadGtk PRIVATE
+            "CLASSIC_NOTEPAD_ICON_PATH=\"${CLASSIC_NOTEPAD_APP_ICON_PNG}\""
         )
 
         target_link_libraries(ClassicNotepadGtk PRIVATE

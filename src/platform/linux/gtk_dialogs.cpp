@@ -7,6 +7,10 @@
 #include <cwchar>
 #include <string>
 
+#ifndef CLASSIC_NOTEPAD_ICON_PATH
+#define CLASSIC_NOTEPAD_ICON_PATH "assets/icons/classic_notepad_large_transparent.png"
+#endif
+
 namespace classic_notepad::linux_ui {
 namespace {
 
@@ -132,6 +136,17 @@ GtkWidget* CreateDialogContent(GtkWidget* dialog)
     gtk_widget_set_margin_bottom(content, 16);
     gtk_window_set_child(GTK_WINDOW(dialog), content);
     return content;
+}
+
+GtkWidget* CreateAboutIcon()
+{
+    GtkWidget* image = g_file_test(CLASSIC_NOTEPAD_ICON_PATH, G_FILE_TEST_EXISTS)
+        ? gtk_image_new_from_file(CLASSIC_NOTEPAD_ICON_PATH)
+        : gtk_image_new_from_icon_name("accessories-text-editor-symbolic");
+    gtk_image_set_pixel_size(GTK_IMAGE(image), 72);
+    gtk_widget_set_size_request(image, 72, 72);
+    gtk_widget_set_valign(image, GTK_ALIGN_START);
+    return image;
 }
 
 void ReadFindOptions(FindDialogState& state)
@@ -693,21 +708,58 @@ void ShowErrorDialog(GtkWindow* parent, const std::wstring& message)
 
 void ShowAboutDialog(GtkWindow* parent, const std::wstring& version)
 {
-    std::wstring message = L"Classic Notepad\n";
-    message += version;
-    message += L"\n\nNative GTK build with classic menus, local files, find/replace, Go To, word wrap, font selection, status metadata, page setup, and printing.";
-    message += L"\n\nNo tabs, cloud features, telemetry, or modern editor extras.";
+    MessageLoopState state;
+    state.loop = g_main_loop_new(nullptr, FALSE);
 
-    RunMessageDialog(
-        parent,
-        "About Classic Notepad",
-        message,
-        "OK",
-        GTK_RESPONSE_OK,
-        nullptr,
-        GTK_RESPONSE_CANCEL,
-        nullptr,
-        GTK_RESPONSE_CANCEL);
+    GtkWidget* dialog = gtk_window_new();
+    ConfigureDialogWindow(dialog, parent, "About Classic Notepad", 460);
+    gtk_window_set_resizable(GTK_WINDOW(dialog), FALSE);
+    g_signal_connect(dialog, "destroy", G_CALLBACK(DialogDestroyed), &state);
+
+    GtkWidget* content = CreateDialogContent(dialog);
+    GtkWidget* body = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+    gtk_box_append(GTK_BOX(content), body);
+
+    gtk_box_append(GTK_BOX(body), CreateAboutIcon());
+
+    GtkWidget* textColumn = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+    gtk_widget_set_hexpand(textColumn, TRUE);
+    gtk_box_append(GTK_BOX(body), textColumn);
+
+    GtkWidget* titleLabel = gtk_label_new(nullptr);
+    gtk_label_set_markup(GTK_LABEL(titleLabel), "<b>Classic Notepad</b>");
+    gtk_label_set_xalign(GTK_LABEL(titleLabel), 0.0F);
+    gtk_box_append(GTK_BOX(textColumn), titleLabel);
+
+    const std::string utf8Version = Utf8FromWide(version);
+    GtkWidget* versionLabel = gtk_label_new(utf8Version.c_str());
+    gtk_label_set_xalign(GTK_LABEL(versionLabel), 0.0F);
+    gtk_box_append(GTK_BOX(textColumn), versionLabel);
+
+    GtkWidget* descriptionLabel = gtk_label_new(
+        "Native GTK build with classic menus, local files, find/replace, Go To, word wrap, font selection, status metadata, page setup, and printing.");
+    gtk_label_set_wrap(GTK_LABEL(descriptionLabel), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(descriptionLabel), 0.0F);
+    gtk_label_set_max_width_chars(GTK_LABEL(descriptionLabel), 44);
+    gtk_box_append(GTK_BOX(textColumn), descriptionLabel);
+
+    GtkWidget* scopeLabel = gtk_label_new("No tabs, cloud features, telemetry, or modern editor extras.");
+    gtk_label_set_wrap(GTK_LABEL(scopeLabel), TRUE);
+    gtk_label_set_xalign(GTK_LABEL(scopeLabel), 0.0F);
+    gtk_label_set_max_width_chars(GTK_LABEL(scopeLabel), 44);
+    gtk_box_append(GTK_BOX(textColumn), scopeLabel);
+
+    GtkWidget* row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_halign(row, GTK_ALIGN_END);
+    gtk_box_append(GTK_BOX(content), row);
+
+    GtkWidget* okButton = AddButton(row, "OK", GTK_RESPONSE_OK, state);
+    gtk_widget_grab_focus(okButton);
+    gtk_window_set_default_widget(GTK_WINDOW(dialog), okButton);
+
+    gtk_window_present(GTK_WINDOW(dialog));
+    g_main_loop_run(state.loop);
+    g_main_loop_unref(state.loop);
 }
 
 } // namespace classic_notepad::linux_ui

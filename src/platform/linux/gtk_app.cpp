@@ -1365,6 +1365,22 @@ void GtkNotepadApp::SetStatusBarVisible(bool visible)
     if (statusBar_ != nullptr) {
         gtk_widget_set_visible(statusBar_, visible);
     }
+
+    if (window_ != nullptr) {
+        GAction* action = g_action_map_lookup_action(G_ACTION_MAP(window_), "status-bar");
+        if (G_IS_SIMPLE_ACTION(action)) {
+            g_simple_action_set_state(G_SIMPLE_ACTION(action), g_variant_new_boolean(statusBarVisible_));
+        }
+    }
+
+    if (menuBar_ != nullptr && GTK_IS_POPOVER_MENU_BAR(menuBar_)) {
+        GMenuModel* model = gtk_popover_menu_bar_get_menu_model(GTK_POPOVER_MENU_BAR(menuBar_));
+        if (model != nullptr) {
+            g_object_ref(model);
+            gtk_popover_menu_bar_set_menu_model(GTK_POPOVER_MENU_BAR(menuBar_), model);
+            g_object_unref(model);
+        }
+    }
 }
 
 bool GtkNotepadApp::GetStatusBarVisible() const
@@ -1626,8 +1642,8 @@ void GtkNotepadApp::BuildWindow(GtkApplication* application)
     GtkWidget* root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_window_set_child(GTK_WINDOW(window_), root);
 
-    GtkWidget* menuBar = CreateMenuBar();
-    gtk_box_append(GTK_BOX(root), menuBar);
+    menuBar_ = CreateMenuBar();
+    gtk_box_append(GTK_BOX(root), menuBar_);
 
     GtkWidget* scrolledWindow = gtk_scrolled_window_new();
     gtk_widget_set_vexpand(scrolledWindow, TRUE);

@@ -157,6 +157,7 @@ private:
 
     GtkApplication* application_ = nullptr;
     GtkWidget* window_ = nullptr;
+    GtkWidget* menuBar_ = nullptr;
     GtkWidget* textView_ = nullptr;
     GtkTextBuffer* buffer_ = nullptr;
     GtkWidget* statusBar_ = nullptr;
