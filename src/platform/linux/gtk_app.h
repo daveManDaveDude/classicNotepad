@@ -49,6 +49,20 @@ public:
     bool HandleSave();
     bool HandleSaveAs();
     void HandleExit();
+    void HandleUndo();
+    void HandleCut();
+    void HandleCopy();
+    void HandlePaste();
+    void HandleDelete();
+    void HandleFind();
+    void HandleFindNext();
+    void HandleReplace();
+    void HandleGoTo();
+    void HandleSelectAll();
+    void HandleTimeDate();
+    void HandleToggleWordWrap();
+    void HandleChooseFont();
+    void HandleToggleStatusBar();
 
     bool NewDocument();
     bool OpenFile(const std::wstring& path, std::wstring& errorMessage);
@@ -71,11 +85,28 @@ public:
     AutomationSelection GetSelection() const;
     void SetSelection(std::size_t selectionStart, std::size_t selectionEnd);
     void SelectAll();
+    void Undo();
+    void Cut();
+    void Copy();
+    void Paste();
     void DeleteSelection();
+    bool Find(const std::wstring& text, bool matchCase, bool wholeWord, bool searchDown);
+    bool FindNext(bool matchCase, bool wholeWord, bool searchDown);
+    bool Replace(
+        const std::wstring& text,
+        const std::wstring& replacement,
+        bool matchCase,
+        bool wholeWord,
+        bool searchDown);
+    std::size_t ReplaceAll(const std::wstring& text, const std::wstring& replacement, bool matchCase, bool wholeWord);
+    bool GoToLine(int lineNumber, std::wstring& errorMessage);
+    void InsertTimeDate();
     void SetWordWrap(bool enabled);
     bool GetWordWrap() const;
     void SetStatusBarVisible(bool visible);
     bool GetStatusBarVisible() const;
+    bool SetFont(const std::wstring& fontDescription, std::wstring& errorMessage);
+    std::wstring GetFont() const;
 
     void OnBufferChanged();
     void OnCursorMoved();
@@ -87,11 +118,25 @@ private:
     void SetInitialTitleAndStatus();
     bool MissingFilePath(const std::wstring& path) const;
     std::wstring SuggestedSaveName() const;
+    std::wstring GetRawText() const;
+    std::wstring GetSelectedText() const;
+    void ReplaceSelection(const std::wstring& text);
+    std::wstring BuildTimeDateText() const;
+    int CurrentLine() const;
+    int MaxLine() const;
+    void ApplyFont();
+    void InstallContextMenu();
 
     Document document_;
     std::wstring initialPath_;
     std::wstring title_;
     std::wstring statusText_;
+    std::wstring findText_;
+    std::wstring replaceText_;
+    bool findMatchCase_ = false;
+    bool findWholeWord_ = false;
+    bool findSearchDown_ = true;
+    std::wstring fontDescription_ = L"Monospace 11";
 
     GtkApplication* application_ = nullptr;
     GtkWidget* window_ = nullptr;
@@ -99,6 +144,7 @@ private:
     GtkTextBuffer* buffer_ = nullptr;
     GtkWidget* statusBar_ = nullptr;
     GtkWidget* statusLabel_ = nullptr;
+    GtkCssProvider* fontProvider_ = nullptr;
 
     bool suppressChange_ = false;
     bool automationMode_ = false;

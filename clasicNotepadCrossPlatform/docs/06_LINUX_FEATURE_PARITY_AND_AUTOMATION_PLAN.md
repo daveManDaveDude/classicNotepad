@@ -31,21 +31,18 @@ Completed so far:
   - status label
   - first command-line file load
   - shared encoding/line-ending/document metadata display
+  - native File/Edit/Format/View menu actions through GTK actions
+  - New/Open/Save/Save As file workflow with dirty-state prompts
+  - undo/cut/copy/paste/delete/select-all/time-date editing commands
+  - editor context menu entries for common editing commands
+  - Find/Find Next/Replace/Replace All/Go To support
+  - word-wrap, font metadata, and status-bar visibility controls
+  - shared JSON-lines automation coverage through phase 7
 
 Major gaps in `ClassicNotepadGtk`:
 
-- No menu bar.
-- No New/Open/Save/Save As flows.
-- No dirty-state confirmation.
-- No command dispatcher.
-- No Find/Replace/Go To/Time-Date.
-- No word-wrap toggle.
-- No font chooser.
-- No status-bar toggle.
 - No page setup or print.
-- No context menu.
 - No Linux spell-check strategy.
-- No cross-binary GUI/feature automation harness.
 
 ## Definition Of Done
 

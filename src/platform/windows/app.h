@@ -74,6 +74,8 @@ public:
     bool AutomationGetWordWrap() const;
     void AutomationSetStatusBarVisible(bool visible);
     bool AutomationGetStatusBarVisible() const;
+    bool AutomationSetFont(const std::wstring& fontDescription, std::wstring& errorMessage);
+    std::wstring AutomationGetFont() const;
     bool AutomationSpellCheckAvailable() const;
     bool AutomationDarkModeEnabled() const;
 

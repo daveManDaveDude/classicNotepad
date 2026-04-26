@@ -7,7 +7,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <ctime>
+#include <cwctype>
 #include <cstring>
+#include <iomanip>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -48,6 +52,182 @@ std::vector<std::uint8_t> BytesFromString(const std::string& text)
 std::size_t ClampOffset(std::size_t value)
 {
     return std::min<std::size_t>(value, static_cast<std::size_t>(G_MAXINT));
+}
+
+bool IsWordCharacter(wchar_t character)
+{
+    return std::iswalnum(static_cast<wint_t>(character)) != 0 || character == L'_';
+}
+
+bool HasWordBoundaryAt(const std::wstring& text, std::size_t position)
+{
+    if (position == 0U || position >= text.size()) {
+        return true;
+    }
+
+    return !IsWordCharacter(text[position - 1U]) || !IsWordCharacter(text[position]);
+}
+
+bool CharactersEqual(wchar_t left, wchar_t right, bool matchCase)
+{
+    if (matchCase) {
+        return left == right;
+    }
+
+    return std::towlower(static_cast<wint_t>(left)) == std::towlower(static_cast<wint_t>(right));
+}
+
+bool TextMatchesAt(
+    const std::wstring& text,
+    std::size_t position,
+    const std::wstring& needle,
+    bool matchCase,
+    bool wholeWord)
+{
+    if (needle.empty() || position + needle.size() > text.size()) {
+        return false;
+    }
+
+    for (std::size_t index = 0; index < needle.size(); ++index) {
+        if (!CharactersEqual(text[position + index], needle[index], matchCase)) {
+            return false;
+        }
+    }
+
+    if (!wholeWord) {
+        return true;
+    }
+
+    return HasWordBoundaryAt(text, position) && HasWordBoundaryAt(text, position + needle.size());
+}
+
+bool IsLineBreakAt(const std::wstring& rawText, std::size_t position, std::size_t& rawLength)
+{
+    if (position >= rawText.size()) {
+        rawLength = 0;
+        return false;
+    }
+
+    if (rawText[position] == L'\r') {
+        rawLength = position + 1U < rawText.size() && rawText[position + 1U] == L'\n' ? 2U : 1U;
+        return true;
+    }
+
+    if (rawText[position] == L'\n') {
+        rawLength = 1U;
+        return true;
+    }
+
+    rawLength = 0;
+    return false;
+}
+
+std::size_t EditorOffsetFromBufferOffset(const std::wstring& rawText, std::size_t bufferOffset)
+{
+    std::size_t editorOffset = 0;
+    std::size_t rawOffset = 0;
+    while (rawOffset < rawText.size() && rawOffset < bufferOffset) {
+        std::size_t rawLineBreakLength = 0;
+        if (IsLineBreakAt(rawText, rawOffset, rawLineBreakLength)) {
+            editorOffset += 2U;
+            rawOffset += rawLineBreakLength;
+        } else {
+            ++editorOffset;
+            ++rawOffset;
+        }
+    }
+
+    return editorOffset;
+}
+
+std::size_t BufferOffsetFromEditorOffset(const std::wstring& rawText, std::size_t editorOffset)
+{
+    std::size_t rawOffset = 0;
+    std::size_t currentEditorOffset = 0;
+    while (rawOffset < rawText.size()) {
+        std::size_t rawLineBreakLength = 0;
+        const std::size_t editorLength = IsLineBreakAt(rawText, rawOffset, rawLineBreakLength) ? 2U : 1U;
+        if (editorOffset < currentEditorOffset + editorLength) {
+            return rawOffset;
+        }
+
+        currentEditorOffset += editorLength;
+        rawOffset += rawLineBreakLength == 0U ? 1U : rawLineBreakLength;
+        if (editorOffset == currentEditorOffset) {
+            return rawOffset;
+        }
+    }
+
+    return rawText.size();
+}
+
+std::string EscapeCssString(const std::string& text)
+{
+    std::string escaped;
+    escaped.reserve(text.size());
+    for (char character : text) {
+        if (character == '\\' || character == '"') {
+            escaped.push_back('\\');
+        }
+        escaped.push_back(character);
+    }
+    return escaped;
+}
+
+std::string CssSizeFromPangoDescription(PangoFontDescription* description)
+{
+    const int pangoSize = pango_font_description_get_size(description);
+    if (pangoSize <= 0) {
+        return "11pt";
+    }
+
+    const double points = static_cast<double>(pangoSize) / static_cast<double>(PANGO_SCALE);
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(points == static_cast<int>(points) ? 0 : 1) << points << "pt";
+    return output.str();
+}
+
+struct ClipboardReadState {
+    GMainLoop* loop = nullptr;
+    std::wstring text;
+};
+
+void OnClipboardTextReady(GObject* sourceObject, GAsyncResult* result, gpointer userData)
+{
+    auto* state = static_cast<ClipboardReadState*>(userData);
+    GError* error = nullptr;
+    char* text = gdk_clipboard_read_text_finish(GDK_CLIPBOARD(sourceObject), result, &error);
+    if (text != nullptr) {
+        state->text = WideFromUtf8(text);
+        g_free(text);
+    }
+
+    if (error != nullptr) {
+        g_error_free(error);
+    }
+
+    if (state->loop != nullptr && g_main_loop_is_running(state->loop)) {
+        g_main_loop_quit(state->loop);
+    }
+}
+
+std::wstring ReadClipboardText(GtkWidget* widget)
+{
+    if (widget == nullptr) {
+        return {};
+    }
+
+    GdkClipboard* clipboard = gtk_widget_get_clipboard(widget);
+    if (clipboard == nullptr) {
+        return {};
+    }
+
+    ClipboardReadState state;
+    state.loop = g_main_loop_new(nullptr, FALSE);
+    gdk_clipboard_read_text_async(clipboard, nullptr, OnClipboardTextReady, &state);
+    g_main_loop_run(state.loop);
+    g_main_loop_unref(state.loop);
+    return classic_notepad::NormalizeLineEndingsForEditor(state.text);
 }
 
 } // namespace
@@ -102,6 +282,11 @@ GtkNotepadApp::~GtkNotepadApp()
         GtkWidget* window = window_;
         window_ = nullptr;
         gtk_window_destroy(GTK_WINDOW(window));
+    }
+
+    if (fontProvider_ != nullptr) {
+        g_object_unref(fontProvider_);
+        fontProvider_ = nullptr;
     }
 
     if (application_ != nullptr) {
@@ -266,6 +451,144 @@ void GtkNotepadApp::HandleExit()
     }
 }
 
+void GtkNotepadApp::HandleUndo()
+{
+    Undo();
+}
+
+void GtkNotepadApp::HandleCut()
+{
+    Cut();
+}
+
+void GtkNotepadApp::HandleCopy()
+{
+    Copy();
+}
+
+void GtkNotepadApp::HandlePaste()
+{
+    Paste();
+}
+
+void GtkNotepadApp::HandleDelete()
+{
+    DeleteSelection();
+}
+
+void GtkNotepadApp::HandleFind()
+{
+    FindDialogResult result = ShowFindDialog(Window(), findText_, findMatchCase_, findWholeWord_, findSearchDown_);
+    if (!result.accepted || result.text.empty()) {
+        return;
+    }
+
+    if (!Find(result.text, result.matchCase, result.wholeWord, result.searchDown)) {
+        std::wstring message = L"Cannot find \"";
+        message += result.text;
+        message += L"\".";
+        ShowError(message);
+    }
+}
+
+void GtkNotepadApp::HandleFindNext()
+{
+    if (findText_.empty()) {
+        HandleFind();
+        return;
+    }
+
+    if (!FindNext(findMatchCase_, findWholeWord_, findSearchDown_)) {
+        std::wstring message = L"Cannot find \"";
+        message += findText_;
+        message += L"\".";
+        ShowError(message);
+    }
+}
+
+void GtkNotepadApp::HandleReplace()
+{
+    ReplaceDialogResult result = ShowReplaceDialog(
+        Window(),
+        findText_,
+        replaceText_,
+        findMatchCase_,
+        findWholeWord_,
+        findSearchDown_);
+
+    if (result.action == ReplaceDialogAction::Cancel || result.text.empty()) {
+        return;
+    }
+
+    findText_ = result.text;
+    replaceText_ = result.replacement;
+    findMatchCase_ = result.matchCase;
+    findWholeWord_ = result.wholeWord;
+    findSearchDown_ = result.searchDown;
+
+    if (result.action == ReplaceDialogAction::Replace) {
+        if (!Replace(result.text, result.replacement, result.matchCase, result.wholeWord, result.searchDown)) {
+            std::wstring message = L"Cannot find \"";
+            message += result.text;
+            message += L"\".";
+            ShowError(message);
+        }
+        return;
+    }
+
+    const std::size_t count = ReplaceAll(result.text, result.replacement, result.matchCase, result.wholeWord);
+    if (count == 0U) {
+        std::wstring message = L"Cannot find \"";
+        message += result.text;
+        message += L"\".";
+        ShowError(message);
+    }
+}
+
+void GtkNotepadApp::HandleGoTo()
+{
+    int selectedLine = CurrentLine();
+    if (ShowGoToDialog(Window(), selectedLine, MaxLine(), selectedLine)) {
+        std::wstring error;
+        if (!GoToLine(selectedLine, error)) {
+            ShowError(error);
+        }
+    }
+}
+
+void GtkNotepadApp::HandleSelectAll()
+{
+    SelectAll();
+}
+
+void GtkNotepadApp::HandleTimeDate()
+{
+    InsertTimeDate();
+}
+
+void GtkNotepadApp::HandleToggleWordWrap()
+{
+    SetWordWrap(!wordWrap_);
+}
+
+void GtkNotepadApp::HandleChooseFont()
+{
+    const std::wstring selectedFont = ShowFontDialog(Window(), fontDescription_);
+    if (selectedFont.empty()) {
+        return;
+    }
+
+    std::wstring error;
+    if (!SetFont(selectedFont, error)) {
+        ShowError(error);
+    }
+}
+
+void GtkNotepadApp::HandleToggleStatusBar()
+{
+    SetStatusBarVisible(!statusBarVisible_);
+}
+
 bool GtkNotepadApp::NewDocument()
 {
     document_.ResetUntitled();
@@ -424,10 +747,29 @@ void GtkNotepadApp::SetText(const std::wstring& text)
 
 void GtkNotepadApp::InsertText(const std::wstring& text)
 {
+    ReplaceSelection(text);
+}
+
+std::wstring GtkNotepadApp::GetSelectedText() const
+{
+    const AutomationSelection selection = GetSelection();
+    if (selection.end <= selection.start) {
+        return {};
+    }
+
+    const std::wstring text = GetText();
+    const std::size_t start = std::min(selection.start, text.size());
+    const std::size_t end = std::min(selection.end, text.size());
+    return start < end ? text.substr(start, end - start) : std::wstring();
+}
+
+void GtkNotepadApp::ReplaceSelection(const std::wstring& text)
+{
     if (buffer_ == nullptr) {
         return;
     }
 
+    gtk_text_buffer_begin_user_action(buffer_);
     GtkTextIter start;
     GtkTextIter end;
     if (gtk_text_buffer_get_selection_bounds(buffer_, &start, &end)) {
@@ -439,12 +781,18 @@ void GtkNotepadApp::InsertText(const std::wstring& text)
 
     const std::string utf8Text = Utf8FromWide(text);
     gtk_text_buffer_insert(buffer_, &start, utf8Text.c_str(), static_cast<int>(utf8Text.size()));
+    gtk_text_buffer_end_user_action(buffer_);
     document_.SetModified(true);
     UpdateTitle();
     UpdateStatus();
 }
 
 std::wstring GtkNotepadApp::GetText() const
+{
+    return classic_notepad::NormalizeLineEndingsForEditor(GetRawText());
+}
+
+std::wstring GtkNotepadApp::GetRawText() const
 {
     if (buffer_ == nullptr) {
         return {};
@@ -459,7 +807,7 @@ std::wstring GtkNotepadApp::GetText() const
     const std::wstring wideText = WideFromUtf8(text);
     g_free(text);
 
-    return classic_notepad::NormalizeLineEndingsForEditor(wideText);
+    return wideText;
 }
 
 std::wstring GtkNotepadApp::GetTitle() const
@@ -498,14 +846,15 @@ GtkNotepadApp::AutomationSelection GtkNotepadApp::GetSelection() const
 
     GtkTextIter start;
     GtkTextIter end;
+    const std::wstring rawText = GetRawText();
     if (gtk_text_buffer_get_selection_bounds(buffer_, &start, &end)) {
-        selection.start = static_cast<std::size_t>(gtk_text_iter_get_offset(&start));
-        selection.end = static_cast<std::size_t>(gtk_text_iter_get_offset(&end));
+        selection.start = EditorOffsetFromBufferOffset(rawText, static_cast<std::size_t>(gtk_text_iter_get_offset(&start)));
+        selection.end = EditorOffsetFromBufferOffset(rawText, static_cast<std::size_t>(gtk_text_iter_get_offset(&end)));
         return selection;
     }
 
     gtk_text_buffer_get_iter_at_mark(buffer_, &start, gtk_text_buffer_get_insert(buffer_));
-    selection.start = static_cast<std::size_t>(gtk_text_iter_get_offset(&start));
+    selection.start = EditorOffsetFromBufferOffset(rawText, static_cast<std::size_t>(gtk_text_iter_get_offset(&start)));
     selection.end = selection.start;
     return selection;
 }
@@ -518,8 +867,11 @@ void GtkNotepadApp::SetSelection(std::size_t selectionStart, std::size_t selecti
 
     GtkTextIter start;
     GtkTextIter end;
-    gtk_text_buffer_get_iter_at_offset(buffer_, &start, static_cast<int>(ClampOffset(selectionStart)));
-    gtk_text_buffer_get_iter_at_offset(buffer_, &end, static_cast<int>(ClampOffset(selectionEnd)));
+    const std::wstring rawText = GetRawText();
+    const std::size_t bufferStart = BufferOffsetFromEditorOffset(rawText, selectionStart);
+    const std::size_t bufferEnd = BufferOffsetFromEditorOffset(rawText, selectionEnd);
+    gtk_text_buffer_get_iter_at_offset(buffer_, &start, static_cast<int>(ClampOffset(bufferStart)));
+    gtk_text_buffer_get_iter_at_offset(buffer_, &end, static_cast<int>(ClampOffset(bufferEnd)));
     gtk_text_buffer_select_range(buffer_, &start, &end);
     UpdateStatus();
 }
@@ -538,6 +890,49 @@ void GtkNotepadApp::SelectAll()
     UpdateStatus();
 }
 
+void GtkNotepadApp::Undo()
+{
+    if (buffer_ == nullptr) {
+        return;
+    }
+
+    gtk_text_buffer_undo(buffer_);
+    UpdateTitle();
+    UpdateStatus();
+}
+
+void GtkNotepadApp::Copy()
+{
+    if (textView_ == nullptr) {
+        return;
+    }
+
+    const std::wstring selectedText = GetSelectedText();
+    if (selectedText.empty()) {
+        return;
+    }
+
+    const std::string utf8Text = Utf8FromWide(selectedText);
+    GdkClipboard* clipboard = gtk_widget_get_clipboard(textView_);
+    if (clipboard != nullptr) {
+        gdk_clipboard_set_text(clipboard, utf8Text.c_str());
+    }
+}
+
+void GtkNotepadApp::Cut()
+{
+    Copy();
+    DeleteSelection();
+}
+
+void GtkNotepadApp::Paste()
+{
+    const std::wstring text = ReadClipboardText(textView_);
+    if (!text.empty()) {
+        ReplaceSelection(text);
+    }
+}
+
 void GtkNotepadApp::DeleteSelection()
 {
     if (buffer_ == nullptr) {
@@ -547,11 +942,193 @@ void GtkNotepadApp::DeleteSelection()
     GtkTextIter start;
     GtkTextIter end;
     if (gtk_text_buffer_get_selection_bounds(buffer_, &start, &end)) {
+        gtk_text_buffer_begin_user_action(buffer_);
         gtk_text_buffer_delete(buffer_, &start, &end);
+        gtk_text_buffer_end_user_action(buffer_);
         document_.SetModified(true);
         UpdateTitle();
         UpdateStatus();
     }
+}
+
+bool GtkNotepadApp::Find(const std::wstring& text, bool matchCase, bool wholeWord, bool searchDown)
+{
+    if (text.empty()) {
+        return false;
+    }
+
+    findText_ = text;
+    findMatchCase_ = matchCase;
+    findWholeWord_ = wholeWord;
+    findSearchDown_ = searchDown;
+    if (searchDown) {
+        SetSelection(0, 0);
+    } else {
+        const std::size_t textLength = GetText().size();
+        SetSelection(textLength, textLength);
+    }
+
+    return FindNext(matchCase, wholeWord, searchDown);
+}
+
+bool GtkNotepadApp::FindNext(bool matchCase, bool wholeWord, bool searchDown)
+{
+    if (findText_.empty()) {
+        return false;
+    }
+
+    const std::wstring text = GetText();
+    if (text.empty() || findText_.size() > text.size()) {
+        return false;
+    }
+
+    const AutomationSelection selection = GetSelection();
+    const std::size_t selectionStart = std::min(selection.start, selection.end);
+    const std::size_t selectionEnd = std::max(selection.start, selection.end);
+    const std::size_t lastPossible = text.size() - findText_.size();
+
+    if (searchDown) {
+        const std::size_t startPosition = std::min(selectionEnd, text.size());
+        for (std::size_t position = startPosition; position <= lastPossible; ++position) {
+            if (TextMatchesAt(text, position, findText_, matchCase, wholeWord)) {
+                SetSelection(position, position + findText_.size());
+                findMatchCase_ = matchCase;
+                findWholeWord_ = wholeWord;
+                findSearchDown_ = searchDown;
+                return true;
+            }
+        }
+    } else if (selectionStart > 0U) {
+        std::size_t position = std::min<std::size_t>(selectionStart - 1U, lastPossible);
+        for (;;) {
+            if (TextMatchesAt(text, position, findText_, matchCase, wholeWord)) {
+                SetSelection(position, position + findText_.size());
+                findMatchCase_ = matchCase;
+                findWholeWord_ = wholeWord;
+                findSearchDown_ = searchDown;
+                return true;
+            }
+
+            if (position == 0U) {
+                break;
+            }
+            --position;
+        }
+    }
+
+    return false;
+}
+
+bool GtkNotepadApp::Replace(
+    const std::wstring& text,
+    const std::wstring& replacement,
+    bool matchCase,
+    bool wholeWord,
+    bool searchDown)
+{
+    if (text.empty()) {
+        return false;
+    }
+
+    findText_ = text;
+    replaceText_ = replacement;
+    findMatchCase_ = matchCase;
+    findWholeWord_ = wholeWord;
+    findSearchDown_ = searchDown;
+
+    const std::wstring currentText = GetText();
+    const AutomationSelection selection = GetSelection();
+    const std::size_t selectionStart = std::min(selection.start, selection.end);
+    const std::size_t selectionEnd = std::max(selection.start, selection.end);
+    const bool selectionMatches =
+        selectionEnd > selectionStart &&
+        selectionEnd - selectionStart == text.size() &&
+        TextMatchesAt(currentText, selectionStart, text, matchCase, wholeWord);
+    if (!selectionMatches &&
+        !FindNext(matchCase, wholeWord, searchDown)) {
+        return false;
+    }
+
+    const AutomationSelection foundSelection = GetSelection();
+    const std::size_t foundStart = std::min(foundSelection.start, foundSelection.end);
+    const std::size_t foundEnd = std::max(foundSelection.start, foundSelection.end);
+    if (foundEnd <= foundStart ||
+        foundEnd - foundStart != text.size() ||
+        !TextMatchesAt(GetText(), foundStart, text, matchCase, wholeWord)) {
+        return false;
+    }
+
+    ReplaceSelection(replacement);
+    return true;
+}
+
+std::size_t GtkNotepadApp::ReplaceAll(
+    const std::wstring& text,
+    const std::wstring& replacement,
+    bool matchCase,
+    bool wholeWord)
+{
+    if (text.empty()) {
+        return 0;
+    }
+
+    findText_ = text;
+    replaceText_ = replacement;
+    findMatchCase_ = matchCase;
+    findWholeWord_ = wholeWord;
+
+    const std::wstring sourceText = GetText();
+    std::wstring replaced;
+    replaced.reserve(sourceText.size());
+
+    std::size_t replacementCount = 0;
+    for (std::size_t position = 0; position < sourceText.size();) {
+        if (TextMatchesAt(sourceText, position, text, matchCase, wholeWord)) {
+            replaced += replacement;
+            position += text.size();
+            ++replacementCount;
+        } else {
+            replaced.push_back(sourceText[position]);
+            ++position;
+        }
+    }
+
+    if (replacementCount == 0U) {
+        return 0;
+    }
+
+    SetText(replaced);
+    SetSelection(0, 0);
+    return replacementCount;
+}
+
+bool GtkNotepadApp::GoToLine(int lineNumber, std::wstring& errorMessage)
+{
+    const int maxLine = MaxLine();
+    if (lineNumber < 1 || lineNumber > maxLine) {
+        errorMessage = L"Line number must be between 1 and ";
+        errorMessage += std::to_wstring(maxLine);
+        errorMessage += L".";
+        return false;
+    }
+
+    const std::wstring text = GetText();
+    int currentLine = 1;
+    std::size_t offset = 0;
+    while (currentLine < lineNumber && offset < text.size()) {
+        if (text[offset] == L'\n') {
+            ++currentLine;
+        }
+        ++offset;
+    }
+
+    SetSelection(offset, offset);
+    return true;
+}
+
+void GtkNotepadApp::InsertTimeDate()
+{
+    ReplaceSelection(BuildTimeDateText());
 }
 
 void GtkNotepadApp::SetWordWrap(bool enabled)
@@ -578,6 +1155,40 @@ void GtkNotepadApp::SetStatusBarVisible(bool visible)
 bool GtkNotepadApp::GetStatusBarVisible() const
 {
     return statusBarVisible_;
+}
+
+bool GtkNotepadApp::SetFont(const std::wstring& fontDescription, std::wstring& errorMessage)
+{
+    const std::string utf8Description = Utf8FromWide(fontDescription);
+    if (utf8Description.empty()) {
+        errorMessage = L"Font description cannot be empty.";
+        return false;
+    }
+
+    PangoFontDescription* description = pango_font_description_from_string(utf8Description.c_str());
+    if (description == nullptr || pango_font_description_get_family(description) == nullptr) {
+        if (description != nullptr) {
+            pango_font_description_free(description);
+        }
+        errorMessage = L"Font description is invalid.";
+        return false;
+    }
+
+    char* normalized = pango_font_description_to_string(description);
+    fontDescription_ = normalized != nullptr ? WideFromUtf8(normalized) : fontDescription;
+    if (normalized != nullptr) {
+        g_free(normalized);
+    }
+    pango_font_description_free(description);
+
+    ApplyFont();
+    UpdateStatus();
+    return true;
+}
+
+std::wstring GtkNotepadApp::GetFont() const
+{
+    return fontDescription_;
 }
 
 void GtkNotepadApp::OnBufferChanged()
@@ -609,6 +1220,119 @@ void GtkNotepadApp::OnWindowDestroyed()
     }
 }
 
+std::wstring GtkNotepadApp::BuildTimeDateText() const
+{
+    std::time_t now = std::time(nullptr);
+    std::tm localTime {};
+#if defined(_WIN32)
+    localtime_s(&localTime, &now);
+#else
+    localtime_r(&now, &localTime);
+#endif
+
+    char buffer[128] {};
+    if (std::strftime(buffer, sizeof(buffer), "%H:%M %x", &localTime) == 0U) {
+        return L"";
+    }
+
+    return WideFromUtf8(buffer);
+}
+
+int GtkNotepadApp::CurrentLine() const
+{
+    if (buffer_ == nullptr) {
+        return 1;
+    }
+
+    GtkTextIter cursor;
+    gtk_text_buffer_get_iter_at_mark(buffer_, &cursor, gtk_text_buffer_get_insert(buffer_));
+    return gtk_text_iter_get_line(&cursor) + 1;
+}
+
+int GtkNotepadApp::MaxLine() const
+{
+    const std::wstring text = GetText();
+    int lineCount = 1;
+    for (wchar_t character : text) {
+        if (character == L'\n') {
+            ++lineCount;
+        }
+    }
+
+    return std::max(1, lineCount);
+}
+
+void GtkNotepadApp::ApplyFont()
+{
+    if (textView_ == nullptr) {
+        return;
+    }
+
+    const std::string utf8Description = Utf8FromWide(fontDescription_);
+    PangoFontDescription* description = pango_font_description_from_string(utf8Description.c_str());
+    if (description == nullptr) {
+        return;
+    }
+
+    const char* family = pango_font_description_get_family(description);
+    if (family == nullptr || family[0] == '\0') {
+        pango_font_description_free(description);
+        return;
+    }
+
+    std::string css = ".classic-notepad-editor { font-family: \"";
+    css += EscapeCssString(family);
+    css += "\"; font-size: ";
+    css += CssSizeFromPangoDescription(description);
+    css += "; }";
+    pango_font_description_free(description);
+
+    if (fontProvider_ == nullptr) {
+        fontProvider_ = gtk_css_provider_new();
+        gtk_style_context_add_provider_for_display(
+            gtk_widget_get_display(textView_),
+            GTK_STYLE_PROVIDER(fontProvider_),
+            GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+
+#if GTK_CHECK_VERSION(4, 12, 0)
+    gtk_css_provider_load_from_string(fontProvider_, css.c_str());
+#else
+    gtk_css_provider_load_from_data(fontProvider_, css.c_str(), static_cast<gssize>(css.size()));
+#endif
+    gtk_text_view_set_monospace(GTK_TEXT_VIEW(textView_), FALSE);
+}
+
+void GtkNotepadApp::InstallContextMenu()
+{
+    if (textView_ == nullptr) {
+        return;
+    }
+
+    GMenu* menu = g_menu_new();
+    GMenu* undoSection = g_menu_new();
+    GMenu* clipboardSection = g_menu_new();
+    GMenu* selectSection = g_menu_new();
+
+    g_menu_append(undoSection, "Undo", "win.undo");
+    g_menu_append_section(menu, nullptr, G_MENU_MODEL(undoSection));
+
+    g_menu_append(clipboardSection, "Cut", "win.cut");
+    g_menu_append(clipboardSection, "Copy", "win.copy");
+    g_menu_append(clipboardSection, "Paste", "win.paste");
+    g_menu_append(clipboardSection, "Delete", "win.delete");
+    g_menu_append_section(menu, nullptr, G_MENU_MODEL(clipboardSection));
+
+    g_menu_append(selectSection, "Select All", "win.select-all");
+    g_menu_append_section(menu, nullptr, G_MENU_MODEL(selectSection));
+
+    gtk_text_view_set_extra_menu(GTK_TEXT_VIEW(textView_), G_MENU_MODEL(menu));
+    g_object_unref(selectSection);
+    g_object_unref(clipboardSection);
+    g_object_unref(undoSection);
+    g_object_unref(menu);
+}
+
 void GtkNotepadApp::BuildWindow(GtkApplication* application)
 {
     window_ = gtk_application_window_new(application);
@@ -616,12 +1340,12 @@ void GtkNotepadApp::BuildWindow(GtkApplication* application)
     g_signal_connect(window_, "close-request", G_CALLBACK(OnCloseRequest), this);
     g_signal_connect(window_, "destroy", G_CALLBACK(OnWindowDestroy), this);
 
-    InstallFileActions(*this);
+    InstallAppActions(*this);
 
     GtkWidget* root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_window_set_child(GTK_WINDOW(window_), root);
 
-    GtkWidget* menuBar = CreateFileMenuBar();
+    GtkWidget* menuBar = CreateMenuBar();
     gtk_box_append(GTK_BOX(root), menuBar);
 
     GtkWidget* scrolledWindow = gtk_scrolled_window_new();
@@ -630,13 +1354,18 @@ void GtkNotepadApp::BuildWindow(GtkApplication* application)
     gtk_box_append(GTK_BOX(root), scrolledWindow);
 
     textView_ = gtk_text_view_new();
+    gtk_widget_add_css_class(textView_, "classic-notepad-editor");
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(textView_), TRUE);
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(textView_), wordWrap_ ? GTK_WRAP_WORD_CHAR : GTK_WRAP_NONE);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolledWindow), textView_);
 
     buffer_ = gtk_text_view_get_buffer(GTK_TEXT_VIEW(textView_));
+    gtk_text_buffer_set_enable_undo(buffer_, TRUE);
+    gtk_text_buffer_set_max_undo_levels(buffer_, 100);
     g_signal_connect(buffer_, "changed", G_CALLBACK(OnBufferChangedSignal), this);
     g_signal_connect(buffer_, "notify::cursor-position", G_CALLBACK(OnCursorMovedSignal), this);
+    InstallContextMenu();
+    ApplyFont();
 
     statusBar_ = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_visible(statusBar_, statusBarVisible_);
@@ -659,7 +1388,9 @@ void GtkNotepadApp::SetBufferText(const std::wstring& text, bool markModified)
 
     const std::string utf8Text = Utf8FromWide(text);
     suppressChange_ = true;
+    gtk_text_buffer_begin_irreversible_action(buffer_);
     gtk_text_buffer_set_text(buffer_, utf8Text.c_str(), static_cast<int>(utf8Text.size()));
+    gtk_text_buffer_end_irreversible_action(buffer_);
     GtkTextIter start;
     gtk_text_buffer_get_start_iter(buffer_, &start);
     gtk_text_buffer_place_cursor(buffer_, &start);

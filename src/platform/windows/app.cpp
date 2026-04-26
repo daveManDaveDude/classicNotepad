@@ -681,6 +681,66 @@ HFONT CreateDefaultEditorFont(HWND ownerWindow)
     return CreateFontIndirectW(&logFont);
 }
 
+std::wstring TrimWhitespace(const std::wstring& text)
+{
+    const auto first = std::find_if_not(text.begin(), text.end(), [](wchar_t character) {
+        return std::iswspace(static_cast<wint_t>(character)) != 0;
+    });
+    const auto last = std::find_if_not(text.rbegin(), text.rend(), [](wchar_t character) {
+        return std::iswspace(static_cast<wint_t>(character)) != 0;
+    }).base();
+
+    return first < last ? std::wstring(first, last) : std::wstring();
+}
+
+bool ParseAutomationFontDescription(const std::wstring& fontDescription, std::wstring& faceName, int& pointSize)
+{
+    const std::wstring trimmed = TrimWhitespace(fontDescription);
+    if (trimmed.empty()) {
+        return false;
+    }
+
+    std::size_t sizeEnd = trimmed.size();
+    while (sizeEnd > 0U && std::iswspace(static_cast<wint_t>(trimmed[sizeEnd - 1U])) != 0) {
+        --sizeEnd;
+    }
+
+    std::size_t sizeStart = sizeEnd;
+    while (sizeStart > 0U && std::iswdigit(static_cast<wint_t>(trimmed[sizeStart - 1U])) != 0) {
+        --sizeStart;
+    }
+
+    if (sizeStart == sizeEnd) {
+        return false;
+    }
+
+    const std::wstring sizeText = trimmed.substr(sizeStart, sizeEnd - sizeStart);
+    const long parsedSize = std::wcstol(sizeText.c_str(), nullptr, 10);
+    if (parsedSize < 1 || parsedSize > 144) {
+        return false;
+    }
+
+    faceName = TrimWhitespace(trimmed.substr(0, sizeStart));
+    if (faceName.size() >= LF_FACESIZE || faceName.empty()) {
+        return false;
+    }
+
+    pointSize = static_cast<int>(parsedSize);
+    return true;
+}
+
+int PointSizeFromLogFont(HWND ownerWindow, const LOGFONTW& logFont)
+{
+    HDC deviceContext = GetDC(ownerWindow);
+    const int dpiY = deviceContext != nullptr ? std::max(1, GetDeviceCaps(deviceContext, LOGPIXELSY)) : 96;
+    if (deviceContext != nullptr) {
+        ReleaseDC(ownerWindow, deviceContext);
+    }
+
+    const int pixelHeight = std::max(1, static_cast<int>(logFont.lfHeight < 0 ? -logFont.lfHeight : logFont.lfHeight));
+    return std::max(1, MulDiv(pixelHeight, 72, dpiY));
+}
+
 bool IsFontFamilyAvailable(HDC deviceContext, const wchar_t* faceName)
 {
     if (deviceContext == nullptr || faceName == nullptr || faceName[0] == L'\0') {
@@ -5020,6 +5080,67 @@ void ClassicNotepadApp::AutomationSetStatusBarVisible(bool visible)
 bool ClassicNotepadApp::AutomationGetStatusBarVisible() const
 {
     return statusBarVisible_;
+}
+
+bool ClassicNotepadApp::AutomationSetFont(const std::wstring& fontDescription, std::wstring& errorMessage)
+{
+    std::wstring faceName;
+    int pointSize = 0;
+    if (!ParseAutomationFontDescription(fontDescription, faceName, pointSize)) {
+        errorMessage = L"Font description must use '<face name> <point size>'.";
+        return false;
+    }
+
+    HDC deviceContext = GetDC(mainWindow_);
+    const int dpiY = deviceContext != nullptr ? std::max(1, GetDeviceCaps(deviceContext, LOGPIXELSY)) : 96;
+    if (deviceContext != nullptr) {
+        ReleaseDC(mainWindow_, deviceContext);
+    }
+
+    LOGFONTW logFont{};
+    logFont.lfHeight = -MulDiv(pointSize, dpiY, 72);
+    logFont.lfWeight = FW_NORMAL;
+    logFont.lfCharSet = DEFAULT_CHARSET;
+    logFont.lfOutPrecision = OUT_DEFAULT_PRECIS;
+    logFont.lfClipPrecision = CLIP_DEFAULT_PRECIS;
+    logFont.lfQuality = CLEARTYPE_QUALITY;
+    logFont.lfPitchAndFamily = DEFAULT_PITCH;
+    wcscpy_s(logFont.lfFaceName, faceName.c_str());
+
+    HFONT newFont = CreateFontIndirectW(&logFont);
+    if (newFont == nullptr) {
+        errorMessage = L"The selected font could not be created.";
+        return false;
+    }
+
+    HFONT oldFont = editorFont_;
+    const bool ownedOldFont = ownsEditorFont_;
+    editorFont_ = newFont;
+    ownsEditorFont_ = true;
+    SendMessageW(editor_, WM_SETFONT, reinterpret_cast<WPARAM>(editorFont_), TRUE);
+    if (ownedOldFont && oldFont != nullptr) {
+        DeleteObject(oldFont);
+    }
+
+    InvalidateWidestLineCache();
+    ResizeEditor();
+    UpdateStatusBar();
+    UpdateScrollBars();
+    InvalidateRect(editor_, nullptr, FALSE);
+    return true;
+}
+
+std::wstring ClassicNotepadApp::AutomationGetFont() const
+{
+    LOGFONTW logFont{};
+    if (editorFont_ == nullptr || GetObjectW(editorFont_, sizeof(logFont), &logFont) == 0) {
+        return std::wstring(kDefaultEditorFontFace) + L" " + std::to_wstring(kDefaultEditorFontPointSize);
+    }
+
+    std::wstring description(logFont.lfFaceName);
+    description += L" ";
+    description += std::to_wstring(PointSizeFromLogFont(mainWindow_, logFont));
+    return description;
 }
 
 bool ClassicNotepadApp::AutomationSpellCheckAvailable() const

@@ -511,7 +511,7 @@ std::string BuildCapabilitiesObject()
            << ",\"nativeUi\":\"gtk4\""
            << ",\"printing\":false"
            << ",\"pageSetup\":false"
-           << ",\"fontChooser\":false"
+           << ",\"fontChooser\":true"
            << ",\"spellCheck\":false"
            << ",\"darkMode\":false"
            << "}";
@@ -669,6 +669,11 @@ std::string HandleCommand(GtkNotepadApp& app, std::wstring& testClipboard, const
         return ResponseWriter(id, true).Finish();
     }
 
+    if (name == L"undo") {
+        app.Undo();
+        return ResponseWriter(id, true).Finish();
+    }
+
     if (name == L"copy") {
         testClipboard = SelectedText(app);
         return ResponseWriter(id, true).Finish();
@@ -687,6 +692,87 @@ std::string HandleCommand(GtkNotepadApp& app, std::wstring& testClipboard, const
 
     if (name == L"deleteSelection") {
         app.DeleteSelection();
+        return ResponseWriter(id, true).Finish();
+    }
+
+    if (name == L"find" || name == L"findNext") {
+        std::wstring text;
+        const bool matchCase = GetBool(request, "matchCase", false);
+        const bool wholeWord = GetBool(request, "wholeWord", false);
+        const bool searchDown = GetBool(request, "searchDown", true);
+        bool found = false;
+
+        if (name == L"find") {
+            if (!RequireString(request, "text", text, errorMessage)) {
+                return BuildErrorResponse(id, errorMessage);
+            }
+
+            found = app.Find(text, matchCase, wholeWord, searchDown);
+        } else {
+            found = app.FindNext(matchCase, wholeWord, searchDown);
+        }
+
+        ResponseWriter response(id, true);
+        response.AddBool("found", found);
+        response.AddRaw("selection", BuildSelectionObject(app.GetSelection()));
+        return response.Finish();
+    }
+
+    if (name == L"replace") {
+        std::wstring text;
+        std::wstring replacement;
+        if (!RequireString(request, "text", text, errorMessage) ||
+            !RequireString(request, "replacement", replacement, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        const bool replaced = app.Replace(
+            text,
+            replacement,
+            GetBool(request, "matchCase", false),
+            GetBool(request, "wholeWord", false),
+            GetBool(request, "searchDown", true));
+        ResponseWriter response(id, true);
+        response.AddBool("replaced", replaced);
+        response.AddRaw("selection", BuildSelectionObject(app.GetSelection()));
+        return response.Finish();
+    }
+
+    if (name == L"replaceAll") {
+        std::wstring text;
+        std::wstring replacement;
+        if (!RequireString(request, "text", text, errorMessage) ||
+            !RequireString(request, "replacement", replacement, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        const std::size_t count = app.ReplaceAll(
+            text,
+            replacement,
+            GetBool(request, "matchCase", false),
+            GetBool(request, "wholeWord", false));
+        ResponseWriter response(id, true);
+        response.AddNumber("count", static_cast<long long>(count));
+        return response.Finish();
+    }
+
+    if (name == L"goToLine") {
+        long long lineNumber = 0;
+        if (!RequireNumber(request, "line", lineNumber, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        if (!app.GoToLine(static_cast<int>(lineNumber), errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        ResponseWriter response(id, true);
+        response.AddRaw("selection", BuildSelectionObject(app.GetSelection()));
+        return response.Finish();
+    }
+
+    if (name == L"insertTimeDate") {
+        app.InsertTimeDate();
         return ResponseWriter(id, true).Finish();
     }
 
@@ -709,6 +795,25 @@ std::string HandleCommand(GtkNotepadApp& app, std::wstring& testClipboard, const
     if (name == L"getStatusBarVisible") {
         ResponseWriter response(id, true);
         response.AddBool("visible", app.GetStatusBarVisible());
+        return response.Finish();
+    }
+
+    if (name == L"setFont") {
+        std::wstring font;
+        if (!RequireString(request, "font", font, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        if (!app.SetFont(font, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        return ResponseWriter(id, true).Finish();
+    }
+
+    if (name == L"getFont") {
+        ResponseWriter response(id, true);
+        response.AddString("font", app.GetFont());
         return response.Finish();
     }
 

@@ -838,6 +838,25 @@ std::string HandleCommand(ClassicNotepadApp& app, const JsonObject& request, boo
         return response.Finish();
     }
 
+    if (name == L"setFont") {
+        std::wstring font;
+        if (!RequireString(request, "font", font, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        if (!app.AutomationSetFont(font, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        return ResponseWriter(id, true).Finish();
+    }
+
+    if (name == L"getFont") {
+        ResponseWriter response(id, true);
+        response.AddString("font", app.AutomationGetFont());
+        return response.Finish();
+    }
+
     if (name == L"close") {
         shouldClose = true;
         return ResponseWriter(id, true).Finish();

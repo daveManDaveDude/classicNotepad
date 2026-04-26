@@ -6,7 +6,7 @@ namespace classic_notepad::linux_ui {
 
 class GtkNotepadApp;
 
-void InstallFileActions(GtkNotepadApp& app);
-GtkWidget* CreateFileMenuBar();
+void InstallAppActions(GtkNotepadApp& app);
+GtkWidget* CreateMenuBar();
 
 } // namespace classic_notepad::linux_ui
