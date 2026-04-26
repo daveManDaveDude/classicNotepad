@@ -1,7 +1,7 @@
 # Cross-Platform Spelling And Dark Mode Plan
 
 Date: 2026-04-26  
-Status: proposed implementation plan.
+Status: active implementation plan; Phases 4, 5, and 6 completed for the current source tree on 2026-04-26.
 
 ## Purpose
 
@@ -222,6 +222,15 @@ CLASSIC_NOTEPAD_THEME=dark
 
 This keeps WSL validation independent of hidden desktop or WSL configuration.
 
+Implementation completed 2026-04-26:
+
+- Added `src/appearance.*` with shared parsing, labels, and dark-mode resolution for `System`, `Light`, and `Dark`.
+- Invalid `CLASSIC_NOTEPAD_THEME` values fall back to `System`.
+- Windows, Linux, and macOS helper code use the shared model.
+- Automation reports `appearanceTheme`, `effectiveAppearance`, `darkMode`, and `highContrast`.
+- Automation supports `getAppearance` and `setAppearanceTheme`.
+- Core tests cover parsing, invalid values, labels, and high-contrast resolution.
+
 ## Phase 5: macOS Dark Mode
 
 Deliverables:
@@ -236,6 +245,14 @@ Acceptance checks:
 - System dark mode is followed.
 - Forced `CLASSIC_NOTEPAD_THEME=dark` works without changing global macOS settings.
 - Selection, caret, misspelling underlines, status text, and disabled menu items are readable.
+
+Implementation completed 2026-04-26:
+
+- Added `src/platform/macos/mac_appearance.*`.
+- The helper applies `System`, `Light`, and `Dark` through AppKit `NSAppearance` at application or window scope.
+- Plain `NSTextView` appearance uses semantic AppKit colors: `textBackgroundColor`, `textColor`, and text-color insertion point.
+- `tests/macos_spelling_compile.mm` now compiles both spelling and appearance helper paths.
+- The repository still does not contain the full macOS editor target, so editor-wide macOS visual verification remains tied to future macOS adapter bring-up.
 
 ## Phase 6: Linux Dark Mode
 
@@ -254,6 +271,15 @@ Acceptance checks:
 - `CLASSIC_NOTEPAD_THEME=system` follows the desktop when available.
 - High-contrast themes are not overridden with unreadable custom colors.
 - GTK file/font/print dialogs remain usable.
+
+Implementation completed 2026-04-26:
+
+- `ClassicNotepadGtk` reads `CLASSIC_NOTEPAD_THEME` and applies `classic-light` or `classic-dark` CSS classes at the app root.
+- The GTK CSS provider styles the editor, status bar, and menu bar with explicit Notepad-compatible light/dark colors.
+- `System` reads `GtkSettings:gtk-interface-color-scheme` when available, falls back to `gtk-application-prefer-dark-theme`, then dark GTK theme names.
+- High-contrast GTK theme names suppress forced custom light/dark colors and are reported through automation.
+- The View menu now includes an Appearance submenu with System, Light, and Dark commands.
+- The shared automation suite covers dark, light, system, invalid environment values, and runtime `setAppearanceTheme`.
 
 ## Phase 7: Build And Test Without Hidden WSL Config
 
@@ -292,6 +318,7 @@ Automated:
 - Linux compile test with spelling enabled.
 - Linux compile test with spelling disabled or dependency missing.
 - Theme-state unit tests for `System`, `Light`, `Dark`, and invalid env values.
+- Windows and Linux automation tests for `CLASSIC_NOTEPAD_THEME=system|light|dark`, invalid fallback, and runtime theme switching.
 
 Manual:
 
@@ -310,17 +337,19 @@ Manual:
 4. Spike `libspelling` in a small Linux test target.
 5. Add macOS spelling through `NSTextView`/`NSSpellChecker`.
 6. Add Linux spelling UI integration.
-7. Add the shared appearance state and test override.
-8. Add macOS dark-mode polish.
-9. Add Linux CSS-based dark mode.
+7. Add the shared appearance state and test override. Completed 2026-04-26.
+8. Add macOS dark-mode polish. Completed 2026-04-26 as an AppKit helper; full macOS editor verification remains future adapter work.
+9. Add Linux CSS-based dark mode. Completed 2026-04-26.
 10. Run the full test matrix on Windows, macOS, Ubuntu desktop, and WSL.
 
 ## Open Questions
 
-- Should Linux use `GtkSourceView` for the main editor from the start, or only switch if the `libspelling` adapter requires it?
-- Should spelling be enabled by default on all platforms when the dictionary exists, or should there be a View/Format toggle?
-- Should the app prefer GB English only, or select the user's language with GB English as the project parity test?
-- Should the first automated visual dark-mode check use screenshots, accessibility color checks, or both?
+Resolved 2026-04-26:
+
+- Linux should stay on the current text-view path unless the `libspelling` adapter requires `GtkSourceView`. The current implementation already supports optional spelling and dark-mode CSS without turning on editor extras.
+- Spelling should be enabled by default when the requested backend and dictionary exist. Missing backend/dictionary remains a capability state, not an error.
+- The app should prefer GB English for parity tests and current product behavior. User-language selection is a future preference feature, not part of this pass.
+- The first automated dark-mode check is semantic automation: appearance state, effective appearance, invalid fallback, and runtime switching. Screenshot and accessibility color checks should be added later as a visual smoke layer, with accessibility contrast checks preferred before brittle pixel assertions.
 
 ## References
 

@@ -125,6 +125,21 @@ void OnStatusBarChangeState(GSimpleAction*, GVariant* value, gpointer userData)
     static_cast<GtkNotepadApp*>(userData)->SetStatusBarVisible(g_variant_get_boolean(value) != FALSE);
 }
 
+void OnAppearanceSystem(GSimpleAction*, GVariant*, gpointer userData)
+{
+    static_cast<GtkNotepadApp*>(userData)->SetAppearanceTheme(classic_notepad::AppearanceTheme::System);
+}
+
+void OnAppearanceLight(GSimpleAction*, GVariant*, gpointer userData)
+{
+    static_cast<GtkNotepadApp*>(userData)->SetAppearanceTheme(classic_notepad::AppearanceTheme::Light);
+}
+
+void OnAppearanceDark(GSimpleAction*, GVariant*, gpointer userData)
+{
+    static_cast<GtkNotepadApp*>(userData)->SetAppearanceTheme(classic_notepad::AppearanceTheme::Dark);
+}
+
 void OnAbout(GSimpleAction*, GVariant*, gpointer userData)
 {
     static_cast<GtkNotepadApp*>(userData)->HandleAbout();
@@ -152,6 +167,9 @@ const GActionEntry kActions[] = {
     {"word-wrap", OnWordWrap, nullptr, nullptr, nullptr},
     {"font", OnFont, nullptr, nullptr, nullptr},
     {"status-bar", OnStatusBar, nullptr, "true", OnStatusBarChangeState},
+    {"appearance-system", OnAppearanceSystem, nullptr, nullptr, nullptr},
+    {"appearance-light", OnAppearanceLight, nullptr, nullptr, nullptr},
+    {"appearance-dark", OnAppearanceDark, nullptr, nullptr, nullptr},
     {"about", OnAbout, nullptr, nullptr, nullptr},
 };
 
@@ -204,6 +222,7 @@ GtkWidget* CreateMenuBar()
     GMenu* editOtherSection = g_menu_new();
     GMenu* formatMenu = g_menu_new();
     GMenu* viewMenu = g_menu_new();
+    GMenu* appearanceMenu = g_menu_new();
     GMenu* helpMenu = g_menu_new();
 
     g_menu_append(filePrimarySection, "New", "win.new");
@@ -242,6 +261,10 @@ GtkWidget* CreateMenuBar()
     g_menu_append(formatMenu, "Font...", "win.font");
 
     g_menu_append(viewMenu, "Status Bar", "win.status-bar");
+    g_menu_append(appearanceMenu, "System", "win.appearance-system");
+    g_menu_append(appearanceMenu, "Light", "win.appearance-light");
+    g_menu_append(appearanceMenu, "Dark", "win.appearance-dark");
+    g_menu_append_submenu(viewMenu, "Appearance", G_MENU_MODEL(appearanceMenu));
     g_menu_append(helpMenu, "About Classic Notepad", "win.about");
 
     g_menu_append_submenu(bar, "File", G_MENU_MODEL(fileMenu));
@@ -252,6 +275,7 @@ GtkWidget* CreateMenuBar()
 
     GtkWidget* menuBar = gtk_popover_menu_bar_new_from_model(G_MENU_MODEL(bar));
     g_object_unref(helpMenu);
+    g_object_unref(appearanceMenu);
     g_object_unref(viewMenu);
     g_object_unref(formatMenu);
     g_object_unref(editOtherSection);

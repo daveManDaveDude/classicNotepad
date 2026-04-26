@@ -586,6 +586,23 @@ std::wstring SpellCapabilityName(classic_notepad::SpellCapability capability)
     return classic_notepad::SpellCapabilityLabel(capability);
 }
 
+std::wstring JsonAppearanceThemeName(classic_notepad::AppearanceTheme theme)
+{
+    return WideFromUtf8(classic_notepad::AppearanceThemeName(theme));
+}
+
+std::string BuildAppearanceObject(const GtkNotepadApp& app)
+{
+    std::ostringstream output;
+    output << "{"
+           << "\"theme\":" << EscapeJsonString(JsonAppearanceThemeName(app.AppearanceTheme()))
+           << ",\"effectiveAppearance\":" << EscapeJsonString(WideFromUtf8(app.DarkModeEnabled() ? "dark" : "light"))
+           << ",\"darkMode\":" << (app.DarkModeEnabled() ? "true" : "false")
+           << ",\"highContrast\":" << (app.HighContrastThemeActive() ? "true" : "false")
+           << "}";
+    return output.str();
+}
+
 std::string BuildCapabilitiesObject(const GtkNotepadApp& app)
 {
     const classic_notepad::SpellCapability capability = app.SpellCheckCapability();
@@ -599,7 +616,10 @@ std::string BuildCapabilitiesObject(const GtkNotepadApp& app)
            << ",\"spellCheck\":" << (app.SpellCheckAvailable() ? "true" : "false")
            << ",\"spellCapability\":" << EscapeJsonString(SpellCapabilityName(capability))
            << ",\"spellLanguage\":" << EscapeJsonString(app.SpellCheckLanguage())
-           << ",\"darkMode\":false"
+           << ",\"darkMode\":" << (app.DarkModeEnabled() ? "true" : "false")
+           << ",\"appearanceTheme\":" << EscapeJsonString(JsonAppearanceThemeName(app.AppearanceTheme()))
+           << ",\"effectiveAppearance\":" << EscapeJsonString(WideFromUtf8(app.DarkModeEnabled() ? "dark" : "light"))
+           << ",\"highContrast\":" << (app.HighContrastThemeActive() ? "true" : "false")
            << "}";
     return output.str();
 }
@@ -640,6 +660,30 @@ std::string HandleCommand(GtkNotepadApp& app, std::wstring& testClipboard, const
     if (name == L"getCapabilities") {
         ResponseWriter response(id, true);
         response.AddRaw("capabilities", BuildCapabilitiesObject(app));
+        return response.Finish();
+    }
+
+    if (name == L"getAppearance") {
+        ResponseWriter response(id, true);
+        response.AddRaw("appearance", BuildAppearanceObject(app));
+        return response.Finish();
+    }
+
+    if (name == L"setAppearanceTheme") {
+        std::wstring themeText;
+        if (!RequireString(request, "theme", themeText, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        const std::optional<classic_notepad::AppearanceTheme> theme =
+            classic_notepad::TryParseAppearanceTheme(Utf8FromWide(themeText));
+        if (!theme.has_value()) {
+            return BuildErrorResponse(id, L"Appearance theme must be system, light, or dark.");
+        }
+
+        app.SetAppearanceTheme(*theme);
+        ResponseWriter response(id, true);
+        response.AddRaw("appearance", BuildAppearanceObject(app));
         return response.Finish();
     }
 

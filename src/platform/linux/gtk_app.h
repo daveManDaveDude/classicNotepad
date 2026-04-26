@@ -1,5 +1,6 @@
 #pragma once
 
+#include "appearance.h"
 #include "document.h"
 #include "spelling.h"
 
@@ -139,6 +140,11 @@ public:
     bool SetPageMargins(const AutomationPageMargins& margins, std::wstring& errorMessage);
     AutomationPageMargins GetPageMargins() const;
     bool PrintToTestSink(const std::wstring& path, std::wstring& errorMessage) const;
+    classic_notepad::AppearanceTheme AppearanceTheme() const;
+    bool DarkModeEnabled() const;
+    bool HighContrastThemeActive() const;
+    void SetAppearanceTheme(classic_notepad::AppearanceTheme theme);
+    void RefreshAppearanceFromSystem();
     classic_notepad::SpellCapability SpellCheckCapability() const;
     std::wstring SpellCheckLanguage() const;
     bool SpellCheckAvailable() const;
@@ -164,6 +170,10 @@ private:
     int CurrentLine() const;
     int MaxLine() const;
     void ApplyFont();
+    void ApplyAppearance();
+    void EnsureThemeProvider();
+    bool SystemPrefersDark() const;
+    bool DetectHighContrastTheme() const;
     void InstallContextMenu();
     GtkPageSetup* EnsurePageSetup();
     GtkPrintSettings* EnsurePrintSettings();
@@ -182,12 +192,14 @@ private:
 
     GtkApplication* application_ = nullptr;
     GtkWidget* window_ = nullptr;
+    GtkWidget* root_ = nullptr;
     GtkWidget* menuBar_ = nullptr;
     GtkWidget* textView_ = nullptr;
     GtkTextBuffer* buffer_ = nullptr;
     GtkWidget* statusBar_ = nullptr;
     GtkWidget* statusLabel_ = nullptr;
     GtkCssProvider* fontProvider_ = nullptr;
+    GtkCssProvider* themeProvider_ = nullptr;
     GtkPageSetup* pageSetup_ = nullptr;
     GtkPrintSettings* printSettings_ = nullptr;
 
@@ -200,6 +212,9 @@ private:
     bool automationVisible_ = false;
     bool wordWrap_ = false;
     bool statusBarVisible_ = true;
+    classic_notepad::AppearanceTheme appearanceTheme_ = classic_notepad::AppearanceTheme::System;
+    bool darkModeEnabled_ = false;
+    bool highContrastThemeActive_ = false;
     AutomationPageMargins pageMargins_;
 };
 

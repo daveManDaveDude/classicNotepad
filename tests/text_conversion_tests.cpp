@@ -1,4 +1,5 @@
 #include "document.h"
+#include "appearance.h"
 #include "encoding.h"
 #include "line_endings.h"
 #include "spelling.h"
@@ -397,6 +398,47 @@ void TestSpellCapabilityLabels()
         "Disabled build spell capability label formats");
 }
 
+void TestAppearanceThemeParsing()
+{
+    using classic_notepad::AppearanceTheme;
+
+    Expect(
+        classic_notepad::TryParseAppearanceTheme("system").value_or(AppearanceTheme::Dark) == AppearanceTheme::System,
+        "System appearance value parses");
+    Expect(
+        classic_notepad::TryParseAppearanceTheme(" light ").value_or(AppearanceTheme::Dark) == AppearanceTheme::Light,
+        "Light appearance value parses with whitespace");
+    Expect(
+        classic_notepad::TryParseAppearanceTheme("DARK").value_or(AppearanceTheme::System) == AppearanceTheme::Dark,
+        "Dark appearance value parses case-insensitively");
+    Expect(
+        !classic_notepad::TryParseAppearanceTheme("sepia").has_value(),
+        "Invalid appearance values are rejected");
+    Expect(
+        classic_notepad::ParseAppearanceThemeOrSystem("sepia") == AppearanceTheme::System,
+        "Invalid appearance override falls back to System");
+
+    ExpectText(classic_notepad::AppearanceThemeLabel(AppearanceTheme::System), L"System", "System label formats");
+    ExpectText(classic_notepad::AppearanceThemeLabel(AppearanceTheme::Light), L"Light", "Light label formats");
+    ExpectText(classic_notepad::AppearanceThemeLabel(AppearanceTheme::Dark), L"Dark", "Dark label formats");
+
+    Expect(
+        std::string(classic_notepad::AppearanceThemeName(AppearanceTheme::System)) == "system",
+        "System JSON name formats");
+    Expect(
+        std::string(classic_notepad::AppearanceThemeName(AppearanceTheme::Light)) == "light",
+        "Light JSON name formats");
+    Expect(
+        std::string(classic_notepad::AppearanceThemeName(AppearanceTheme::Dark)) == "dark",
+        "Dark JSON name formats");
+
+    Expect(!classic_notepad::ResolveDarkMode(AppearanceTheme::Light, true, false), "Light override disables dark");
+    Expect(classic_notepad::ResolveDarkMode(AppearanceTheme::Dark, false, false), "Dark override enables dark");
+    Expect(classic_notepad::ResolveDarkMode(AppearanceTheme::System, true, false), "System follows dark preference");
+    Expect(!classic_notepad::ResolveDarkMode(AppearanceTheme::System, false, false), "System follows light preference");
+    Expect(!classic_notepad::ResolveDarkMode(AppearanceTheme::Dark, true, true), "High contrast suppresses forced dark");
+}
+
 } // namespace
 
 int main()
@@ -412,6 +454,7 @@ int main()
     TestSpellWordExpansion();
     TestSpellRangeOverlap();
     TestSpellCapabilityLabels();
+    TestAppearanceThemeParsing();
 
     if (g_failureCount != 0) {
         std::cerr << g_failureCount << " test failure(s).\n";

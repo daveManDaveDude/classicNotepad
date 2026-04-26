@@ -88,11 +88,19 @@ cd /mnt/c/vibe/classicNotepad
 
 WSLg is required to display the GTK window from WSL. Automation mode can run headless enough for the semantic suite, but manual UI checks need a working Linux desktop display.
 
+To force a deterministic app appearance without changing WSL or desktop theme configuration:
+
+```bash
+CLASSIC_NOTEPAD_THEME=system ./build-ubuntu/ClassicNotepadGtk
+CLASSIC_NOTEPAD_THEME=light ./build-ubuntu/ClassicNotepadGtk
+CLASSIC_NOTEPAD_THEME=dark ./build-ubuntu/ClassicNotepadGtk
+```
+
 ## Current Linux Capability Notes
 
 - File/edit/find/replace/go-to/format/view/status/printing workflows are covered by the shared automation suite.
 - Linux spell checking is available when CMake finds `libspelling-1` and Ubuntu has the GB Hunspell dictionary installed. If the backend or dictionary is absent, `getCapabilities` reports a non-available `spellCapability`, and spelling commands return graceful unavailable responses.
-- Linux dark mode is out of v1 parity scope. `getCapabilities` reports `darkMode: false`.
+- Linux dark mode is available through the shared appearance state. `getCapabilities` reports `appearanceTheme`, `effectiveAppearance`, `darkMode`, and `highContrast`; high-contrast GTK themes suppress custom light/dark colors.
 
 ## Troubleshooting
 

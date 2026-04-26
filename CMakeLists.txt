@@ -31,6 +31,8 @@ configure_file(
 
 set(CLASSIC_NOTEPAD_SHARED_CORE_SOURCES
     src/ansi_encoding.h
+    src/appearance.cpp
+    src/appearance.h
     src/document.cpp
     src/document.h
     src/encoding.cpp
@@ -230,6 +232,8 @@ if(APPLE)
     enable_language(OBJCXX)
 
     add_library(ClassicNotepadMacSpelling STATIC
+        src/platform/macos/mac_appearance.h
+        src/platform/macos/mac_appearance.mm
         src/platform/macos/mac_spelling.h
         src/platform/macos/mac_spelling.mm
     )
@@ -241,6 +245,7 @@ if(APPLE)
     )
 
     target_link_libraries(ClassicNotepadMacSpelling PUBLIC
+        ClassicNotepadCore
         "-framework AppKit"
     )
 

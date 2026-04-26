@@ -30,6 +30,7 @@ The project is built with C++17, Win32, CMake, and the free Visual Studio C++ Bu
 - Print uses the standard Windows print dialog and sends plain Unicode text through GDI using the selected editor font.
 - Automatic dark-mode matching for the main window, editor, status bar, menu bar, resize grip, and scrollbars.
 - Custom dark-mode menu bar and scrollbars so the app remains readable when Windows is in dark mode.
+- Shared `System` / `Light` / `Dark` appearance state with `CLASSIC_NOTEPAD_THEME` test override.
 - Windows spell checking for British English (`en-GB`) when that language is installed.
 - Spell checking runs over the visible editor region, draws red wavy underlines, and offers right-click suggestions.
 - Spell check context actions include suggestions, Ignore Once, and Add to Dictionary.
@@ -51,7 +52,7 @@ The Linux target builds as `ClassicNotepadGtk` on Ubuntu/WSL with GTK4. It now c
 Accepted Linux v1 capability differences:
 
 - Spell checking is optional on Linux. With `libspelling-1-dev` and `hunspell-en-gb`, `getCapabilities` reports `spellCheck: true`; without them, spelling commands return graceful unavailable results.
-- Dark mode is out of the cross-platform v1 scope. `getCapabilities` reports `darkMode: false`.
+- Dark mode is implemented through the shared appearance state. Set `CLASSIC_NOTEPAD_THEME=system`, `CLASSIC_NOTEPAD_THEME=light`, or `CLASSIC_NOTEPAD_THEME=dark`; `getCapabilities` reports `appearanceTheme`, `effectiveAppearance`, `darkMode`, and `highContrast`.
 
 ## Text File Behavior
 
@@ -173,6 +174,13 @@ cd /mnt/c/vibe/classicNotepad
 ./build-ubuntu/ClassicNotepadGtk
 ```
 
+Force a deterministic Linux appearance without changing desktop or WSL settings:
+
+```bash
+CLASSIC_NOTEPAD_THEME=dark ./build-ubuntu/ClassicNotepadGtk
+CLASSIC_NOTEPAD_THEME=light ./build-ubuntu/ClassicNotepadGtk
+```
+
 You can pass a first file path argument to open it through the shared document loader:
 
 ```bash
@@ -269,6 +277,7 @@ src/
   document.cpp, document.h       Document path, modified state, load/save behavior
   encoding.cpp, encoding.h       UTF-8, UTF-16 LE, and ANSI conversion
   line_endings.cpp, .h           Line-ending detection and conversion
+  appearance.cpp, .h             Shared System/Light/Dark appearance state
   text_metadata.cpp, .h          Shared status metadata labels and character counts
   spell_text_utils.cpp, .h       Word range and spelling range helpers
   file_io.h, ansi_encoding.h     Platform seams used by the shared core
@@ -281,12 +290,15 @@ src/
       resources.rc, resource.h   Menus, accelerators, dialogs, and version/icon resources
       win32_platform.h           Common Win32 compile definitions
     linux/
-      gtk_app.cpp, .h            GTK application, menus, dialogs, editor, printing, status, and About UI
+      gtk_app.cpp, .h            GTK application, menus, dialogs, editor, printing, status, appearance, and About UI
       gtk_actions.cpp, .h        GTK action and menu wiring
       gtk_automation.cpp, .h     Linux JSON-lines automation controller
       gtk_dialogs.cpp, .h        GTK file, find, replace, go-to, font, error, and About dialogs
       gtk_main.cpp               GTK entry point
       gtk_spelling.cpp, .h       Optional GTK/libspelling British English spell service
+    macos/
+      mac_appearance.mm, .h      AppKit appearance override and semantic text-view colors
+      mac_spelling.mm, .h        AppKit spelling configuration helpers
 
 assets/
   icons/                     Application icon resources

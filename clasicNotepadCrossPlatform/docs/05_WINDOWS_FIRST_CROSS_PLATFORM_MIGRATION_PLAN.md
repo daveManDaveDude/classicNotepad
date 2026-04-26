@@ -16,7 +16,7 @@ The near-term success condition is not a macOS or Linux GUI. It is a Windows bui
 - Keep document, encoding, line-ending, and text helper behavior in shared C++.
 - Avoid Electron/WebView/heavy cross-platform UI frameworks.
 - Preserve the current single-document plain-text workflow.
-- Dark mode is out of scope for cross-platform v1, even though the current Windows app already has it.
+- Dark mode was excluded from the original v1 scope, but the spelling/dark-mode follow-up has now added a shared appearance state and deterministic test override.
 - Spell checking remains platform-specific and optional outside Windows/macOS.
 
 ## Migration Principles
@@ -123,11 +123,14 @@ Ubuntu/WSL checkpoint:
 - CMake, Ninja, `pkg-config`, Python 3, and GTK4 development packages installed through Ubuntu package manager.
 - Build directory: `build-ubuntu/`.
 - Release-style build directory: `build-ubuntu-release/`.
-- Current Ubuntu target coverage: `ClassicNotepadCore`, `TextConversionTests`, and feature-parity `ClassicNotepadGtk`.
-- Expected Ubuntu CTest target: `TextConversionTests`.
+- Current Ubuntu target coverage: `ClassicNotepadCore`, `TextConversionTests`, `LinuxSpellingProbe` when available, and feature-parity `ClassicNotepadGtk`.
+- Expected Ubuntu CTest targets: `TextConversionTests` and `LinuxSpellingProbe` when `libspelling-1` is available.
 - The Windows GUI target is intentionally not built on Ubuntu.
 - The GTK target currently provides native File/Edit/Format/View/Help menus, file workflow, edit commands, find/replace/go-to, word wrap, font metadata, status bar, About dialog, page setup, print, optional GTK/libspelling spell checking, and automation coverage.
 - Linux spell checking is enabled when `libspelling-1` and the GB Hunspell dictionary are present. Missing backend or dictionary states report graceful unavailable responses.
+- Shared appearance state is implemented for `System`, `Light`, and `Dark`.
+- Windows keeps its existing custom dark-mode drawing and now honors `CLASSIC_NOTEPAD_THEME`.
+- Linux applies `classic-light` / `classic-dark` GTK CSS classes and honors `CLASSIC_NOTEPAD_THEME`.
 
 Detailed Linux setup instructions are maintained in `../../docs/LINUX_BUILD_ENVIRONMENT.md`.
 

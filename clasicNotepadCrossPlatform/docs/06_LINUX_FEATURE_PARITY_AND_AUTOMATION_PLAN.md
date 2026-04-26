@@ -41,12 +41,13 @@ Completed so far:
   - Help > About Classic Notepad
   - automation `pageSetup` and `printToTestSink` commands for deterministic print validation
   - spell-check automation capability reporting, with optional GTK/libspelling support when available
+  - shared appearance automation capability reporting and `CLASSIC_NOTEPAD_THEME` override support
   - shared JSON-lines automation coverage through phase 10
 
 Accepted v1 platform differences in `ClassicNotepadGtk` before the spelling parity follow-up:
 
 - Linux spell checking was initially unavailable in v1. The follow-up spelling phase enables optional `libspelling` support while preserving graceful unavailable results when the backend or dictionary is missing.
-- Linux dark mode is out of cross-platform v1 scope. The app reports `darkMode == false`.
+- Linux dark mode is available through the shared appearance state. The app reports `appearanceTheme`, `effectiveAppearance`, `darkMode`, and `highContrast`.
 
 ## Definition Of Done
 
@@ -242,6 +243,8 @@ Initial required commands:
 - `getFont`
 - `pageSetup`
 - `printToTestSink`
+- `getAppearance`
+- `setAppearanceTheme`
 - `close`
 
 Capability response example:
@@ -257,7 +260,10 @@ Capability response example:
     "pageSetup": true,
     "fontChooser": true,
     "spellCheck": true,
-    "darkMode": true
+    "darkMode": true,
+    "appearanceTheme": "dark",
+    "effectiveAppearance": "dark",
+    "highContrast": false
   }
 }
 ```
@@ -272,7 +278,10 @@ Linux v1 may report:
   "pageSetup": true,
   "fontChooser": true,
   "spellCheck": false,
-  "darkMode": false
+  "darkMode": true,
+  "appearanceTheme": "dark",
+  "effectiveAppearance": "dark",
+  "highContrast": false
 }
 ```
 
@@ -293,6 +302,7 @@ tests/automation/
   test_format_view_status.py
   test_printing.py
   test_spell_capability.py
+  test_appearance_theme.py
   fixtures/
 ```
 
@@ -402,6 +412,15 @@ Tests:
 - If unavailable:
   - app remains usable.
   - spelling commands return a graceful unavailable result.
+
+### Appearance Tests
+
+- `getCapabilities` reports `appearanceTheme`, `effectiveAppearance`, `darkMode`, and `highContrast`.
+- `CLASSIC_NOTEPAD_THEME=dark` reports a dark effective appearance unless high contrast suppresses custom colors.
+- `CLASSIC_NOTEPAD_THEME=light` reports a light effective appearance.
+- `CLASSIC_NOTEPAD_THEME=system` follows the desktop preference when GTK or Windows exposes it.
+- Invalid environment values fall back to `System`.
+- `setAppearanceTheme` can switch System/Light/Dark at runtime and rejects invalid values.
 
 ## Implementation Plan
 
@@ -602,18 +621,20 @@ Verification results:
 
 - Windows Debug build: passed.
 - Windows Debug CTest: `TextConversionTests` and `TextConversionPortableSmokeTests` passed.
-- Windows Debug automation: 20 tests passed.
+- Windows Debug automation: 24 tests passed.
 - Ubuntu Debug build: passed.
-- Ubuntu Debug CTest: `TextConversionTests` passed.
-- Ubuntu Debug automation: 20 tests passed.
+- Ubuntu Debug CTest: `LinuxSpellingProbe` and `TextConversionTests` passed.
+- Ubuntu Debug automation: 24 tests passed.
 - Windows Release build with `-SkipVersionIncrement`: passed.
 - Windows Release CTest: `TextConversionTests` and `TextConversionPortableSmokeTests` passed.
+- Windows Release automation: 24 tests passed.
 - Ubuntu Release-style build and CTest: passed.
+- Ubuntu Release automation: 24 tests passed.
 
 Accepted capability differences:
 
 - Linux spell checking is optional after the spelling follow-up (`spellCheck: true` when `libspelling-1` and `hunspell-en-gb` are present; graceful unavailable otherwise).
-- Linux dark mode remains unavailable in v1 (`darkMode: false`).
+- Linux dark mode is no longer an accepted gap. It is implemented through GTK CSS classes and the shared appearance state, with high-contrast GTK themes intentionally left to the desktop theme.
 
 ## Suggested Commands For Future Context
 
