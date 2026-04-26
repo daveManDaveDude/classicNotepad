@@ -151,6 +151,14 @@ if(UNIX AND NOT APPLE)
 
     if(GTK4_FOUND)
         add_executable(ClassicNotepadGtk
+            src/platform/linux/gtk_actions.cpp
+            src/platform/linux/gtk_actions.h
+            src/platform/linux/gtk_app.cpp
+            src/platform/linux/gtk_app.h
+            src/platform/linux/gtk_automation.cpp
+            src/platform/linux/gtk_automation.h
+            src/platform/linux/gtk_dialogs.cpp
+            src/platform/linux/gtk_dialogs.h
             src/platform/linux/gtk_main.cpp
         )
 

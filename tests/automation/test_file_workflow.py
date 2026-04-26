@@ -17,6 +17,22 @@ class FileWorkflowTests(unittest.TestCase):
                 self.assertEqual(app.command("getTitle")["title"], "argument.txt - Classic Notepad")
                 self.assertFalse(app.command("isModified")["modified"])
 
+    def test_command_line_missing_file_creates_document_for_path(self):
+        with tempfile.TemporaryDirectory(dir=automation_temp_root()) as temp_root:
+            path = Path(temp_root) / "created-from-argument.txt"
+
+            with ClassicNotepadDriver(automation_binary(), automation_platform(), str(path)) as app:
+                self.assertEqual(app.command("getText")["text"], "")
+                self.assertEqual(app.command("getTitle")["title"], "created-from-argument.txt - Classic Notepad")
+                self.assertFalse(app.command("isModified")["modified"])
+
+                metadata = app.command("getDocumentMetadata")["metadata"]
+                self.assertTrue(metadata["hasPath"])
+                self.assertEqual(metadata["displayName"], "created-from-argument.txt")
+
+                app.command("save")
+                self.assertEqual(path.read_bytes(), b"")
+
     def test_new_type_save_as_save_and_open(self):
         with tempfile.TemporaryDirectory(dir=automation_temp_root()) as temp_root:
             temp_path = Path(temp_root)
