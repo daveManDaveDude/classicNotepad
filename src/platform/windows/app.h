@@ -9,16 +9,73 @@
 #include <commdlg.h>
 
 #include <array>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
 
 class ClassicNotepadApp {
 public:
+    struct AutomationDocumentMetadata {
+        std::wstring path;
+        std::wstring displayName;
+        std::wstring encoding;
+        std::wstring lineEnding;
+        std::wstring saveLineEnding;
+        bool hasPath = false;
+    };
+
+    struct AutomationSelection {
+        DWORD start = 0;
+        DWORD end = 0;
+    };
+
     explicit ClassicNotepadApp(HINSTANCE instance);
     ~ClassicNotepadApp();
 
     int Run(int showCommand, const std::wstring& initialFilePath);
+    int RunAutomation(int showCommand, const std::wstring& initialFilePath, bool visible);
+
+    bool AutomationNewDocument();
+    bool AutomationOpenFile(const std::wstring& path, std::wstring& errorMessage);
+    bool AutomationSave(std::wstring& errorMessage);
+    bool AutomationSaveAs(const std::wstring& path, std::wstring& errorMessage);
+    void AutomationSetText(const std::wstring& text);
+    void AutomationInsertText(const std::wstring& text);
+    std::wstring AutomationGetText() const;
+    std::wstring AutomationGetTitle() const;
+    bool AutomationIsModified() const;
+    AutomationDocumentMetadata AutomationGetDocumentMetadata() const;
+    std::wstring AutomationGetStatusText() const;
+    AutomationSelection AutomationGetSelection() const;
+    void AutomationSetSelection(DWORD selectionStart, DWORD selectionEnd);
+    void AutomationSelectAll();
+    void AutomationUndo();
+    void AutomationCut();
+    void AutomationCopy();
+    void AutomationPaste();
+    void AutomationDeleteSelection();
+    bool AutomationFind(const std::wstring& text, bool matchCase, bool wholeWord, bool searchDown);
+    bool AutomationFindNext(bool matchCase, bool wholeWord, bool searchDown);
+    bool AutomationReplace(
+        const std::wstring& text,
+        const std::wstring& replacement,
+        bool matchCase,
+        bool wholeWord,
+        bool searchDown);
+    std::size_t AutomationReplaceAll(
+        const std::wstring& text,
+        const std::wstring& replacement,
+        bool matchCase,
+        bool wholeWord);
+    bool AutomationGoToLine(int lineNumber, std::wstring& errorMessage);
+    void AutomationInsertTimeDate();
+    void AutomationSetWordWrap(bool enabled);
+    bool AutomationGetWordWrap() const;
+    void AutomationSetStatusBarVisible(bool visible);
+    bool AutomationGetStatusBarVisible() const;
+    bool AutomationSpellCheckAvailable() const;
+    bool AutomationDarkModeEnabled() const;
 
 private:
     enum class ScrollBarOrientation {
@@ -259,6 +316,7 @@ private:
     bool menuKeyboardActive_ = false;
     bool customScrollBarDragging_ = false;
     bool darkModeEnabled_ = false;
+    bool automationMode_ = false;
     bool suppressEditorChange_ = false;
     bool comInitialized_ = false;
     SpellCheckService spellChecker_;

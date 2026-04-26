@@ -98,6 +98,8 @@ if(WIN32)
         "${CLASSIC_NOTEPAD_APP_ICON}"
         src/platform/windows/app.cpp
         src/platform/windows/app.h
+        src/platform/windows/automation.cpp
+        src/platform/windows/automation.h
         src/platform/windows/main.cpp
         src/platform/windows/spell_check.cpp
         src/platform/windows/spell_check.h
