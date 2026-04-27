@@ -7,7 +7,7 @@ Status: proposed plan for review before execution.
 
 - Native first.
 - Small executable and fast startup.
-- No dark mode in v1.
+- Dark mode was excluded from this original v1 plan, then added by the 2026-04-26 spelling/dark-mode follow-up.
 - Use free toolchains only.
 - Keep core logic shared and heavily unit-tested.
 
@@ -141,7 +141,7 @@ Acceptance checks:
 
 ## 13) QA and Release Checklist (v1)
 
-- No dark mode implementation.
+- Shared appearance state and Linux/Windows dark-mode automation coverage are now part of the follow-up scope.
 - Startup time and memory spot-checks.
 - Open/save reliability checks (large files, interruption-safe strategy).
 - Documentation complete:

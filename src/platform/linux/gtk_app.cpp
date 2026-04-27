@@ -14,6 +14,7 @@
 #include <cstring>
 #include <iomanip>
 #include <sstream>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -21,6 +22,12 @@
 
 namespace classic_notepad::linux_ui {
 namespace {
+
+void ApplyClassicCursorThemeSize(GtkWidget* widget);
+void PopdownMappedPopovers(GtkWidget* widget);
+int CountMappedPopovers(GtkWidget* widget);
+bool ActivateFirstWidgetWithLabel(GtkWidget* widget, const char* label);
+gboolean OnEditorKeyPressed(GtkEventControllerKey* controller, guint keyval, guint keycode, GdkModifierType state, gpointer userData);
 
 void OnActivate(GtkApplication* application, gpointer userData)
 {
@@ -42,10 +49,126 @@ gboolean OnCloseRequest(GtkWindow*, gpointer userData)
     return static_cast<GtkNotepadApp*>(userData)->ConfirmDiscard() ? FALSE : TRUE;
 }
 
+void OnGtkSettingsAppearanceChanged(GObject*, GParamSpec*, gpointer userData)
+{
+    static_cast<GtkNotepadApp*>(userData)->RefreshAppearanceFromSystem();
+}
+
+void OnWindowScaleFactorChanged(GObject* object, GParamSpec*, gpointer)
+{
+    if (GTK_IS_WIDGET(object)) {
+        ApplyClassicCursorThemeSize(GTK_WIDGET(object));
+    }
+}
+
+void OnWindowPressed(GtkGestureClick*, int, double x, double y, gpointer userData)
+{
+    static_cast<GtkNotepadApp*>(userData)->HandleWindowPress(x, y);
+}
+
+void OnEditorPressed(GtkGestureClick* gesture, int, double x, double y, gpointer userData)
+{
+    static_cast<GtkNotepadApp*>(userData)->HandleEditorPress(
+        gesture,
+        static_cast<unsigned int>(gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(gesture))),
+        x,
+        y);
+}
+
+void OnContextPopoverClosedSignal(GtkPopover* popover, gpointer userData)
+{
+    static_cast<GtkNotepadApp*>(userData)->OnContextPopoverClosed(GTK_WIDGET(popover));
+}
+
+void PopdownMappedPopovers(GtkWidget* widget)
+{
+    if (widget == nullptr) {
+        return;
+    }
+
+    for (GtkWidget* child = gtk_widget_get_first_child(widget); child != nullptr;) {
+        GtkWidget* next = gtk_widget_get_next_sibling(child);
+        PopdownMappedPopovers(child);
+        child = next;
+    }
+
+    if (GTK_IS_POPOVER(widget) && gtk_widget_get_mapped(widget)) {
+        gtk_popover_popdown(GTK_POPOVER(widget));
+    }
+}
+
+int CountMappedPopovers(GtkWidget* widget)
+{
+    if (widget == nullptr) {
+        return 0;
+    }
+
+    int count = GTK_IS_POPOVER(widget) && gtk_widget_get_mapped(widget) ? 1 : 0;
+    for (GtkWidget* child = gtk_widget_get_first_child(widget); child != nullptr; child = gtk_widget_get_next_sibling(child)) {
+        count += CountMappedPopovers(child);
+    }
+    return count;
+}
+
+bool WidgetHasDirectLabel(GtkWidget* widget, const char* label)
+{
+    return GTK_IS_LABEL(widget) && std::strcmp(gtk_label_get_text(GTK_LABEL(widget)), label) == 0;
+}
+
+bool WidgetSubtreeHasLabel(GtkWidget* widget, const char* label)
+{
+    if (widget == nullptr) {
+        return false;
+    }
+
+    if (WidgetHasDirectLabel(widget, label)) {
+        return true;
+    }
+
+    for (GtkWidget* child = gtk_widget_get_first_child(widget); child != nullptr; child = gtk_widget_get_next_sibling(child)) {
+        if (WidgetSubtreeHasLabel(child, label)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ActivateFirstWidgetWithLabel(GtkWidget* widget, const char* label)
+{
+    if (widget == nullptr || !WidgetSubtreeHasLabel(widget, label)) {
+        return false;
+    }
+
+    for (GtkWidget* child = gtk_widget_get_first_child(widget); child != nullptr; child = gtk_widget_get_next_sibling(child)) {
+        if (ActivateFirstWidgetWithLabel(child, label)) {
+            return true;
+        }
+    }
+
+    return gtk_widget_activate(widget) != FALSE;
+}
+
 void OnWindowDestroy(GtkWidget*, gpointer userData)
 {
     auto* app = static_cast<GtkNotepadApp*>(userData);
     app->OnWindowDestroyed();
+}
+
+bool IsDeleteKey(guint keyval)
+{
+    return keyval == GDK_KEY_Delete || keyval == GDK_KEY_KP_Delete;
+}
+
+gboolean OnEditorKeyPressed(GtkEventControllerKey*, guint keyval, guint, GdkModifierType state, gpointer userData)
+{
+    constexpr GdkModifierType handledModifiers = static_cast<GdkModifierType>(
+        GDK_SHIFT_MASK | GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK | GDK_META_MASK);
+    if (!IsDeleteKey(keyval) || (state & handledModifiers) != 0) {
+        return FALSE;
+    }
+
+    static_cast<GtkNotepadApp*>(userData)->HandleDelete();
+    return TRUE;
 }
 
 std::vector<std::uint8_t> BytesFromString(const std::string& text)
@@ -368,6 +491,162 @@ void OnDrawPrintPage(GtkPrintOperation*, GtkPrintContext* context, int pageNumbe
     g_object_unref(layout);
 }
 
+std::string LowerAscii(std::string_view text)
+{
+    std::string lowered;
+    lowered.reserve(text.size());
+    for (char character : text) {
+        lowered.push_back(character >= 'A' && character <= 'Z'
+            ? static_cast<char>(character - 'A' + 'a')
+            : character);
+    }
+    return lowered;
+}
+
+bool ContainsAsciiCaseInsensitive(const std::string& text, const char* needle)
+{
+    return LowerAscii(text).find(needle) != std::string::npos;
+}
+
+bool SettingsHasProperty(GtkSettings* settings, const char* name)
+{
+    return settings != nullptr &&
+        g_object_class_find_property(G_OBJECT_GET_CLASS(settings), name) != nullptr;
+}
+
+bool ReadSettingsBoolean(GtkSettings* settings, const char* name, bool fallback)
+{
+    if (!SettingsHasProperty(settings, name)) {
+        return fallback;
+    }
+
+    gboolean value = fallback ? TRUE : FALSE;
+    g_object_get(settings, name, &value, nullptr);
+    return value != FALSE;
+}
+
+std::string ReadSettingsString(GtkSettings* settings, const char* name)
+{
+    if (!SettingsHasProperty(settings, name)) {
+        return {};
+    }
+
+    char* value = nullptr;
+    g_object_get(settings, name, &value, nullptr);
+    std::string result = value == nullptr ? std::string() : std::string(value);
+    g_free(value);
+    return result;
+}
+
+int ReadSettingsEnum(GtkSettings* settings, const char* name, int fallback)
+{
+    if (!SettingsHasProperty(settings, name)) {
+        return fallback;
+    }
+
+    GParamSpec* property = g_object_class_find_property(G_OBJECT_GET_CLASS(settings), name);
+    if (property == nullptr) {
+        return fallback;
+    }
+
+    GValue value = G_VALUE_INIT;
+    g_value_init(&value, G_PARAM_SPEC_VALUE_TYPE(property));
+    g_object_get_property(G_OBJECT(settings), name, &value);
+
+    int result = fallback;
+    if (G_VALUE_HOLDS_ENUM(&value)) {
+        result = g_value_get_enum(&value);
+    } else if (G_VALUE_HOLDS_INT(&value)) {
+        result = g_value_get_int(&value);
+    }
+
+    g_value_unset(&value);
+    return result;
+}
+
+int BaseCursorThemeSize(GtkSettings* settings)
+{
+    static int baseSize = 0;
+    if (baseSize > 0) {
+        return baseSize;
+    }
+
+    int configuredSize = 0;
+    if (settings != nullptr && SettingsHasProperty(settings, "gtk-cursor-theme-size")) {
+        g_object_get(settings, "gtk-cursor-theme-size", &configuredSize, nullptr);
+    }
+
+    constexpr int kClassicCursorThemeSize = 24;
+    baseSize = configuredSize > 0 ? configuredSize : kClassicCursorThemeSize;
+    return baseSize;
+}
+
+void ApplyClassicCursorThemeSize(GtkWidget* widget)
+{
+    GtkSettings* settings = gtk_settings_get_default();
+    if (!SettingsHasProperty(settings, "gtk-cursor-theme-size")) {
+        return;
+    }
+
+    const int scaleFactor = widget == nullptr ? 1 : std::max(1, gtk_widget_get_scale_factor(widget));
+    constexpr int kMinimumCursorThemeSize = 8;
+    const int baseSize = BaseCursorThemeSize(settings);
+    const int targetSize = scaleFactor > 1
+        ? std::max(kMinimumCursorThemeSize, baseSize / scaleFactor)
+        : baseSize;
+
+    int currentSize = 0;
+    g_object_get(settings, "gtk-cursor-theme-size", &currentSize, nullptr);
+    if (currentSize != targetSize) {
+        g_object_set(settings, "gtk-cursor-theme-size", targetSize, nullptr);
+    }
+}
+
+classic_notepad::AppearanceTheme ThemeFromEnvironment()
+{
+    const char* value = g_getenv(classic_notepad::kAppearanceThemeEnvironmentVariable);
+    return value == nullptr
+        ? classic_notepad::AppearanceTheme::System
+        : classic_notepad::ParseAppearanceThemeOrSystem(value);
+}
+
+void SetCssProviderColorScheme(GtkCssProvider* provider, classic_notepad::AppearanceTheme theme, bool darkMode)
+{
+    if (provider == nullptr) {
+        return;
+    }
+
+    GParamSpec* property = g_object_class_find_property(G_OBJECT_GET_CLASS(provider), "prefers-color-scheme");
+    if (property == nullptr) {
+        return;
+    }
+
+    constexpr int gtkInterfaceColorSchemeDefault = 1;
+    constexpr int gtkInterfaceColorSchemeDark = 2;
+    constexpr int gtkInterfaceColorSchemeLight = 3;
+
+    int colorScheme = gtkInterfaceColorSchemeDefault;
+    if (theme == classic_notepad::AppearanceTheme::Dark || (theme == classic_notepad::AppearanceTheme::System && darkMode)) {
+        colorScheme = gtkInterfaceColorSchemeDark;
+    } else if (theme == classic_notepad::AppearanceTheme::Light || (theme == classic_notepad::AppearanceTheme::System && !darkMode)) {
+        colorScheme = gtkInterfaceColorSchemeLight;
+    }
+
+    GValue value = G_VALUE_INIT;
+    g_value_init(&value, G_PARAM_SPEC_VALUE_TYPE(property));
+    if (G_VALUE_HOLDS_ENUM(&value)) {
+        g_value_set_enum(&value, colorScheme);
+    } else if (G_VALUE_HOLDS_INT(&value)) {
+        g_value_set_int(&value, colorScheme);
+    } else {
+        g_value_unset(&value);
+        return;
+    }
+
+    g_object_set_property(G_OBJECT(provider), "prefers-color-scheme", &value);
+    g_value_unset(&value);
+}
+
 } // namespace
 
 std::wstring WideFromUtf8(const char* text)
@@ -411,6 +690,7 @@ std::string Utf8FromWide(const std::wstring& text)
 
 GtkNotepadApp::GtkNotepadApp(std::wstring initialPath)
     : initialPath_(std::move(initialPath))
+    , appearanceTheme_(ThemeFromEnvironment())
 {
 }
 
@@ -425,6 +705,11 @@ GtkNotepadApp::~GtkNotepadApp()
     if (fontProvider_ != nullptr) {
         g_object_unref(fontProvider_);
         fontProvider_ = nullptr;
+    }
+
+    if (themeProvider_ != nullptr) {
+        g_object_unref(themeProvider_);
+        themeProvider_ = nullptr;
     }
 
     if (pageSetup_ != nullptr) {
@@ -473,6 +758,7 @@ int GtkNotepadApp::RunAutomation(bool visible)
         gtk_window_present(GTK_WINDOW(window_));
     }
     PumpEvents();
+    ApplyClassicCursorThemeSize(window_);
 
     GtkAutomationController controller(*this);
     const int result = controller.Run();
@@ -490,12 +776,14 @@ void GtkNotepadApp::Activate(GtkApplication* application)
 {
     if (window_ != nullptr) {
         gtk_window_present(GTK_WINDOW(window_));
+        ApplyClassicCursorThemeSize(window_);
         return;
     }
 
     BuildWindow(application);
     HandleInitialFilePath(false);
     gtk_window_present(GTK_WINDOW(window_));
+    ApplyClassicCursorThemeSize(window_);
 }
 
 void GtkNotepadApp::PumpEvents()
@@ -679,7 +967,36 @@ void GtkNotepadApp::HandlePaste()
 
 void GtkNotepadApp::HandleDelete()
 {
-    DeleteSelection();
+    if (buffer_ == nullptr) {
+        return;
+    }
+
+    GtkTextIter start;
+    GtkTextIter end;
+    if (gtk_text_buffer_get_selection_bounds(buffer_, &start, &end)) {
+        DeleteSelection();
+        return;
+    }
+
+    gtk_text_buffer_get_iter_at_mark(buffer_, &start, gtk_text_buffer_get_insert(buffer_));
+    const std::wstring rawText = GetRawText();
+    const std::size_t bufferStart = static_cast<std::size_t>(gtk_text_iter_get_offset(&start));
+    if (bufferStart >= rawText.size()) {
+        return;
+    }
+
+    std::size_t lineBreakLength = 0;
+    const std::size_t bufferEnd = IsLineBreakAt(rawText, bufferStart, lineBreakLength)
+        ? bufferStart + lineBreakLength
+        : bufferStart + 1U;
+    gtk_text_buffer_get_iter_at_offset(buffer_, &end, static_cast<int>(ClampOffset(bufferEnd)));
+
+    gtk_text_buffer_begin_user_action(buffer_);
+    gtk_text_buffer_delete(buffer_, &start, &end);
+    gtk_text_buffer_end_user_action(buffer_);
+    document_.SetModified(true);
+    UpdateTitle();
+    UpdateStatus();
 }
 
 void GtkNotepadApp::HandleFind()
@@ -802,6 +1119,111 @@ void GtkNotepadApp::HandleAbout()
     }
 
     ShowAboutDialog(Window(), CLASSIC_NOTEPAD_VERSION_DISPLAY_W);
+}
+
+void GtkNotepadApp::DismissOpenMenus()
+{
+    PopdownMappedPopovers(window_);
+
+    if (contextPopover_ != nullptr) {
+        gtk_popover_popdown(GTK_POPOVER(contextPopover_));
+    }
+}
+
+void GtkNotepadApp::DismissOpenMenusAndResetModels()
+{
+    DismissOpenMenus();
+
+    if (menuBar_ != nullptr && GTK_IS_POPOVER_MENU_BAR(menuBar_)) {
+        GMenuModel* model = gtk_popover_menu_bar_get_menu_model(GTK_POPOVER_MENU_BAR(menuBar_));
+        if (model != nullptr) {
+            g_object_ref(model);
+            gtk_popover_menu_bar_set_menu_model(GTK_POPOVER_MENU_BAR(menuBar_), nullptr);
+            gtk_popover_menu_bar_set_menu_model(GTK_POPOVER_MENU_BAR(menuBar_), model);
+            g_object_unref(model);
+        }
+    }
+}
+
+int GtkNotepadApp::AutomationMappedMenuPopoverCount() const
+{
+    return CountMappedPopovers(window_);
+}
+
+bool GtkNotepadApp::AutomationActivateMenuLabel(const std::wstring& label)
+{
+    if (window_ == nullptr) {
+        return false;
+    }
+
+    if (!gtk_widget_get_mapped(window_)) {
+        gtk_window_present(GTK_WINDOW(window_));
+        PumpEvents();
+    }
+
+    const std::string utf8Label = Utf8FromWide(label);
+    if (utf8Label.empty()) {
+        return false;
+    }
+
+    const bool activated = ActivateFirstWidgetWithLabel(window_, utf8Label.c_str());
+    PumpEvents();
+    return activated;
+}
+
+void GtkNotepadApp::HandleWindowPress(double x, double y)
+{
+    if (window_ == nullptr) {
+        return;
+    }
+
+    if (menuBar_ != nullptr) {
+        graphene_rect_t menuBounds {};
+        if (gtk_widget_compute_bounds(menuBar_, window_, &menuBounds) &&
+            x >= menuBounds.origin.x &&
+            x < menuBounds.origin.x + menuBounds.size.width &&
+            y >= menuBounds.origin.y &&
+            y < menuBounds.origin.y + menuBounds.size.height) {
+            PopdownMappedPopovers(window_);
+            return;
+        }
+    }
+
+    DismissOpenMenusAndResetModels();
+}
+
+void GtkNotepadApp::HandleEditorPress(GtkGestureClick* gesture, unsigned int button, double x, double y)
+{
+    if (button != GDK_BUTTON_SECONDARY || textView_ == nullptr || contextMenuModel_ == nullptr) {
+        return;
+    }
+
+    DismissOpenMenusAndResetModels();
+
+    contextPopover_ = gtk_popover_menu_new_from_model(contextMenuModel_);
+    gtk_popover_set_autohide(GTK_POPOVER(contextPopover_), TRUE);
+    gtk_popover_set_has_arrow(GTK_POPOVER(contextPopover_), FALSE);
+    gtk_widget_set_parent(contextPopover_, textView_);
+
+    const GdkRectangle point {static_cast<int>(x), static_cast<int>(y), 1, 1};
+    gtk_popover_set_pointing_to(GTK_POPOVER(contextPopover_), &point);
+    g_signal_connect(contextPopover_, "closed", G_CALLBACK(OnContextPopoverClosedSignal), this);
+    gtk_popover_popup(GTK_POPOVER(contextPopover_));
+
+    gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+}
+
+void GtkNotepadApp::OnContextPopoverClosed(GtkWidget* popover)
+{
+    if (popover == nullptr) {
+        return;
+    }
+
+    if (contextPopover_ == popover) {
+        contextPopover_ = nullptr;
+    }
+
+    gtk_widget_unparent(popover);
 }
 
 bool GtkNotepadApp::NewDocument()
@@ -1352,6 +1774,13 @@ void GtkNotepadApp::SetWordWrap(bool enabled)
     if (textView_ != nullptr) {
         gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(textView_), enabled ? GTK_WRAP_WORD_CHAR : GTK_WRAP_NONE);
     }
+
+    if (window_ != nullptr) {
+        GAction* action = g_action_map_lookup_action(G_ACTION_MAP(window_), "word-wrap");
+        if (G_IS_SIMPLE_ACTION(action)) {
+            g_simple_action_set_state(G_SIMPLE_ACTION(action), g_variant_new_boolean(wordWrap_));
+        }
+    }
 }
 
 bool GtkNotepadApp::GetWordWrap() const
@@ -1373,14 +1802,6 @@ void GtkNotepadApp::SetStatusBarVisible(bool visible)
         }
     }
 
-    if (menuBar_ != nullptr && GTK_IS_POPOVER_MENU_BAR(menuBar_)) {
-        GMenuModel* model = gtk_popover_menu_bar_get_menu_model(GTK_POPOVER_MENU_BAR(menuBar_));
-        if (model != nullptr) {
-            g_object_ref(model);
-            gtk_popover_menu_bar_set_menu_model(GTK_POPOVER_MENU_BAR(menuBar_), model);
-            g_object_unref(model);
-        }
-    }
 }
 
 bool GtkNotepadApp::GetStatusBarVisible() const
@@ -1449,8 +1870,111 @@ bool GtkNotepadApp::PrintToTestSink(const std::wstring& path, std::wstring& erro
     return WriteUtf8TextFile(path, sinkText, errorMessage);
 }
 
+classic_notepad::AppearanceTheme GtkNotepadApp::AppearanceTheme() const
+{
+    return appearanceTheme_;
+}
+
+bool GtkNotepadApp::DarkModeEnabled() const
+{
+    return darkModeEnabled_;
+}
+
+bool GtkNotepadApp::HighContrastThemeActive() const
+{
+    return highContrastThemeActive_;
+}
+
+void GtkNotepadApp::SetAppearanceTheme(classic_notepad::AppearanceTheme theme)
+{
+    appearanceTheme_ = theme;
+    ApplyAppearance();
+}
+
+void GtkNotepadApp::RefreshAppearanceFromSystem()
+{
+    if (appearanceTheme_ == classic_notepad::AppearanceTheme::System) {
+        ApplyAppearance();
+    }
+}
+
+classic_notepad::SpellCapability GtkNotepadApp::SpellCheckCapability() const
+{
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    return spelling_ == nullptr ? classic_notepad::SpellCapability::MissingBackend : spelling_->Capability();
+#else
+    return classic_notepad::SpellCapability::DisabledByBuild;
+#endif
+}
+
+std::wstring GtkNotepadApp::SpellCheckLanguage() const
+{
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    return spelling_ == nullptr ? std::wstring() : WideFromUtf8(spelling_->LanguageCode());
+#else
+    return {};
+#endif
+}
+
 bool GtkNotepadApp::SpellCheckAvailable() const
 {
+    return SpellCheckCapability() == classic_notepad::SpellCapability::Available;
+}
+
+std::vector<GtkNotepadApp::AutomationSpellingIssue> GtkNotepadApp::CheckSpelling(const std::wstring& text) const
+{
+    std::vector<AutomationSpellingIssue> issues;
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (spelling_ == nullptr || !SpellCheckAvailable()) {
+        return issues;
+    }
+
+    for (const classic_notepad::SpellIssue& issue : spelling_->CheckText(text)) {
+        issues.push_back({ issue.startUtf16, issue.lengthUtf16, {}, L"spell" });
+    }
+#else
+    (void)text;
+#endif
+    return issues;
+}
+
+std::vector<std::wstring> GtkNotepadApp::SuggestSpelling(const std::wstring& word, std::size_t limit) const
+{
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (spelling_ != nullptr && SpellCheckAvailable()) {
+        return spelling_->Suggest(word, limit);
+    }
+#else
+    (void)word;
+    (void)limit;
+#endif
+    return {};
+}
+
+bool GtkNotepadApp::IgnoreSpelling(const std::wstring& word, std::wstring& errorMessage)
+{
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (spelling_ != nullptr && spelling_->IgnoreOnce(word)) {
+        return true;
+    }
+#else
+    (void)word;
+#endif
+    errorMessage = L"Spell checking is unavailable.";
+    return false;
+}
+
+bool GtkNotepadApp::AddSpelling(const std::wstring& word, bool dryRun, std::wstring& errorMessage)
+{
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (spelling_ != nullptr && spelling_->AddToDictionary(word, dryRun)) {
+        return true;
+    }
+#else
+    (void)word;
+    (void)dryRun;
+#endif
+    errorMessage = L"Spell checking is unavailable.";
     return false;
 }
 
@@ -1461,6 +1985,11 @@ void GtkNotepadApp::OnBufferChanged()
     }
 
     document_.SetModified(true);
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (spelling_ != nullptr) {
+        spelling_->InvalidateAll();
+    }
+#endif
     UpdateTitle();
     UpdateStatus();
 }
@@ -1472,11 +2001,27 @@ void GtkNotepadApp::OnCursorMoved()
 
 void GtkNotepadApp::OnWindowDestroyed()
 {
+    GtkSettings* settings = gtk_settings_get_default();
+    if (settings != nullptr) {
+        g_signal_handlers_disconnect_by_data(settings, this);
+    }
+
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    spelling_.reset();
+#endif
     window_ = nullptr;
+    root_ = nullptr;
+    menuBar_ = nullptr;
+    contextPopover_ = nullptr;
     textView_ = nullptr;
     buffer_ = nullptr;
     statusBar_ = nullptr;
     statusLabel_ = nullptr;
+
+    if (contextMenuModel_ != nullptr) {
+        g_object_unref(contextMenuModel_);
+        contextMenuModel_ = nullptr;
+    }
 
     if (application_ != nullptr) {
         g_application_quit(G_APPLICATION(application_));
@@ -1600,13 +2145,159 @@ void GtkNotepadApp::ApplyFont()
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(textView_), FALSE);
 }
 
+void GtkNotepadApp::EnsureThemeProvider()
+{
+    if (themeProvider_ != nullptr || window_ == nullptr) {
+        return;
+    }
+
+    static constexpr const char* kThemeCss = R"css(
+.classic-notepad-root.classic-light {
+    background-color: #f5f5f5;
+    color: #000000;
+}
+
+.classic-notepad-root.classic-dark {
+    background-color: #262626;
+    color: #f2f2f2;
+}
+
+.classic-notepad-root.classic-light .classic-notepad-menu {
+    background-color: #f5f5f5;
+    color: #000000;
+}
+
+.classic-notepad-root.classic-dark .classic-notepad-menu {
+    background-color: #262626;
+    color: #f2f2f2;
+}
+
+.classic-notepad-root.classic-light textview.classic-notepad-editor,
+.classic-notepad-root.classic-light textview.classic-notepad-editor text {
+    background-color: #ffffff;
+    color: #000000;
+    caret-color: #000000;
+}
+
+.classic-notepad-root.classic-dark textview.classic-notepad-editor,
+.classic-notepad-root.classic-dark textview.classic-notepad-editor text {
+    background-color: #202020;
+    color: #f2f2f2;
+    caret-color: #f2f2f2;
+}
+
+.classic-notepad-root.classic-light .classic-notepad-status {
+    background-color: #f0f0f0;
+    color: #000000;
+    border-top: 1px solid #d0d0d0;
+}
+
+.classic-notepad-root.classic-dark .classic-notepad-status {
+    background-color: #2b2b2b;
+    color: #d8d8d8;
+    border-top: 1px solid #444444;
+}
+
+)css";
+
+    themeProvider_ = gtk_css_provider_new();
+    gtk_style_context_add_provider_for_display(
+        gtk_widget_get_display(window_),
+        GTK_STYLE_PROVIDER(themeProvider_),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+#if GTK_CHECK_VERSION(4, 12, 0)
+    gtk_css_provider_load_from_string(themeProvider_, kThemeCss);
+#else
+    gtk_css_provider_load_from_data(themeProvider_, kThemeCss, static_cast<gssize>(std::strlen(kThemeCss)));
+#endif
+}
+
+bool GtkNotepadApp::SystemPrefersDark() const
+{
+    GtkSettings* settings = gtk_settings_get_default();
+    constexpr int gtkInterfaceColorSchemeDark = 2;
+    constexpr int gtkInterfaceColorSchemeLight = 3;
+
+    const int colorScheme = ReadSettingsEnum(settings, "gtk-interface-color-scheme", 0);
+    if (colorScheme == gtkInterfaceColorSchemeDark) {
+        return true;
+    }
+
+    if (colorScheme == gtkInterfaceColorSchemeLight) {
+        return false;
+    }
+
+    if (ReadSettingsBoolean(settings, "gtk-application-prefer-dark-theme", false)) {
+        return true;
+    }
+
+    const std::string themeName = ReadSettingsString(settings, "gtk-theme-name");
+    return !DetectHighContrastTheme() && ContainsAsciiCaseInsensitive(themeName, "dark");
+}
+
+bool GtkNotepadApp::DetectHighContrastTheme() const
+{
+    GtkSettings* settings = gtk_settings_get_default();
+    const std::string themeName = ReadSettingsString(settings, "gtk-theme-name");
+    return ContainsAsciiCaseInsensitive(themeName, "highcontrast") ||
+        ContainsAsciiCaseInsensitive(themeName, "high-contrast") ||
+        ContainsAsciiCaseInsensitive(themeName, "high contrast");
+}
+
+void GtkNotepadApp::ApplyAppearance()
+{
+    if (root_ == nullptr) {
+        return;
+    }
+
+    EnsureThemeProvider();
+
+    highContrastThemeActive_ = DetectHighContrastTheme();
+    darkModeEnabled_ = classic_notepad::ResolveDarkMode(
+        appearanceTheme_,
+        SystemPrefersDark(),
+        highContrastThemeActive_);
+
+    gtk_widget_remove_css_class(root_, "classic-system");
+    gtk_widget_remove_css_class(root_, "classic-light");
+    gtk_widget_remove_css_class(root_, "classic-dark");
+    gtk_widget_remove_css_class(root_, "classic-high-contrast");
+
+    if (highContrastThemeActive_) {
+        gtk_widget_add_css_class(root_, "classic-high-contrast");
+        gtk_widget_add_css_class(root_, "classic-system");
+    } else if (darkModeEnabled_) {
+        gtk_widget_add_css_class(root_, "classic-dark");
+    } else {
+        gtk_widget_add_css_class(root_, "classic-light");
+    }
+
+    SetCssProviderColorScheme(themeProvider_, appearanceTheme_, darkModeEnabled_);
+}
+
 void GtkNotepadApp::InstallContextMenu()
 {
     if (textView_ == nullptr) {
         return;
     }
 
+    if (contextMenuModel_ != nullptr) {
+        g_object_unref(contextMenuModel_);
+        contextMenuModel_ = nullptr;
+    }
+
     GMenu* menu = g_menu_new();
+    GMenuModel* spellingMenuModel = nullptr;
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (spelling_ != nullptr) {
+        spellingMenuModel = spelling_->ContextMenuModel();
+    }
+#endif
+    if (spellingMenuModel != nullptr) {
+        g_menu_append_section(menu, nullptr, spellingMenuModel);
+    }
+
     GMenu* undoSection = g_menu_new();
     GMenu* clipboardSection = g_menu_new();
     GMenu* selectSection = g_menu_new();
@@ -1623,7 +2314,8 @@ void GtkNotepadApp::InstallContextMenu()
     g_menu_append(selectSection, "Select All", "win.select-all");
     g_menu_append_section(menu, nullptr, G_MENU_MODEL(selectSection));
 
-    gtk_text_view_set_extra_menu(GTK_TEXT_VIEW(textView_), G_MENU_MODEL(menu));
+    contextMenuModel_ = G_MENU_MODEL(g_object_ref(menu));
+    gtk_text_view_set_extra_menu(GTK_TEXT_VIEW(textView_), nullptr);
     g_object_unref(selectSection);
     g_object_unref(clipboardSection);
     g_object_unref(undoSection);
@@ -1636,45 +2328,88 @@ void GtkNotepadApp::BuildWindow(GtkApplication* application)
     gtk_window_set_default_size(GTK_WINDOW(window_), 800, 500);
     g_signal_connect(window_, "close-request", G_CALLBACK(OnCloseRequest), this);
     g_signal_connect(window_, "destroy", G_CALLBACK(OnWindowDestroy), this);
+    g_signal_connect(window_, "notify::scale-factor", G_CALLBACK(OnWindowScaleFactorChanged), nullptr);
+    ApplyClassicCursorThemeSize(window_);
+
+    GtkGesture* windowClick = gtk_gesture_click_new();
+    gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(windowClick), GTK_PHASE_CAPTURE);
+    g_signal_connect(windowClick, "pressed", G_CALLBACK(OnWindowPressed), this);
+    gtk_widget_add_controller(window_, GTK_EVENT_CONTROLLER(windowClick));
 
     InstallAppActions(*this);
 
-    GtkWidget* root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_window_set_child(GTK_WINDOW(window_), root);
+    root_ = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_add_css_class(root_, "classic-notepad-root");
+    gtk_window_set_child(GTK_WINDOW(window_), root_);
 
     menuBar_ = CreateMenuBar();
-    gtk_box_append(GTK_BOX(root), menuBar_);
+    gtk_widget_add_css_class(menuBar_, "classic-notepad-menu");
+    gtk_box_append(GTK_BOX(root_), menuBar_);
 
     GtkWidget* scrolledWindow = gtk_scrolled_window_new();
     gtk_widget_set_vexpand(scrolledWindow, TRUE);
     gtk_widget_set_hexpand(scrolledWindow, TRUE);
-    gtk_box_append(GTK_BOX(root), scrolledWindow);
+    gtk_box_append(GTK_BOX(root_), scrolledWindow);
 
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    spelling_ = std::make_unique<GtkSpellingService>();
+    textView_ = spelling_->CreatePlainTextView();
+#else
     textView_ = gtk_text_view_new();
+#endif
     gtk_widget_add_css_class(textView_, "classic-notepad-editor");
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(textView_), TRUE);
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(textView_), wordWrap_ ? GTK_WRAP_WORD_CHAR : GTK_WRAP_NONE);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolledWindow), textView_);
+
+    GtkEventController* editorKey = gtk_event_controller_key_new();
+    gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(editorKey), GTK_PHASE_CAPTURE);
+    g_signal_connect(editorKey, "key-pressed", G_CALLBACK(OnEditorKeyPressed), this);
+    gtk_widget_add_controller(textView_, editorKey);
+
+    GtkGesture* editorClick = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(editorClick), 0);
+    gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(editorClick), GTK_PHASE_CAPTURE);
+    g_signal_connect(editorClick, "pressed", G_CALLBACK(OnEditorPressed), this);
+    gtk_widget_add_controller(textView_, GTK_EVENT_CONTROLLER(editorClick));
 
     buffer_ = gtk_text_view_get_buffer(GTK_TEXT_VIEW(textView_));
     gtk_text_buffer_set_enable_undo(buffer_, TRUE);
     gtk_text_buffer_set_max_undo_levels(buffer_, 100);
     g_signal_connect(buffer_, "changed", G_CALLBACK(OnBufferChangedSignal), this);
     g_signal_connect(buffer_, "notify::cursor-position", G_CALLBACK(OnCursorMovedSignal), this);
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (spelling_ != nullptr) {
+        spelling_->Attach(buffer_);
+    }
+#endif
     InstallContextMenu();
     ApplyFont();
 
     statusBar_ = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_visible(statusBar_, statusBarVisible_);
-    gtk_box_append(GTK_BOX(root), statusBar_);
+    gtk_widget_add_css_class(statusBar_, "classic-notepad-status");
+    gtk_box_append(GTK_BOX(root_), statusBar_);
 
     statusLabel_ = gtk_label_new("");
+    gtk_widget_add_css_class(statusLabel_, "classic-notepad-status-label");
     gtk_widget_set_halign(statusLabel_, GTK_ALIGN_START);
     gtk_widget_set_margin_start(statusLabel_, 8);
     gtk_widget_set_margin_end(statusLabel_, 8);
     gtk_widget_set_margin_top(statusLabel_, 4);
     gtk_widget_set_margin_bottom(statusLabel_, 4);
     gtk_box_append(GTK_BOX(statusBar_), statusLabel_);
+
+    GtkSettings* settings = gtk_settings_get_default();
+    if (settings != nullptr) {
+        g_signal_connect(settings, "notify::gtk-application-prefer-dark-theme", G_CALLBACK(OnGtkSettingsAppearanceChanged), this);
+        g_signal_connect(settings, "notify::gtk-theme-name", G_CALLBACK(OnGtkSettingsAppearanceChanged), this);
+        if (SettingsHasProperty(settings, "gtk-interface-color-scheme")) {
+            g_signal_connect(settings, "notify::gtk-interface-color-scheme", G_CALLBACK(OnGtkSettingsAppearanceChanged), this);
+        }
+    }
+
+    ApplyAppearance();
 }
 
 void GtkNotepadApp::SetBufferText(const std::wstring& text, bool markModified)
@@ -1694,6 +2429,11 @@ void GtkNotepadApp::SetBufferText(const std::wstring& text, bool markModified)
     suppressChange_ = false;
 
     document_.SetModified(markModified);
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (spelling_ != nullptr) {
+        spelling_->InvalidateAll();
+    }
+#endif
 }
 
 void GtkNotepadApp::SetInitialTitleAndStatus()

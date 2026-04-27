@@ -94,6 +94,7 @@ Baseline source: the finished `classicNotepad` repository behavior and docs.
 
 ## Scope Adjustment for Cross-Platform v1
 
-For the new cross-platform project, this baseline is carried forward **except**:
-- Remove dark mode from initial spec and implementation.
-- Treat spell-check as optional/deferred on Linux until OS-native-friendly strategy is confirmed.
+For the new cross-platform project, this baseline was initially carried forward with dark mode deferred and Linux spell-check treated as optional. The 2026-04-26 spelling/dark-mode follow-up supersedes that initial scope:
+
+- Dark mode is a cross-platform parity item through a shared `System` / `Light` / `Dark` appearance state.
+- Linux spell checking is optional at build/runtime through GTK/libspelling and remains graceful when unavailable.

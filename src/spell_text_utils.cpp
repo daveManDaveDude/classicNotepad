@@ -68,6 +68,22 @@ bool ExpandWordRangeAt(const std::wstring& text, std::size_t index, TextRange& r
     return true;
 }
 
+std::vector<TextRange> FindSpellCheckWordRanges(const std::wstring& text)
+{
+    std::vector<TextRange> ranges;
+    for (std::size_t index = 0; index < text.size();) {
+        TextRange range {};
+        if (ExpandWordRangeAt(text, index, range)) {
+            ranges.push_back(range);
+            index = range.start + range.length;
+        } else {
+            ++index;
+        }
+    }
+
+    return ranges;
+}
+
 bool RangesOverlap(std::size_t firstStart, std::size_t firstLength, std::size_t secondStart, std::size_t secondLength)
 {
     if (firstLength == 0U || secondLength == 0U) {
