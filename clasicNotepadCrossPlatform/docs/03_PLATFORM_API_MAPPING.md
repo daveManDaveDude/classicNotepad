@@ -1,4 +1,4 @@
-# Cross-Platform API Mapping (No Dark Mode in v1)
+# Cross-Platform API Mapping
 
 Date: 2026-04-20
 
@@ -29,6 +29,7 @@ Date: 2026-04-20
 | Clipboard | text abstraction | `NSPasteboard` (if needed directly) | `GdkClipboard` / GTK text buffer integration |
 | Status bar | computed status text | `NSTextField` status area | `GtkLabel`/status widget |
 | Spell check (optional v1 on Linux) | token ranges, UI hooks | `NSSpellChecker` / `NSTextView` integration | defer or optional Enchant-backed integration behind flag |
+| Appearance | `AppearanceTheme` (`System` / `Light` / `Dark`) and env override parsing | `NSAppearance` plus semantic AppKit colors | GTK CSS provider/classes plus optional `GtkSettings` color-scheme read |
 
 ## Notes on Spell Checking
 
@@ -48,9 +49,10 @@ Keep all transformation logic platform-independent in shared C++ to guarantee pa
 
 This minimizes platform divergence and reduces regression risk.
 
-## Non-goals for v1
+## Non-goals from the original v1 scope
 
-- Dark mode.
 - Cross-platform rich text.
 - Plugin system.
 - Cloud/sync/telemetry.
+
+Update 2026-04-26: dark mode is no longer a non-goal. It is handled through a shared `System` / `Light` / `Dark` appearance state, AppKit appearances on macOS, GTK CSS classes on Linux, and the existing custom Win32 dark-mode drawing on Windows.

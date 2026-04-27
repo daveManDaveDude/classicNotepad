@@ -2,6 +2,7 @@
 
 #include "win32_platform.h"
 
+#include "appearance.h"
 #include "document.h"
 #include "spell_check.h"
 
@@ -57,6 +58,7 @@ public:
     void AutomationDeleteSelection();
     void AutomationPressInsert();
     void AutomationTypeText(const std::wstring& text);
+    void AutomationDelete();
     bool AutomationFind(const std::wstring& text, bool matchCase, bool wholeWord, bool searchDown);
     bool AutomationFindNext(bool matchCase, bool wholeWord, bool searchDown);
     bool AutomationReplace(
@@ -87,6 +89,9 @@ public:
     bool AutomationIgnoreSpelling(const std::wstring& word, std::wstring& errorMessage);
     bool AutomationAddSpelling(const std::wstring& word, bool dryRun, std::wstring& errorMessage);
     bool AutomationDarkModeEnabled() const;
+    classic_notepad::AppearanceTheme AutomationAppearanceTheme() const;
+    bool AutomationHighContrastThemeActive() const;
+    void AutomationSetAppearanceTheme(classic_notepad::AppearanceTheme theme);
 
 private:
     enum class ScrollBarOrientation {
@@ -327,6 +332,7 @@ private:
     bool menuKeyboardActive_ = false;
     bool customScrollBarDragging_ = false;
     bool darkModeEnabled_ = false;
+    classic_notepad::AppearanceTheme appearanceTheme_ = classic_notepad::AppearanceTheme::System;
     bool automationMode_ = false;
     bool overwriteMode_ = false;
     bool suppressEditorChange_ = false;

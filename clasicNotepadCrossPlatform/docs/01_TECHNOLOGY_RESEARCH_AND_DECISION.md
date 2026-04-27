@@ -8,7 +8,7 @@ Scope: macOS-first implementation, Linux desktop support (Ubuntu default desktop
 - Keep the app native on each OS (no browser shell, no Electron/WebView framework).
 - Use free tooling.
 - Minimize non-OS dependencies.
-- Match Classic Notepad behavior, but **exclude dark mode from initial scope**.
+- Match Classic Notepad behavior. Dark mode was excluded from the initial 2026-04-20 scope, then added by the 2026-04-26 spelling/dark-mode follow-up.
 - Start development on macOS, then add Linux parity.
 
 ## 2) Candidate Approaches

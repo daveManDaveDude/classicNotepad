@@ -1,11 +1,24 @@
 #pragma once
 
+#include "appearance.h"
 #include "document.h"
+#include "spelling.h"
 
 #include <gtk/gtk.h>
 
 #include <cstddef>
+#include <vector>
 #include <string>
+
+#ifndef CLASSIC_NOTEPAD_HAS_LIBSPELLING
+#define CLASSIC_NOTEPAD_HAS_LIBSPELLING 0
+#endif
+
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+#include "gtk_spelling.h"
+
+#include <memory>
+#endif
 
 namespace classic_notepad::linux_ui {
 
@@ -34,6 +47,13 @@ public:
         int top = 750;
         int right = 750;
         int bottom = 750;
+    };
+
+    struct AutomationSpellingIssue {
+        std::size_t start = 0;
+        std::size_t length = 0;
+        std::wstring replacement;
+        std::wstring action;
     };
 
     explicit GtkNotepadApp(std::wstring initialPath);
@@ -73,6 +93,13 @@ public:
     void HandleChooseFont();
     void HandleToggleStatusBar();
     void HandleAbout();
+    void DismissOpenMenus();
+    void DismissOpenMenusAndResetModels();
+    int AutomationMappedMenuPopoverCount() const;
+    bool AutomationActivateMenuLabel(const std::wstring& label);
+    void HandleWindowPress(double x, double y);
+    void HandleEditorPress(GtkGestureClick* gesture, unsigned int button, double x, double y);
+    void OnContextPopoverClosed(GtkWidget* popover);
 
     bool NewDocument();
     bool OpenFile(const std::wstring& path, std::wstring& errorMessage);
@@ -120,7 +147,18 @@ public:
     bool SetPageMargins(const AutomationPageMargins& margins, std::wstring& errorMessage);
     AutomationPageMargins GetPageMargins() const;
     bool PrintToTestSink(const std::wstring& path, std::wstring& errorMessage) const;
+    classic_notepad::AppearanceTheme AppearanceTheme() const;
+    bool DarkModeEnabled() const;
+    bool HighContrastThemeActive() const;
+    void SetAppearanceTheme(classic_notepad::AppearanceTheme theme);
+    void RefreshAppearanceFromSystem();
+    classic_notepad::SpellCapability SpellCheckCapability() const;
+    std::wstring SpellCheckLanguage() const;
     bool SpellCheckAvailable() const;
+    std::vector<AutomationSpellingIssue> CheckSpelling(const std::wstring& text) const;
+    std::vector<std::wstring> SuggestSpelling(const std::wstring& word, std::size_t limit) const;
+    bool IgnoreSpelling(const std::wstring& word, std::wstring& errorMessage);
+    bool AddSpelling(const std::wstring& word, bool dryRun, std::wstring& errorMessage);
 
     void OnBufferChanged();
     void OnCursorMoved();
@@ -139,6 +177,10 @@ private:
     int CurrentLine() const;
     int MaxLine() const;
     void ApplyFont();
+    void ApplyAppearance();
+    void EnsureThemeProvider();
+    bool SystemPrefersDark() const;
+    bool DetectHighContrastTheme() const;
     void InstallContextMenu();
     GtkPageSetup* EnsurePageSetup();
     GtkPrintSettings* EnsurePrintSettings();
@@ -157,20 +199,31 @@ private:
 
     GtkApplication* application_ = nullptr;
     GtkWidget* window_ = nullptr;
+    GtkWidget* root_ = nullptr;
     GtkWidget* menuBar_ = nullptr;
     GtkWidget* textView_ = nullptr;
+    GtkWidget* contextPopover_ = nullptr;
+    GMenuModel* contextMenuModel_ = nullptr;
     GtkTextBuffer* buffer_ = nullptr;
     GtkWidget* statusBar_ = nullptr;
     GtkWidget* statusLabel_ = nullptr;
     GtkCssProvider* fontProvider_ = nullptr;
+    GtkCssProvider* themeProvider_ = nullptr;
     GtkPageSetup* pageSetup_ = nullptr;
     GtkPrintSettings* printSettings_ = nullptr;
+
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    std::unique_ptr<GtkSpellingService> spelling_;
+#endif
 
     bool suppressChange_ = false;
     bool automationMode_ = false;
     bool automationVisible_ = false;
     bool wordWrap_ = false;
     bool statusBarVisible_ = true;
+    classic_notepad::AppearanceTheme appearanceTheme_ = classic_notepad::AppearanceTheme::System;
+    bool darkModeEnabled_ = false;
+    bool highContrastThemeActive_ = false;
     AutomationPageMargins pageMargins_;
 };
 

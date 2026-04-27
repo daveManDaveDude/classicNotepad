@@ -33,6 +33,46 @@ class EditCommandTests(unittest.TestCase):
             app.command("selectAll")
             self.assertEqual(app.command("getSelection")["selection"], {"start": 0, "end": 4})
 
+    def test_delete_removes_character_after_caret(self):
+        with ClassicNotepadDriver(automation_binary(), automation_platform()) as app:
+            app.command("setText", text="abcdef")
+            app.command("setSelection", start=2, end=2)
+
+            app.command("delete")
+
+            self.assertEqual(app.command("getText")["text"], "abdef")
+            self.assertEqual(app.command("getSelection")["selection"], {"start": 2, "end": 2})
+
+    def test_delete_removes_last_character_on_line(self):
+        with ClassicNotepadDriver(automation_binary(), automation_platform()) as app:
+            app.command("setText", text="abc\r\ndef")
+            app.command("setSelection", start=2, end=2)
+
+            app.command("delete")
+
+            self.assertEqual(app.command("getText")["text"], "ab\r\ndef")
+            self.assertEqual(app.command("getSelection")["selection"], {"start": 2, "end": 2})
+
+    def test_delete_removes_final_character_in_document(self):
+        with ClassicNotepadDriver(automation_binary(), automation_platform()) as app:
+            app.command("setText", text="abc")
+            app.command("setSelection", start=2, end=2)
+
+            app.command("delete")
+
+            self.assertEqual(app.command("getText")["text"], "ab")
+            self.assertEqual(app.command("getSelection")["selection"], {"start": 2, "end": 2})
+
+    def test_delete_at_end_of_document_does_nothing(self):
+        with ClassicNotepadDriver(automation_binary(), automation_platform()) as app:
+            app.command("setText", text="abcdef")
+            app.command("setSelection", start=6, end=6)
+
+            app.command("delete")
+
+            self.assertEqual(app.command("getText")["text"], "abcdef")
+            self.assertEqual(app.command("getSelection")["selection"], {"start": 6, "end": 6})
+
     def test_time_date_inserts_non_empty_text(self):
         with ClassicNotepadDriver(automation_binary(), automation_platform()) as app:
             app.command("insertTimeDate")

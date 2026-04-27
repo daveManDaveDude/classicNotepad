@@ -40,13 +40,14 @@ Completed so far:
   - Page Setup and Print menu actions backed by GTK print/page setup APIs
   - Help > About Classic Notepad
   - automation `pageSetup` and `printToTestSink` commands for deterministic print validation
-  - spell-check automation capability reporting, with Linux v1 gracefully unavailable
+  - spell-check automation capability reporting, with optional GTK/libspelling support when available
+  - shared appearance automation capability reporting and `CLASSIC_NOTEPAD_THEME` override support
   - shared JSON-lines automation coverage through phase 10
 
-Accepted v1 platform differences in `ClassicNotepadGtk`:
+Accepted v1 platform differences in `ClassicNotepadGtk` before the spelling parity follow-up:
 
-- No native Linux spell-check provider is enabled in v1. The app reports `spellCheck == false` and spelling commands return graceful unavailable results.
-- Linux dark mode is out of cross-platform v1 scope. The app reports `darkMode == false`.
+- Linux spell checking was initially unavailable in v1. The follow-up spelling phase enables optional `libspelling` support while preserving graceful unavailable results when the backend or dictionary is missing.
+- Linux dark mode is available through the shared appearance state. The app reports `appearanceTheme`, `effectiveAppearance`, `darkMode`, and `highContrast`.
 
 ## Definition Of Done
 
@@ -144,10 +145,11 @@ The Linux binary is feature-compatible when:
 ### Spell Checking
 
 - Windows currently supports `en-GB` through the Windows Spell Checking API.
-- Linux v1 may expose spell checking as unavailable unless a native-friendly strategy is chosen.
+- Linux supports optional GTK/libspelling spell checking when `libspelling-1` and `hunspell-en-gb` are present.
 - Tests should treat spell checking as a capability:
   - `spellCheck == true` on configured Windows machines with `en-GB`.
-  - `spellCheck == false` is acceptable on Linux v1 if documented and graceful.
+  - `spellCheck == true` on configured Linux builds with `libspelling-1` and `hunspell-en-gb`.
+  - `spellCheck == false` remains acceptable when the Linux backend or dictionary is missing, as long as it is documented and graceful.
 
 ## Automation Strategy
 
@@ -241,6 +243,8 @@ Initial required commands:
 - `getFont`
 - `pageSetup`
 - `printToTestSink`
+- `getAppearance`
+- `setAppearanceTheme`
 - `close`
 
 Capability response example:
@@ -256,7 +260,10 @@ Capability response example:
     "pageSetup": true,
     "fontChooser": true,
     "spellCheck": true,
-    "darkMode": true
+    "darkMode": true,
+    "appearanceTheme": "dark",
+    "effectiveAppearance": "dark",
+    "highContrast": false
   }
 }
 ```
@@ -271,7 +278,10 @@ Linux v1 may report:
   "pageSetup": true,
   "fontChooser": true,
   "spellCheck": false,
-  "darkMode": false
+  "darkMode": true,
+  "appearanceTheme": "dark",
+  "effectiveAppearance": "dark",
+  "highContrast": false
 }
 ```
 
@@ -292,6 +302,7 @@ tests/automation/
   test_format_view_status.py
   test_printing.py
   test_spell_capability.py
+  test_appearance_theme.py
   fixtures/
 ```
 
@@ -401,6 +412,15 @@ Tests:
 - If unavailable:
   - app remains usable.
   - spelling commands return a graceful unavailable result.
+
+### Appearance Tests
+
+- `getCapabilities` reports `appearanceTheme`, `effectiveAppearance`, `darkMode`, and `highContrast`.
+- `CLASSIC_NOTEPAD_THEME=dark` reports a dark effective appearance unless high contrast suppresses custom colors.
+- `CLASSIC_NOTEPAD_THEME=light` reports a light effective appearance.
+- `CLASSIC_NOTEPAD_THEME=system` follows the desktop preference when GTK or Windows exposes it.
+- Invalid environment values fall back to `System`.
+- `setAppearanceTheme` can switch System/Light/Dark at runtime and rejects invalid values.
 
 ## Implementation Plan
 
@@ -601,18 +621,20 @@ Verification results:
 
 - Windows Debug build: passed.
 - Windows Debug CTest: `TextConversionTests` and `TextConversionPortableSmokeTests` passed.
-- Windows Debug automation: 20 tests passed.
+- Windows Debug automation: 24 tests passed.
 - Ubuntu Debug build: passed.
-- Ubuntu Debug CTest: `TextConversionTests` passed.
-- Ubuntu Debug automation: 20 tests passed.
+- Ubuntu Debug CTest: `LinuxSpellingProbe` and `TextConversionTests` passed.
+- Ubuntu Debug automation: 24 tests passed.
 - Windows Release build with `-SkipVersionIncrement`: passed.
 - Windows Release CTest: `TextConversionTests` and `TextConversionPortableSmokeTests` passed.
+- Windows Release automation: 24 tests passed.
 - Ubuntu Release-style build and CTest: passed.
+- Ubuntu Release automation: 24 tests passed.
 
 Accepted capability differences:
 
-- Linux spell checking remains unavailable in v1 (`spellCheck: false`).
-- Linux dark mode remains unavailable in v1 (`darkMode: false`).
+- Linux spell checking is optional after the spelling follow-up (`spellCheck: true` when `libspelling-1` and `hunspell-en-gb` are present; graceful unavailable otherwise).
+- Linux dark mode is no longer an accepted gap. It is implemented through GTK CSS classes and the shared appearance state, with high-contrast GTK themes intentionally left to the desktop theme.
 
 ## Suggested Commands For Future Context
 

@@ -14,6 +14,7 @@ The requested differences to address are:
 This plan assumes the existing dark-mode work remains in place, including:
 
 - Detecting Windows app dark mode through `AppsUseLightTheme`.
+- Honoring the shared `CLASSIC_NOTEPAD_THEME=system|light|dark` override for deterministic tests.
 - Avoiding direct `SetWindowTheme(..., "DarkMode_Explorer", ...)` calls because that path previously broke under the debugger in `uxtheme.dll`.
 - Using DWM only for the title bar and explicit Win32 painting for app-owned areas.
 

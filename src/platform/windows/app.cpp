@@ -587,12 +587,8 @@ bool IsHighContrastEnabled()
     return (highContrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
 }
 
-bool ShouldUseDarkMode()
+bool SystemPrefersDarkMode()
 {
-    if (IsHighContrastEnabled()) {
-        return false;
-    }
-
     DWORD appsUseLightTheme = 1;
     DWORD valueSize = sizeof(appsUseLightTheme);
     const LSTATUS result = RegGetValueW(
@@ -605,6 +601,25 @@ bool ShouldUseDarkMode()
         &valueSize);
 
     return result == ERROR_SUCCESS && appsUseLightTheme == 0;
+}
+
+classic_notepad::AppearanceTheme AppearanceThemeFromEnvironment()
+{
+    char value[32] {};
+    const DWORD length = GetEnvironmentVariableA(
+        classic_notepad::kAppearanceThemeEnvironmentVariable,
+        value,
+        static_cast<DWORD>(sizeof(value)));
+    if (length == 0 || length >= sizeof(value)) {
+        return classic_notepad::AppearanceTheme::System;
+    }
+
+    return classic_notepad::ParseAppearanceThemeOrSystem(value);
+}
+
+bool ShouldUseDarkMode(classic_notepad::AppearanceTheme theme)
+{
+    return classic_notepad::ResolveDarkMode(theme, SystemPrefersDarkMode(), IsHighContrastEnabled());
 }
 
 void ApplyDarkTitleBar(HWND window, bool useDarkMode)
@@ -1538,7 +1553,8 @@ ClassicNotepadApp::ClassicNotepadApp(HINSTANCE instance)
 {
     const HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     comInitialized_ = SUCCEEDED(hr);
-    darkModeEnabled_ = ShouldUseDarkMode();
+    appearanceTheme_ = AppearanceThemeFromEnvironment();
+    darkModeEnabled_ = ShouldUseDarkMode(appearanceTheme_);
     RecreateThemeBrushes();
 }
 
@@ -2194,7 +2210,7 @@ void ClassicNotepadApp::ApplyOwnerDrawToPopupMenu(
         itemInfo.cbSize = sizeof(itemInfo);
         itemInfo.fMask = MIIM_ID;
         if (GetMenuItemInfoW(menu, static_cast<UINT>(index), TRUE, &itemInfo) &&
-            itemInfo.wID == ID_VIEW_STATUS_BAR) {
+            (itemInfo.wID == ID_FORMAT_WORD_WRAP || itemInfo.wID == ID_VIEW_STATUS_BAR)) {
             reserveIconSpace = true;
             break;
         }
@@ -2289,7 +2305,7 @@ void ClassicNotepadApp::UpdateMenuChrome()
 
 void ClassicNotepadApp::UpdateThemeFromSystem()
 {
-    const bool newDarkMode = ShouldUseDarkMode();
+    const bool newDarkMode = ShouldUseDarkMode(appearanceTheme_);
     if (darkModeEnabled_ != newDarkMode) {
         darkModeEnabled_ = newDarkMode;
         RecreateThemeBrushes();
@@ -4628,6 +4644,16 @@ void ClassicNotepadApp::HandlePaste()
 
 void ClassicNotepadApp::HandleDelete()
 {
+    DWORD selectionStart = 0;
+    DWORD selectionEnd = 0;
+    GetSelectionRange(selectionStart, selectionEnd);
+    if (selectionStart == selectionEnd) {
+        const int textLength = GetWindowTextLengthW(editor_);
+        if (selectionStart < static_cast<DWORD>(textLength)) {
+            SendMessageW(editor_, EM_SETSEL, selectionStart, selectionStart + 1);
+        }
+    }
+
     SendMessageW(editor_, WM_CLEAR, 0, 0);
     UpdateStatusBar();
     UpdateScrollBars();
@@ -5005,6 +5031,20 @@ void ClassicNotepadApp::AutomationPaste()
 
 void ClassicNotepadApp::AutomationDeleteSelection()
 {
+    DWORD selectionStart = 0;
+    DWORD selectionEnd = 0;
+    GetSelectionRange(selectionStart, selectionEnd);
+    if (selectionStart == selectionEnd) {
+        return;
+    }
+
+    SendMessageW(editor_, WM_CLEAR, 0, 0);
+    UpdateStatusBar();
+    UpdateScrollBars();
+}
+
+void ClassicNotepadApp::AutomationDelete()
+{
     HandleDelete();
 }
 
@@ -5324,6 +5364,22 @@ bool ClassicNotepadApp::AutomationAddSpelling(
 bool ClassicNotepadApp::AutomationDarkModeEnabled() const
 {
     return darkModeEnabled_;
+}
+
+classic_notepad::AppearanceTheme ClassicNotepadApp::AutomationAppearanceTheme() const
+{
+    return appearanceTheme_;
+}
+
+bool ClassicNotepadApp::AutomationHighContrastThemeActive() const
+{
+    return IsHighContrastEnabled();
+}
+
+void ClassicNotepadApp::AutomationSetAppearanceTheme(classic_notepad::AppearanceTheme theme)
+{
+    appearanceTheme_ = theme;
+    UpdateThemeFromSystem();
 }
 
 bool ClassicNotepadApp::ConfirmSaveChanges()
