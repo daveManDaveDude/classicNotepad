@@ -95,25 +95,30 @@ void OnTimeDate(GSimpleAction*, GVariant*, gpointer userData)
     static_cast<GtkNotepadApp*>(userData)->HandleTimeDate();
 }
 
-void OnWordWrap(GSimpleAction*, GVariant*, gpointer userData)
+gboolean DismissOpenMenusAfterAction(gpointer userData);
+gboolean ApplyAppearanceThemeAfterMenuDismissal(gpointer userData);
+void QueueMenuDismissal(GtkNotepadApp* app);
+void QueueAppearanceThemeChange(GtkNotepadApp* app, classic_notepad::AppearanceTheme theme);
+
+struct PendingAppearanceThemeChange {
+    GtkNotepadApp* app = nullptr;
+    classic_notepad::AppearanceTheme theme = classic_notepad::AppearanceTheme::System;
+};
+
+void OnWordWrapChangeState(GSimpleAction*, GVariant* value, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleToggleWordWrap();
+    if (value == nullptr) {
+        return;
+    }
+
+    auto* app = static_cast<GtkNotepadApp*>(userData);
+    app->SetWordWrap(g_variant_get_boolean(value) != FALSE);
+    QueueMenuDismissal(app);
 }
 
 void OnFont(GSimpleAction*, GVariant*, gpointer userData)
 {
     static_cast<GtkNotepadApp*>(userData)->HandleChooseFont();
-}
-
-void OnStatusBar(GSimpleAction* action, GVariant*, gpointer)
-{
-    GVariant* state = g_action_get_state(G_ACTION(action));
-    const bool visible = state == nullptr || g_variant_get_boolean(state) == FALSE;
-    if (state != nullptr) {
-        g_variant_unref(state);
-    }
-
-    g_action_change_state(G_ACTION(action), g_variant_new_boolean(visible));
 }
 
 void OnStatusBarChangeState(GSimpleAction*, GVariant* value, gpointer userData)
@@ -122,22 +127,51 @@ void OnStatusBarChangeState(GSimpleAction*, GVariant* value, gpointer userData)
         return;
     }
 
-    static_cast<GtkNotepadApp*>(userData)->SetStatusBarVisible(g_variant_get_boolean(value) != FALSE);
+    auto* app = static_cast<GtkNotepadApp*>(userData);
+    app->SetStatusBarVisible(g_variant_get_boolean(value) != FALSE);
+    QueueMenuDismissal(app);
+}
+
+gboolean DismissOpenMenusAfterAction(gpointer userData)
+{
+    static_cast<GtkNotepadApp*>(userData)->DismissOpenMenus();
+    return G_SOURCE_REMOVE;
+}
+
+gboolean ApplyAppearanceThemeAfterMenuDismissal(gpointer userData)
+{
+    auto* pending = static_cast<PendingAppearanceThemeChange*>(userData);
+    pending->app->SetAppearanceTheme(pending->theme);
+    delete pending;
+    return G_SOURCE_REMOVE;
+}
+
+void QueueMenuDismissal(GtkNotepadApp* app)
+{
+    g_idle_add(DismissOpenMenusAfterAction, app);
+}
+
+void QueueAppearanceThemeChange(GtkNotepadApp* app, classic_notepad::AppearanceTheme theme)
+{
+    g_timeout_add(100, ApplyAppearanceThemeAfterMenuDismissal, new PendingAppearanceThemeChange {app, theme});
 }
 
 void OnAppearanceSystem(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->SetAppearanceTheme(classic_notepad::AppearanceTheme::System);
+    auto* app = static_cast<GtkNotepadApp*>(userData);
+    QueueAppearanceThemeChange(app, classic_notepad::AppearanceTheme::System);
 }
 
 void OnAppearanceLight(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->SetAppearanceTheme(classic_notepad::AppearanceTheme::Light);
+    auto* app = static_cast<GtkNotepadApp*>(userData);
+    QueueAppearanceThemeChange(app, classic_notepad::AppearanceTheme::Light);
 }
 
 void OnAppearanceDark(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->SetAppearanceTheme(classic_notepad::AppearanceTheme::Dark);
+    auto* app = static_cast<GtkNotepadApp*>(userData);
+    QueueAppearanceThemeChange(app, classic_notepad::AppearanceTheme::Dark);
 }
 
 void OnAbout(GSimpleAction*, GVariant*, gpointer userData)
@@ -164,9 +198,9 @@ const GActionEntry kActions[] = {
     {"go-to", OnGoTo, nullptr, nullptr, nullptr},
     {"select-all", OnSelectAll, nullptr, nullptr, nullptr},
     {"time-date", OnTimeDate, nullptr, nullptr, nullptr},
-    {"word-wrap", OnWordWrap, nullptr, nullptr, nullptr},
+    {"word-wrap", nullptr, nullptr, "false", OnWordWrapChangeState},
     {"font", OnFont, nullptr, nullptr, nullptr},
-    {"status-bar", OnStatusBar, nullptr, "true", OnStatusBarChangeState},
+    {"status-bar", nullptr, nullptr, "true", OnStatusBarChangeState},
     {"appearance-system", OnAppearanceSystem, nullptr, nullptr, nullptr},
     {"appearance-light", OnAppearanceLight, nullptr, nullptr, nullptr},
     {"appearance-dark", OnAppearanceDark, nullptr, nullptr, nullptr},

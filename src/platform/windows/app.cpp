@@ -2198,7 +2198,7 @@ void ClassicNotepadApp::ApplyOwnerDrawToPopupMenu(
         itemInfo.cbSize = sizeof(itemInfo);
         itemInfo.fMask = MIIM_ID;
         if (GetMenuItemInfoW(menu, static_cast<UINT>(index), TRUE, &itemInfo) &&
-            itemInfo.wID == ID_VIEW_STATUS_BAR) {
+            (itemInfo.wID == ID_FORMAT_WORD_WRAP || itemInfo.wID == ID_VIEW_STATUS_BAR)) {
             reserveIconSpace = true;
             break;
         }

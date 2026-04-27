@@ -93,6 +93,11 @@ public:
     void HandleChooseFont();
     void HandleToggleStatusBar();
     void HandleAbout();
+    void DismissOpenMenus();
+    void DismissOpenMenusAndResetModels();
+    void HandleWindowPress(double x, double y);
+    void HandleEditorPress(GtkGestureClick* gesture, unsigned int button, double x, double y);
+    void OnContextPopoverClosed(GtkWidget* popover);
 
     bool NewDocument();
     bool OpenFile(const std::wstring& path, std::wstring& errorMessage);
@@ -195,6 +200,8 @@ private:
     GtkWidget* root_ = nullptr;
     GtkWidget* menuBar_ = nullptr;
     GtkWidget* textView_ = nullptr;
+    GtkWidget* contextPopover_ = nullptr;
+    GMenuModel* contextMenuModel_ = nullptr;
     GtkTextBuffer* buffer_ = nullptr;
     GtkWidget* statusBar_ = nullptr;
     GtkWidget* statusLabel_ = nullptr;

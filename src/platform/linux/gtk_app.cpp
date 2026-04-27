@@ -23,6 +23,9 @@
 namespace classic_notepad::linux_ui {
 namespace {
 
+void ApplyClassicCursorThemeSize(GtkWidget* widget);
+void PopdownMappedPopovers(GtkWidget* widget);
+
 void OnActivate(GtkApplication* application, gpointer userData)
 {
     static_cast<GtkNotepadApp*>(userData)->Activate(application);
@@ -46,6 +49,49 @@ gboolean OnCloseRequest(GtkWindow*, gpointer userData)
 void OnGtkSettingsAppearanceChanged(GObject*, GParamSpec*, gpointer userData)
 {
     static_cast<GtkNotepadApp*>(userData)->RefreshAppearanceFromSystem();
+}
+
+void OnWindowScaleFactorChanged(GObject* object, GParamSpec*, gpointer)
+{
+    if (GTK_IS_WIDGET(object)) {
+        ApplyClassicCursorThemeSize(GTK_WIDGET(object));
+    }
+}
+
+void OnWindowPressed(GtkGestureClick*, int, double x, double y, gpointer userData)
+{
+    static_cast<GtkNotepadApp*>(userData)->HandleWindowPress(x, y);
+}
+
+void OnEditorPressed(GtkGestureClick* gesture, int, double x, double y, gpointer userData)
+{
+    static_cast<GtkNotepadApp*>(userData)->HandleEditorPress(
+        gesture,
+        static_cast<unsigned int>(gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(gesture))),
+        x,
+        y);
+}
+
+void OnContextPopoverClosedSignal(GtkPopover* popover, gpointer userData)
+{
+    static_cast<GtkNotepadApp*>(userData)->OnContextPopoverClosed(GTK_WIDGET(popover));
+}
+
+void PopdownMappedPopovers(GtkWidget* widget)
+{
+    if (widget == nullptr) {
+        return;
+    }
+
+    for (GtkWidget* child = gtk_widget_get_first_child(widget); child != nullptr;) {
+        GtkWidget* next = gtk_widget_get_next_sibling(child);
+        PopdownMappedPopovers(child);
+        child = next;
+    }
+
+    if (GTK_IS_POPOVER(widget) && gtk_widget_get_mapped(widget)) {
+        gtk_popover_popdown(GTK_POPOVER(widget));
+    }
 }
 
 void OnWindowDestroy(GtkWidget*, gpointer userData)
@@ -447,6 +493,44 @@ int ReadSettingsEnum(GtkSettings* settings, const char* name, int fallback)
     return result;
 }
 
+int BaseCursorThemeSize(GtkSettings* settings)
+{
+    static int baseSize = 0;
+    if (baseSize > 0) {
+        return baseSize;
+    }
+
+    int configuredSize = 0;
+    if (settings != nullptr && SettingsHasProperty(settings, "gtk-cursor-theme-size")) {
+        g_object_get(settings, "gtk-cursor-theme-size", &configuredSize, nullptr);
+    }
+
+    constexpr int kClassicCursorThemeSize = 24;
+    baseSize = configuredSize > 0 ? configuredSize : kClassicCursorThemeSize;
+    return baseSize;
+}
+
+void ApplyClassicCursorThemeSize(GtkWidget* widget)
+{
+    GtkSettings* settings = gtk_settings_get_default();
+    if (!SettingsHasProperty(settings, "gtk-cursor-theme-size")) {
+        return;
+    }
+
+    const int scaleFactor = widget == nullptr ? 1 : std::max(1, gtk_widget_get_scale_factor(widget));
+    constexpr int kMinimumCursorThemeSize = 8;
+    const int baseSize = BaseCursorThemeSize(settings);
+    const int targetSize = scaleFactor > 1
+        ? std::max(kMinimumCursorThemeSize, baseSize / scaleFactor)
+        : baseSize;
+
+    int currentSize = 0;
+    g_object_get(settings, "gtk-cursor-theme-size", &currentSize, nullptr);
+    if (currentSize != targetSize) {
+        g_object_set(settings, "gtk-cursor-theme-size", targetSize, nullptr);
+    }
+}
+
 classic_notepad::AppearanceTheme ThemeFromEnvironment()
 {
     const char* value = g_getenv(classic_notepad::kAppearanceThemeEnvironmentVariable);
@@ -603,6 +687,7 @@ int GtkNotepadApp::RunAutomation(bool visible)
         gtk_window_present(GTK_WINDOW(window_));
     }
     PumpEvents();
+    ApplyClassicCursorThemeSize(window_);
 
     GtkAutomationController controller(*this);
     const int result = controller.Run();
@@ -620,12 +705,14 @@ void GtkNotepadApp::Activate(GtkApplication* application)
 {
     if (window_ != nullptr) {
         gtk_window_present(GTK_WINDOW(window_));
+        ApplyClassicCursorThemeSize(window_);
         return;
     }
 
     BuildWindow(application);
     HandleInitialFilePath(false);
     gtk_window_present(GTK_WINDOW(window_));
+    ApplyClassicCursorThemeSize(window_);
 }
 
 void GtkNotepadApp::PumpEvents()
@@ -932,6 +1019,85 @@ void GtkNotepadApp::HandleAbout()
     }
 
     ShowAboutDialog(Window(), CLASSIC_NOTEPAD_VERSION_DISPLAY_W);
+}
+
+void GtkNotepadApp::DismissOpenMenus()
+{
+    PopdownMappedPopovers(window_);
+
+    if (contextPopover_ != nullptr) {
+        gtk_popover_popdown(GTK_POPOVER(contextPopover_));
+    }
+}
+
+void GtkNotepadApp::DismissOpenMenusAndResetModels()
+{
+    DismissOpenMenus();
+
+    if (menuBar_ != nullptr && GTK_IS_POPOVER_MENU_BAR(menuBar_)) {
+        GMenuModel* model = gtk_popover_menu_bar_get_menu_model(GTK_POPOVER_MENU_BAR(menuBar_));
+        if (model != nullptr) {
+            g_object_ref(model);
+            gtk_popover_menu_bar_set_menu_model(GTK_POPOVER_MENU_BAR(menuBar_), nullptr);
+            gtk_popover_menu_bar_set_menu_model(GTK_POPOVER_MENU_BAR(menuBar_), model);
+            g_object_unref(model);
+        }
+    }
+}
+
+void GtkNotepadApp::HandleWindowPress(double x, double y)
+{
+    if (window_ == nullptr) {
+        return;
+    }
+
+    if (menuBar_ != nullptr) {
+        graphene_rect_t menuBounds {};
+        if (gtk_widget_compute_bounds(menuBar_, window_, &menuBounds) &&
+            x >= menuBounds.origin.x &&
+            x < menuBounds.origin.x + menuBounds.size.width &&
+            y >= menuBounds.origin.y &&
+            y < menuBounds.origin.y + menuBounds.size.height) {
+            PopdownMappedPopovers(window_);
+            return;
+        }
+    }
+
+    DismissOpenMenusAndResetModels();
+}
+
+void GtkNotepadApp::HandleEditorPress(GtkGestureClick* gesture, unsigned int button, double x, double y)
+{
+    if (button != GDK_BUTTON_SECONDARY || textView_ == nullptr || contextMenuModel_ == nullptr) {
+        return;
+    }
+
+    DismissOpenMenusAndResetModels();
+
+    contextPopover_ = gtk_popover_menu_new_from_model(contextMenuModel_);
+    gtk_popover_set_autohide(GTK_POPOVER(contextPopover_), TRUE);
+    gtk_popover_set_has_arrow(GTK_POPOVER(contextPopover_), FALSE);
+    gtk_widget_set_parent(contextPopover_, textView_);
+
+    const GdkRectangle point {static_cast<int>(x), static_cast<int>(y), 1, 1};
+    gtk_popover_set_pointing_to(GTK_POPOVER(contextPopover_), &point);
+    g_signal_connect(contextPopover_, "closed", G_CALLBACK(OnContextPopoverClosedSignal), this);
+    gtk_popover_popup(GTK_POPOVER(contextPopover_));
+
+    gtk_gesture_set_state(GTK_GESTURE(gesture), GTK_EVENT_SEQUENCE_CLAIMED);
+}
+
+void GtkNotepadApp::OnContextPopoverClosed(GtkWidget* popover)
+{
+    if (popover == nullptr) {
+        return;
+    }
+
+    if (contextPopover_ == popover) {
+        contextPopover_ = nullptr;
+    }
+
+    gtk_widget_unparent(popover);
 }
 
 bool GtkNotepadApp::NewDocument()
@@ -1482,6 +1648,13 @@ void GtkNotepadApp::SetWordWrap(bool enabled)
     if (textView_ != nullptr) {
         gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(textView_), enabled ? GTK_WRAP_WORD_CHAR : GTK_WRAP_NONE);
     }
+
+    if (window_ != nullptr) {
+        GAction* action = g_action_map_lookup_action(G_ACTION_MAP(window_), "word-wrap");
+        if (G_IS_SIMPLE_ACTION(action)) {
+            g_simple_action_set_state(G_SIMPLE_ACTION(action), g_variant_new_boolean(wordWrap_));
+        }
+    }
 }
 
 bool GtkNotepadApp::GetWordWrap() const
@@ -1503,14 +1676,6 @@ void GtkNotepadApp::SetStatusBarVisible(bool visible)
         }
     }
 
-    if (menuBar_ != nullptr && GTK_IS_POPOVER_MENU_BAR(menuBar_)) {
-        GMenuModel* model = gtk_popover_menu_bar_get_menu_model(GTK_POPOVER_MENU_BAR(menuBar_));
-        if (model != nullptr) {
-            g_object_ref(model);
-            gtk_popover_menu_bar_set_menu_model(GTK_POPOVER_MENU_BAR(menuBar_), model);
-            g_object_unref(model);
-        }
-    }
 }
 
 bool GtkNotepadApp::GetStatusBarVisible() const
@@ -1720,10 +1885,17 @@ void GtkNotepadApp::OnWindowDestroyed()
 #endif
     window_ = nullptr;
     root_ = nullptr;
+    menuBar_ = nullptr;
+    contextPopover_ = nullptr;
     textView_ = nullptr;
     buffer_ = nullptr;
     statusBar_ = nullptr;
     statusLabel_ = nullptr;
+
+    if (contextMenuModel_ != nullptr) {
+        g_object_unref(contextMenuModel_);
+        contextMenuModel_ = nullptr;
+    }
 
     if (application_ != nullptr) {
         g_application_quit(G_APPLICATION(application_));
@@ -1984,6 +2156,11 @@ void GtkNotepadApp::InstallContextMenu()
         return;
     }
 
+    if (contextMenuModel_ != nullptr) {
+        g_object_unref(contextMenuModel_);
+        contextMenuModel_ = nullptr;
+    }
+
     GMenu* menu = g_menu_new();
     GMenuModel* spellingMenuModel = nullptr;
 #if CLASSIC_NOTEPAD_HAS_LIBSPELLING
@@ -2011,7 +2188,8 @@ void GtkNotepadApp::InstallContextMenu()
     g_menu_append(selectSection, "Select All", "win.select-all");
     g_menu_append_section(menu, nullptr, G_MENU_MODEL(selectSection));
 
-    gtk_text_view_set_extra_menu(GTK_TEXT_VIEW(textView_), G_MENU_MODEL(menu));
+    contextMenuModel_ = G_MENU_MODEL(g_object_ref(menu));
+    gtk_text_view_set_extra_menu(GTK_TEXT_VIEW(textView_), nullptr);
     g_object_unref(selectSection);
     g_object_unref(clipboardSection);
     g_object_unref(undoSection);
@@ -2024,6 +2202,13 @@ void GtkNotepadApp::BuildWindow(GtkApplication* application)
     gtk_window_set_default_size(GTK_WINDOW(window_), 800, 500);
     g_signal_connect(window_, "close-request", G_CALLBACK(OnCloseRequest), this);
     g_signal_connect(window_, "destroy", G_CALLBACK(OnWindowDestroy), this);
+    g_signal_connect(window_, "notify::scale-factor", G_CALLBACK(OnWindowScaleFactorChanged), nullptr);
+    ApplyClassicCursorThemeSize(window_);
+
+    GtkGesture* windowClick = gtk_gesture_click_new();
+    gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(windowClick), GTK_PHASE_CAPTURE);
+    g_signal_connect(windowClick, "pressed", G_CALLBACK(OnWindowPressed), this);
+    gtk_widget_add_controller(window_, GTK_EVENT_CONTROLLER(windowClick));
 
     InstallAppActions(*this);
 
@@ -2050,6 +2235,12 @@ void GtkNotepadApp::BuildWindow(GtkApplication* application)
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(textView_), TRUE);
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(textView_), wordWrap_ ? GTK_WRAP_WORD_CHAR : GTK_WRAP_NONE);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolledWindow), textView_);
+
+    GtkGesture* editorClick = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(editorClick), 0);
+    gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(editorClick), GTK_PHASE_CAPTURE);
+    g_signal_connect(editorClick, "pressed", G_CALLBACK(OnEditorPressed), this);
+    gtk_widget_add_controller(textView_, GTK_EVENT_CONTROLLER(editorClick));
 
     buffer_ = gtk_text_view_get_buffer(GTK_TEXT_VIEW(textView_));
     gtk_text_buffer_set_enable_undo(buffer_, TRUE);
