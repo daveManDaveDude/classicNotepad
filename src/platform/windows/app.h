@@ -55,6 +55,8 @@ public:
     void AutomationCopy();
     void AutomationPaste();
     void AutomationDeleteSelection();
+    void AutomationPressInsert();
+    void AutomationTypeText(const std::wstring& text);
     bool AutomationFind(const std::wstring& text, bool matchCase, bool wholeWord, bool searchDown);
     bool AutomationFindNext(bool matchCase, bool wholeWord, bool searchDown);
     bool AutomationReplace(
@@ -326,6 +328,7 @@ private:
     bool customScrollBarDragging_ = false;
     bool darkModeEnabled_ = false;
     bool automationMode_ = false;
+    bool overwriteMode_ = false;
     bool suppressEditorChange_ = false;
     bool comInitialized_ = false;
     SpellCheckService spellChecker_;

@@ -749,6 +749,21 @@ std::string HandleCommand(
         return ResponseWriter(id, true).Finish();
     }
 
+    if (name == L"typeText") {
+        std::wstring text;
+        if (!RequireString(request, "text", text, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        app.AutomationTypeText(text);
+        return ResponseWriter(id, true).Finish();
+    }
+
+    if (name == L"pressInsert") {
+        app.AutomationPressInsert();
+        return ResponseWriter(id, true).Finish();
+    }
+
     if (name == L"getTitle") {
         ResponseWriter response(id, true);
         response.AddString("title", app.AutomationGetTitle());

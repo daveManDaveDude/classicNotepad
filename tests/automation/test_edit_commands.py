@@ -39,6 +39,24 @@ class EditCommandTests(unittest.TestCase):
             self.assertNotEqual(app.command("getText")["text"], "")
             self.assertTrue(app.command("isModified")["modified"])
 
+    def test_windows_insert_toggles_overtype_mode(self):
+        if automation_platform() != "windows":
+            self.skipTest("Windows edit control Insert-key behavior")
+
+        with ClassicNotepadDriver(automation_binary(), automation_platform()) as app:
+            app.command("setText", text="abcdef")
+            app.command("setSelection", start=2, end=2)
+
+            app.command("pressInsert")
+            app.command("typeText", text="X")
+            self.assertEqual(app.command("getText")["text"], "abXdef")
+            self.assertEqual(app.command("getSelection")["selection"], {"start": 3, "end": 3})
+
+            app.command("pressInsert")
+            app.command("typeText", text="Y")
+            self.assertEqual(app.command("getText")["text"], "abXYdef")
+            self.assertEqual(app.command("getSelection")["selection"], {"start": 4, "end": 4})
+
 
 if __name__ == "__main__":
     unittest.main()

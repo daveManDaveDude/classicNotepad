@@ -89,6 +89,18 @@ constexpr int kStatusBarSeparatorInset = 7;
 constexpr int kStatusBarMinHeight = 32;
 constexpr std::array<int, kStatusBarPartCount - 1> kStatusBarPartRightPercents{ 18, 40, 62 };
 
+bool IsPlainInsertKeyPress()
+{
+    return (GetKeyState(VK_CONTROL) & 0x8000) == 0 &&
+        (GetKeyState(VK_SHIFT) & 0x8000) == 0 &&
+        (GetKeyState(VK_MENU) & 0x8000) == 0;
+}
+
+bool IsOvertypeCharacter(WPARAM character)
+{
+    return character >= 0x20 && character != 0x7F;
+}
+
 struct GoToDialogState {
     int currentLine = 1;
     int maxLine = 1;
@@ -4996,6 +5008,20 @@ void ClassicNotepadApp::AutomationDeleteSelection()
     HandleDelete();
 }
 
+void ClassicNotepadApp::AutomationPressInsert()
+{
+    SendMessageW(editor_, WM_KEYDOWN, VK_INSERT, 0);
+}
+
+void ClassicNotepadApp::AutomationTypeText(const std::wstring& text)
+{
+    for (const wchar_t character : text) {
+        SendMessageW(editor_, WM_CHAR, static_cast<WPARAM>(character), 0);
+    }
+    UpdateStatusBar();
+    UpdateScrollBars();
+}
+
 bool ClassicNotepadApp::AutomationFind(
     const std::wstring& text,
     bool matchCase,
@@ -6679,6 +6705,27 @@ LRESULT CALLBACK ClassicNotepadApp::EditorWindowProc(HWND window, UINT message, 
 
         if (message == WM_SYSKEYUP && wParam == VK_MENU && app->menuKeyboardActive_) {
             return 0;
+        }
+
+        if (message == WM_KEYDOWN && wParam == VK_INSERT && IsPlainInsertKeyPress()) {
+            app->overwriteMode_ = !app->overwriteMode_;
+            app->UpdateStatusBar();
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
+
+        if (message == WM_CHAR && app->overwriteMode_ && IsOvertypeCharacter(wParam)) {
+            DWORD selectionStart = 0;
+            DWORD selectionEnd = 0;
+            app->GetSelectionRange(selectionStart, selectionEnd);
+            if (selectionStart == selectionEnd) {
+                const std::wstring text = app->GetEditorText();
+                if (selectionStart < text.size() &&
+                    text[selectionStart] != L'\r' &&
+                    text[selectionStart] != L'\n') {
+                    SendMessageW(window, EM_SETSEL, selectionStart, selectionStart + 1);
+                }
+            }
         }
 
         if (message == WM_MOUSEWHEEL && app->HandleMouseWheel(wParam)) {
