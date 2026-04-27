@@ -25,6 +25,9 @@ namespace {
 
 void ApplyClassicCursorThemeSize(GtkWidget* widget);
 void PopdownMappedPopovers(GtkWidget* widget);
+int CountMappedPopovers(GtkWidget* widget);
+bool ActivateFirstWidgetWithLabel(GtkWidget* widget, const char* label);
+gboolean OnEditorKeyPressed(GtkEventControllerKey* controller, guint keyval, guint keycode, GdkModifierType state, gpointer userData);
 
 void OnActivate(GtkApplication* application, gpointer userData)
 {
@@ -94,10 +97,78 @@ void PopdownMappedPopovers(GtkWidget* widget)
     }
 }
 
+int CountMappedPopovers(GtkWidget* widget)
+{
+    if (widget == nullptr) {
+        return 0;
+    }
+
+    int count = GTK_IS_POPOVER(widget) && gtk_widget_get_mapped(widget) ? 1 : 0;
+    for (GtkWidget* child = gtk_widget_get_first_child(widget); child != nullptr; child = gtk_widget_get_next_sibling(child)) {
+        count += CountMappedPopovers(child);
+    }
+    return count;
+}
+
+bool WidgetHasDirectLabel(GtkWidget* widget, const char* label)
+{
+    return GTK_IS_LABEL(widget) && std::strcmp(gtk_label_get_text(GTK_LABEL(widget)), label) == 0;
+}
+
+bool WidgetSubtreeHasLabel(GtkWidget* widget, const char* label)
+{
+    if (widget == nullptr) {
+        return false;
+    }
+
+    if (WidgetHasDirectLabel(widget, label)) {
+        return true;
+    }
+
+    for (GtkWidget* child = gtk_widget_get_first_child(widget); child != nullptr; child = gtk_widget_get_next_sibling(child)) {
+        if (WidgetSubtreeHasLabel(child, label)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ActivateFirstWidgetWithLabel(GtkWidget* widget, const char* label)
+{
+    if (widget == nullptr || !WidgetSubtreeHasLabel(widget, label)) {
+        return false;
+    }
+
+    for (GtkWidget* child = gtk_widget_get_first_child(widget); child != nullptr; child = gtk_widget_get_next_sibling(child)) {
+        if (ActivateFirstWidgetWithLabel(child, label)) {
+            return true;
+        }
+    }
+
+    return gtk_widget_activate(widget) != FALSE;
+}
+
 void OnWindowDestroy(GtkWidget*, gpointer userData)
 {
     auto* app = static_cast<GtkNotepadApp*>(userData);
     app->OnWindowDestroyed();
+}
+
+bool IsDeleteKey(guint keyval)
+{
+    return keyval == GDK_KEY_Delete || keyval == GDK_KEY_KP_Delete;
+}
+
+gboolean OnEditorKeyPressed(GtkEventControllerKey*, guint keyval, guint, GdkModifierType state, gpointer userData)
+{
+    constexpr GdkModifierType handledModifiers = static_cast<GdkModifierType>(
+        GDK_SHIFT_MASK | GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK | GDK_META_MASK);
+    if (!IsDeleteKey(keyval) || (state & handledModifiers) != 0) {
+        return FALSE;
+    }
+
+    static_cast<GtkNotepadApp*>(userData)->HandleDelete();
+    return TRUE;
 }
 
 std::vector<std::uint8_t> BytesFromString(const std::string& text)
@@ -896,7 +967,36 @@ void GtkNotepadApp::HandlePaste()
 
 void GtkNotepadApp::HandleDelete()
 {
-    DeleteSelection();
+    if (buffer_ == nullptr) {
+        return;
+    }
+
+    GtkTextIter start;
+    GtkTextIter end;
+    if (gtk_text_buffer_get_selection_bounds(buffer_, &start, &end)) {
+        DeleteSelection();
+        return;
+    }
+
+    gtk_text_buffer_get_iter_at_mark(buffer_, &start, gtk_text_buffer_get_insert(buffer_));
+    const std::wstring rawText = GetRawText();
+    const std::size_t bufferStart = static_cast<std::size_t>(gtk_text_iter_get_offset(&start));
+    if (bufferStart >= rawText.size()) {
+        return;
+    }
+
+    std::size_t lineBreakLength = 0;
+    const std::size_t bufferEnd = IsLineBreakAt(rawText, bufferStart, lineBreakLength)
+        ? bufferStart + lineBreakLength
+        : bufferStart + 1U;
+    gtk_text_buffer_get_iter_at_offset(buffer_, &end, static_cast<int>(ClampOffset(bufferEnd)));
+
+    gtk_text_buffer_begin_user_action(buffer_);
+    gtk_text_buffer_delete(buffer_, &start, &end);
+    gtk_text_buffer_end_user_action(buffer_);
+    document_.SetModified(true);
+    UpdateTitle();
+    UpdateStatus();
 }
 
 void GtkNotepadApp::HandleFind()
@@ -1043,6 +1143,32 @@ void GtkNotepadApp::DismissOpenMenusAndResetModels()
             g_object_unref(model);
         }
     }
+}
+
+int GtkNotepadApp::AutomationMappedMenuPopoverCount() const
+{
+    return CountMappedPopovers(window_);
+}
+
+bool GtkNotepadApp::AutomationActivateMenuLabel(const std::wstring& label)
+{
+    if (window_ == nullptr) {
+        return false;
+    }
+
+    if (!gtk_widget_get_mapped(window_)) {
+        gtk_window_present(GTK_WINDOW(window_));
+        PumpEvents();
+    }
+
+    const std::string utf8Label = Utf8FromWide(label);
+    if (utf8Label.empty()) {
+        return false;
+    }
+
+    const bool activated = ActivateFirstWidgetWithLabel(window_, utf8Label.c_str());
+    PumpEvents();
+    return activated;
 }
 
 void GtkNotepadApp::HandleWindowPress(double x, double y)
@@ -2235,6 +2361,11 @@ void GtkNotepadApp::BuildWindow(GtkApplication* application)
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(textView_), TRUE);
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(textView_), wordWrap_ ? GTK_WRAP_WORD_CHAR : GTK_WRAP_NONE);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolledWindow), textView_);
+
+    GtkEventController* editorKey = gtk_event_controller_key_new();
+    gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(editorKey), GTK_PHASE_CAPTURE);
+    g_signal_connect(editorKey, "key-pressed", G_CALLBACK(OnEditorKeyPressed), this);
+    gtk_widget_add_controller(textView_, editorKey);
 
     GtkGesture* editorClick = gtk_gesture_click_new();
     gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(editorClick), 0);

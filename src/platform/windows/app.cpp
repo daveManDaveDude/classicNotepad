@@ -4632,6 +4632,16 @@ void ClassicNotepadApp::HandlePaste()
 
 void ClassicNotepadApp::HandleDelete()
 {
+    DWORD selectionStart = 0;
+    DWORD selectionEnd = 0;
+    GetSelectionRange(selectionStart, selectionEnd);
+    if (selectionStart == selectionEnd) {
+        const int textLength = GetWindowTextLengthW(editor_);
+        if (selectionStart < static_cast<DWORD>(textLength)) {
+            SendMessageW(editor_, EM_SETSEL, selectionStart, selectionStart + 1);
+        }
+    }
+
     SendMessageW(editor_, WM_CLEAR, 0, 0);
     UpdateStatusBar();
     UpdateScrollBars();
@@ -5008,6 +5018,20 @@ void ClassicNotepadApp::AutomationPaste()
 }
 
 void ClassicNotepadApp::AutomationDeleteSelection()
+{
+    DWORD selectionStart = 0;
+    DWORD selectionEnd = 0;
+    GetSelectionRange(selectionStart, selectionEnd);
+    if (selectionStart == selectionEnd) {
+        return;
+    }
+
+    SendMessageW(editor_, WM_CLEAR, 0, 0);
+    UpdateStatusBar();
+    UpdateScrollBars();
+}
+
+void ClassicNotepadApp::AutomationDelete()
 {
     HandleDelete();
 }

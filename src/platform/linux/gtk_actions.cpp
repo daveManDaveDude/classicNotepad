@@ -134,13 +134,14 @@ void OnStatusBarChangeState(GSimpleAction*, GVariant* value, gpointer userData)
 
 gboolean DismissOpenMenusAfterAction(gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->DismissOpenMenus();
+    static_cast<GtkNotepadApp*>(userData)->DismissOpenMenusAndResetModels();
     return G_SOURCE_REMOVE;
 }
 
 gboolean ApplyAppearanceThemeAfterMenuDismissal(gpointer userData)
 {
     auto* pending = static_cast<PendingAppearanceThemeChange*>(userData);
+    pending->app->DismissOpenMenusAndResetModels();
     pending->app->SetAppearanceTheme(pending->theme);
     delete pending;
     return G_SOURCE_REMOVE;
@@ -153,7 +154,8 @@ void QueueMenuDismissal(GtkNotepadApp* app)
 
 void QueueAppearanceThemeChange(GtkNotepadApp* app, classic_notepad::AppearanceTheme theme)
 {
-    g_timeout_add(100, ApplyAppearanceThemeAfterMenuDismissal, new PendingAppearanceThemeChange {app, theme});
+    app->DismissOpenMenusAndResetModels();
+    g_idle_add(ApplyAppearanceThemeAfterMenuDismissal, new PendingAppearanceThemeChange {app, theme});
 }
 
 void OnAppearanceSystem(GSimpleAction*, GVariant*, gpointer userData)
@@ -233,7 +235,6 @@ void InstallAppActions(GtkNotepadApp& app)
     SetAccels(app.Application(), "win.cut", "<Primary>x");
     SetAccels(app.Application(), "win.copy", "<Primary>c");
     SetAccels(app.Application(), "win.paste", "<Primary>v");
-    SetAccels(app.Application(), "win.delete", "Delete");
     SetAccels(app.Application(), "win.find", "<Primary>f");
     SetAccels(app.Application(), "win.find-next", "F3");
     SetAccels(app.Application(), "win.replace", "<Primary>h");

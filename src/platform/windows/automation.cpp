@@ -866,6 +866,11 @@ std::string HandleCommand(
         return ResponseWriter(id, true).Finish();
     }
 
+    if (name == L"delete") {
+        app.AutomationDelete();
+        return ResponseWriter(id, true).Finish();
+    }
+
     if (name == L"find" || name == L"findNext") {
         std::wstring text;
         const bool matchCase = GetBool(request, "matchCase", false);

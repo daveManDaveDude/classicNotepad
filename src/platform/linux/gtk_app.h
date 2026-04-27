@@ -95,6 +95,8 @@ public:
     void HandleAbout();
     void DismissOpenMenus();
     void DismissOpenMenusAndResetModels();
+    int AutomationMappedMenuPopoverCount() const;
+    bool AutomationActivateMenuLabel(const std::wstring& label);
     void HandleWindowPress(double x, double y);
     void HandleEditorPress(GtkGestureClick* gesture, unsigned int button, double x, double y);
     void OnContextPopoverClosed(GtkWidget* popover);

@@ -825,6 +825,11 @@ std::string HandleCommand(GtkNotepadApp& app, std::wstring& testClipboard, const
         return ResponseWriter(id, true).Finish();
     }
 
+    if (name == L"delete") {
+        app.HandleDelete();
+        return ResponseWriter(id, true).Finish();
+    }
+
     if (name == L"find" || name == L"findNext") {
         std::wstring text;
         const bool matchCase = GetBool(request, "matchCase", false);
@@ -925,6 +930,29 @@ std::string HandleCommand(GtkNotepadApp& app, std::wstring& testClipboard, const
     if (name == L"getStatusBarVisible") {
         ResponseWriter response(id, true);
         response.AddBool("visible", app.GetStatusBarVisible());
+        return response.Finish();
+    }
+
+    if (name == L"activateMenuLabel") {
+        std::wstring label;
+        if (!RequireString(request, "label", label, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+
+        const bool activated = app.AutomationActivateMenuLabel(label);
+        app.PumpEvents();
+        ResponseWriter response(id, true);
+        response.AddBool("activated", activated);
+        response.AddNumber("openPopovers", app.AutomationMappedMenuPopoverCount());
+        response.AddBool("statusBarVisible", app.GetStatusBarVisible());
+        response.AddRaw("appearance", BuildAppearanceObject(app));
+        return response.Finish();
+    }
+
+    if (name == L"getOpenMenuPopoverCount") {
+        app.PumpEvents();
+        ResponseWriter response(id, true);
+        response.AddNumber("openPopovers", app.AutomationMappedMenuPopoverCount());
         return response.Finish();
     }
 

@@ -1,9 +1,31 @@
 import tempfile
 import unittest
+import os
+from contextlib import contextmanager
 from pathlib import Path
 
 from automation_context import automation_binary, automation_platform, automation_temp_root
 from classic_notepad_driver import ClassicNotepadDriver
+
+
+@contextmanager
+def visible_automation_window():
+    previous_visible = os.environ.get("CLASSIC_NOTEPAD_AUTOMATION_VISIBLE")
+    previous_delay = os.environ.get("CLASSIC_NOTEPAD_AUTOMATION_STEP_DELAY")
+    os.environ["CLASSIC_NOTEPAD_AUTOMATION_VISIBLE"] = "1"
+    os.environ["CLASSIC_NOTEPAD_AUTOMATION_STEP_DELAY"] = "0.05"
+    try:
+        yield
+    finally:
+        if previous_visible is None:
+            os.environ.pop("CLASSIC_NOTEPAD_AUTOMATION_VISIBLE", None)
+        else:
+            os.environ["CLASSIC_NOTEPAD_AUTOMATION_VISIBLE"] = previous_visible
+
+        if previous_delay is None:
+            os.environ.pop("CLASSIC_NOTEPAD_AUTOMATION_STEP_DELAY", None)
+        else:
+            os.environ["CLASSIC_NOTEPAD_AUTOMATION_STEP_DELAY"] = previous_delay
 
 
 class FormatViewStatusTests(unittest.TestCase):
@@ -45,6 +67,23 @@ class FormatViewStatusTests(unittest.TestCase):
             self.assertIn("7 characters", status)
             self.assertIn("Windows (CRLF)", status)
             self.assertIn("UTF-8", status)
+
+    def test_linux_view_status_bar_menu_item_dismisses_after_toggle(self):
+        if automation_platform() != "linux":
+            self.skipTest("GTK menu popover dismissal is Linux-specific")
+
+        with visible_automation_window():
+            with ClassicNotepadDriver(automation_binary(), automation_platform()) as app:
+                view = app.command("activateMenuLabel", label="View")
+                self.assertTrue(view["activated"])
+                self.assertGreater(view["openPopovers"], 0)
+
+                status = app.command("activateMenuLabel", label="Status Bar")
+                self.assertTrue(status["activated"])
+                self.assertFalse(status["statusBarVisible"])
+                self.assertEqual(status["openPopovers"], 0)
+
+                self.assertEqual(app.command("getOpenMenuPopoverCount")["openPopovers"], 0)
 
 
 if __name__ == "__main__":
