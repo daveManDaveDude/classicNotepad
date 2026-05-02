@@ -37,6 +37,38 @@
             "problemMatcher": "$msCompile"
         },
         {
+            "label": "build macos debug",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/build-macos.sh",
+            "args": [
+                "--configuration",
+                "Debug"
+            ],
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "build macos release",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/build-macos.sh",
+            "args": [
+                "--configuration",
+                "Release",
+                "--build-dir",
+                "build-macos-release"
+            ],
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "package macos universal",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/package-macos.sh",
+            "args": [],
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
             "label": "test debug",
             "type": "shell",
             "command": "powershell",
@@ -50,6 +82,17 @@
                 "Debug"
             ],
             "dependsOn": "build debug",
+            "problemMatcher": []
+        },
+        {
+            "label": "test macos debug",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/test-macos.sh",
+            "args": [
+                "--configuration",
+                "Debug"
+            ],
+            "dependsOn": "build macos debug",
             "problemMatcher": []
         },
         {

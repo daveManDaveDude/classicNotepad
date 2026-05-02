@@ -3,7 +3,7 @@
 <img width="931" height="300" alt="image" src="https://github.com/user-attachments/assets/2fa66227-88b2-4052-9a6d-071b25944fbf" />
 
 
-Classic Notepad is a finished single-document Win32/C++ recreation of classic Windows Notepad, with a native GTK4 Linux parity target in the same repository. It keeps the plain local editor feel: one window, one text document, native desktop dialogs, no tabs, no cloud features, no telemetry, and no editor extras that would pull it away from the classic experience.
+Classic Notepad is a finished single-document Win32/C++ recreation of classic Windows Notepad, with a native GTK4 Linux parity target and an early native AppKit macOS target in the same repository. It keeps the plain local editor feel: one window, one text document, native desktop dialogs, no tabs, no cloud features, no telemetry, and no editor extras that would pull it away from the classic experience.
 
 The project is built with C++17, Win32, CMake, and the free Visual Studio C++ Build Tools. It is intended to be opened, built, tested, and debugged from Visual Studio Code.
 
@@ -54,6 +54,60 @@ Accepted Linux v1 capability differences:
 - Spell checking is optional on Linux. With `libspelling-1-dev` and `hunspell-en-gb`, `getCapabilities` reports `spellCheck: true`; without them, spelling commands return graceful unavailable results.
 - Dark mode is implemented through the shared appearance state. Set `CLASSIC_NOTEPAD_THEME=system`, `CLASSIC_NOTEPAD_THEME=light`, or `CLASSIC_NOTEPAD_THEME=dark`; `getCapabilities` reports `appearanceTheme`, `effectiveAppearance`, `darkMode`, and `highContrast`.
 
+## macOS AppKit Target
+
+The macOS target currently builds as `ClassicNotepadMac.app`. This is an early runnable AppKit app: it opens one plain-text window, uses the shared core document loader/saver, supports New, Open, Save, Save As, command-line file open, missing command-line file creation prompts, unsaved-change prompts, editor commands, find/replace/go-to automation, word wrap, font metadata, a status bar, AppKit appearance overrides, and exits when the window closes.
+
+Required macOS tools:
+
+- Xcode Command Line Tools. Install with `xcode-select --install`.
+- CMake on `PATH`.
+- Ninja is optional. If it is installed, `scripts/build-macos.sh` uses it; otherwise it uses Unix Makefiles.
+
+Build and test on Apple Silicon:
+
+```bash
+scripts/build-macos.sh
+scripts/test-macos.sh
+file build-macos/TextConversionTests
+```
+
+Run the app:
+
+```bash
+open build-macos/ClassicNotepadMac.app
+```
+
+Run the shared macOS automation suite:
+
+```bash
+python3 tests/automation/run_automation_tests.py --binary build-macos/ClassicNotepadMac.app/Contents/MacOS/ClassicNotepadMac --platform macos
+```
+
+The visible app uses the AppKit spelling helper on the real `NSTextView`. Headless automation reports spelling as unavailable rather than initializing AppKit spelling services outside the GUI app lifecycle.
+
+The default macOS script build sets `CMAKE_OSX_ARCHITECTURES=arm64`. Universal builds can be requested explicitly:
+
+```bash
+scripts/build-macos.sh --build-dir build-macos-universal --universal
+```
+
+Create a local signed universal zip package:
+
+```bash
+scripts/package-macos.sh --fresh
+```
+
+The package script builds `arm64;x86_64`, runs CTest, verifies the app binary with `lipo`, applies ad-hoc signing, runs the shared macOS automation suite, and writes a zip under `artifacts/macos/`.
+
+The app icon is generated at build time from `assets/icons/classic_notepad_large_transparent.png` into `classic_notepad.icns` and copied into the app bundle resources.
+
+Verify the universal binary manually:
+
+```bash
+lipo -archs build-macos-universal/ClassicNotepadMac.app/Contents/MacOS/ClassicNotepadMac
+```
+
 ## Text File Behavior
 
 - New files save as UTF-8 without BOM and CRLF line endings.
@@ -86,7 +140,7 @@ To install the language support on Windows 10 or Windows 11:
 4. Install the language features that include basic typing or proofing support.
 5. Restart Classic Notepad.
 
-## Required Free Software
+## Required Free Software On Windows
 
 Install these before building:
 
@@ -114,27 +168,43 @@ The build script first looks for `cmake` on `PATH`, then looks for the CMake cop
 1. Install the required software above.
 2. Open this repository folder in VS Code.
 3. Accept the recommended extension prompt, or install the two recommended extensions manually from `.vscode/extensions.json`.
-4. No CMake preset or Kit selection is required for F5 debugging; the repository tasks call the PowerShell build script directly.
+4. No CMake preset or Kit selection is required for F5 debugging; the repository tasks call the platform build scripts directly.
 5. Press `Ctrl+Shift+B` to run the default **build debug** task.
-6. Press `F5` and choose **Debug Classic Notepad** if VS Code asks for a debug configuration.
+6. Press `F5` and choose **Debug Classic Notepad (macOS)** or **Debug Classic Notepad (Windows)** if VS Code asks for a debug configuration.
 
-The F5 launch configuration runs the **build debug** task first:
+The Windows F5 launch configuration runs the **build debug** task first:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 -Configuration Debug
 ```
 
-The debugger then launches:
+The Windows debugger then launches:
 
 ```text
 build\Debug\ClassicNotepad.exe
+```
+
+The macOS F5 launch configuration runs the **build macos debug** task first:
+
+```bash
+scripts/build-macos.sh --configuration Debug
+```
+
+The macOS debugger then launches:
+
+```text
+build-macos/ClassicNotepadMac.app/Contents/MacOS/ClassicNotepadMac
 ```
 
 Useful VS Code tasks are already defined in `.vscode/tasks.json`:
 
 - **build debug**: builds `ClassicNotepad.exe` and `TextConversionTests.exe` in Debug.
 - **build release**: builds the Release configuration.
+- **build macos debug**: builds `ClassicNotepadMac.app`, `TextConversionTests`, and `MacSpellingCompileTests` in Debug.
+- **build macos release**: builds the macOS target in Release under `build-macos-release`.
+- **package macos universal**: builds, signs, verifies, tests, and zips the universal macOS app.
 - **test debug**: builds Debug and then runs CTest.
+- **test macos debug**: builds macOS Debug and then runs CTest.
 - **clean**: removes generated build output.
 
 ## Manual Build

@@ -1,8 +1,13 @@
 build/
 build-ubuntu/
 build-ubuntu-release/
+build-macos/
+build-macos-*/
+artifacts/
 .vs/
 out/
+.DS_Store
+Untitled.txt
 *.user
 *.suo
 *.VC.db

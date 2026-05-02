@@ -2,7 +2,20 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug Classic Notepad",
+            "name": "Debug Classic Notepad (macOS)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build-macos/ClassicNotepadMac.app/Contents/MacOS/ClassicNotepadMac",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "lldb",
+            "preLaunchTask": "build macos debug"
+        },
+        {
+            "name": "Debug Classic Notepad (Windows)",
             "type": "cppvsdbg",
             "request": "launch",
             "program": "${workspaceFolder}\\build\\Debug\\ClassicNotepad.exe",
@@ -15,4 +28,3 @@
         }
     ]
 }
-

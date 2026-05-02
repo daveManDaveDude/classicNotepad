@@ -4,6 +4,7 @@ set(CLASSIC_NOTEPAD_VERSION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 set(CLASSIC_NOTEPAD_VERSION "1.0.0")
 set(CLASSIC_NOTEPAD_APP_ICON "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/classic_notepad_large_transparent.ico")
 set(CLASSIC_NOTEPAD_APP_ICON_PNG "${CMAKE_CURRENT_SOURCE_DIR}/assets/icons/classic_notepad_large_transparent.png")
+set(CLASSIC_NOTEPAD_MAC_ICON_NAME "classic_notepad.icns")
 
 if(EXISTS "${CLASSIC_NOTEPAD_VERSION_FILE}")
     file(READ "${CLASSIC_NOTEPAD_VERSION_FILE}" CLASSIC_NOTEPAD_VERSION)
@@ -230,6 +231,20 @@ endif()
 
 if(APPLE)
     enable_language(OBJCXX)
+    find_library(APPKIT_FRAMEWORK AppKit REQUIRED)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
+    set(CLASSIC_NOTEPAD_MAC_ICON "${CMAKE_CURRENT_BINARY_DIR}/generated/${CLASSIC_NOTEPAD_MAC_ICON_NAME}")
+
+    add_custom_command(
+        OUTPUT "${CLASSIC_NOTEPAD_MAC_ICON}"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate-macos-icon.py"
+            --source "${CLASSIC_NOTEPAD_APP_ICON_PNG}"
+            --output "${CLASSIC_NOTEPAD_MAC_ICON}"
+        DEPENDS "${CLASSIC_NOTEPAD_APP_ICON_PNG}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate-macos-icon.py"
+        VERBATIM
+    )
 
     add_library(ClassicNotepadMacSpelling STATIC
         src/platform/macos/mac_appearance.h
@@ -244,9 +259,45 @@ if(APPLE)
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
     )
 
-    target_link_libraries(ClassicNotepadMacSpelling PUBLIC
+    target_link_libraries(ClassicNotepadMacSpelling
+        PUBLIC
+        ${APPKIT_FRAMEWORK}
+    )
+
+    add_executable(ClassicNotepadMac MACOSX_BUNDLE
+        "${CLASSIC_NOTEPAD_MAC_ICON}"
+        src/platform/macos/Info.plist.in
+        src/platform/macos/mac_app.h
+        src/platform/macos/mac_app.mm
+        src/platform/macos/mac_automation.h
+        src/platform/macos/mac_automation.mm
+        src/platform/macos/mac_main.mm
+    )
+
+    target_compile_features(ClassicNotepadMac PRIVATE cxx_std_17)
+
+    target_include_directories(ClassicNotepadMac PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    )
+
+    target_link_libraries(ClassicNotepadMac PRIVATE
         ClassicNotepadCore
-        "-framework AppKit"
+        ClassicNotepadMacSpelling
+        ${APPKIT_FRAMEWORK}
+    )
+
+    set_source_files_properties("${CLASSIC_NOTEPAD_MAC_ICON}" PROPERTIES
+        MACOSX_PACKAGE_LOCATION "Resources"
+    )
+
+    set_target_properties(ClassicNotepadMac PROPERTIES
+        MACOSX_BUNDLE_GUI_IDENTIFIER "com.classicnotepad.ClassicNotepad"
+        MACOSX_BUNDLE_BUNDLE_NAME "Classic Notepad"
+        MACOSX_BUNDLE_EXECUTABLE_NAME "ClassicNotepadMac"
+        MACOSX_BUNDLE_ICON_FILE "${CLASSIC_NOTEPAD_MAC_ICON_NAME}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/src/platform/macos/Info.plist.in"
     )
 
     add_executable(MacSpellingCompileTests
@@ -255,6 +306,7 @@ if(APPLE)
 
     target_link_libraries(MacSpellingCompileTests PRIVATE
         ClassicNotepadMacSpelling
+        ClassicNotepadCore
     )
 
     add_test(NAME MacSpellingCompileTests COMMAND $<TARGET_FILE:MacSpellingCompileTests>)

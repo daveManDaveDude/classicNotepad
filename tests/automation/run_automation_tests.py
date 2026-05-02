@@ -7,8 +7,8 @@ from pathlib import Path
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run Classic Notepad semantic automation tests.")
-    parser.add_argument("--binary", required=True, help="Path to ClassicNotepad.exe or ClassicNotepadGtk.")
-    parser.add_argument("--platform", required=True, choices=("windows", "linux"))
+    parser.add_argument("--binary", required=True, help="Path to ClassicNotepad.exe, ClassicNotepadGtk, or ClassicNotepadMac.")
+    parser.add_argument("--platform", required=True, choices=("windows", "linux", "macos"))
     parser.add_argument(
         "--pattern",
         default="test_*.py",
