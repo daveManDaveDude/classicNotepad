@@ -233,6 +233,8 @@ static CGFloat PointsFromThousandths(int thousandths)
 - (void)resetUntitledDocument;
 - (void)setEditorText:(const std::wstring&)text markModified:(BOOL)modified;
 - (void)insertTimeDate:(id)sender;
+- (void)undo:(id)sender;
+- (void)redo:(id)sender;
 - (void)findText:(id)sender;
 - (void)findNextText:(id)sender;
 - (void)replaceText:(id)sender;
@@ -385,17 +387,15 @@ static CGFloat PointsFromThousandths(int thousandths)
     [pageSetupItem setTarget:self];
     NSMenuItem* printItem = [fileMenu addItemWithTitle:@"Print..." action:@selector(printDocument:) keyEquivalent:@"p"];
     [printItem setTarget:self];
-    [fileMenu addItem:[NSMenuItem separatorItem]];
-    [fileMenu addItemWithTitle:@"Close" action:@selector(performClose:) keyEquivalent:@"w"];
-    NSMenuItem* exitItem = [fileMenu addItemWithTitle:@"Exit" action:@selector(exitApplication:) keyEquivalent:@""];
-    [exitItem setTarget:self];
 
     NSMenuItem* editItem = [[NSMenuItem alloc] initWithTitle:@"Edit" action:nil keyEquivalent:@""];
     [mainMenu addItem:editItem];
     NSMenu* editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
     [editItem setSubmenu:editMenu];
-    [editMenu addItemWithTitle:@"Undo" action:@selector(undo:) keyEquivalent:@"z"];
-    [editMenu addItemWithTitle:@"Redo" action:@selector(redo:) keyEquivalent:@"Z"];
+    NSMenuItem* undoItem = [editMenu addItemWithTitle:@"Undo" action:@selector(undo:) keyEquivalent:@"z"];
+    [undoItem setTarget:self];
+    NSMenuItem* redoItem = [editMenu addItemWithTitle:@"Redo" action:@selector(redo:) keyEquivalent:@"Z"];
+    [redoItem setTarget:self];
     [editMenu addItem:[NSMenuItem separatorItem]];
     [editMenu addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
     [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
@@ -466,6 +466,12 @@ static CGFloat PointsFromThousandths(int thousandths)
     if (action == @selector(pageSetupDocument:) || action == @selector(printDocument:)) {
         return !_automationMode;
     }
+    if (action == @selector(undo:)) {
+        return [[self.textView undoManager] canUndo];
+    }
+    if (action == @selector(redo:)) {
+        return [[self.textView undoManager] canRedo];
+    }
     if (action == @selector(setAppearanceSystem:)) {
         [menuItem setState:_appearanceTheme == classic_notepad::AppearanceTheme::System ? NSControlStateValueOn : NSControlStateValueOff];
         return YES;
@@ -520,6 +526,7 @@ static CGFloat PointsFromThousandths(int thousandths)
     [[self.textView textContainer] setWidthTracksTextView:NO];
     [self.textView setRichText:NO];
     [self.textView setImportsGraphics:NO];
+    [self.textView setAllowsUndo:YES];
     [self.textView setUsesFindBar:YES];
     [self.textView setFont:[NSFont userFixedPitchFontOfSize:13.0]];
 
@@ -547,6 +554,7 @@ static CGFloat PointsFromThousandths(int thousandths)
     [self updateStatusText];
     if (!_automationMode || _automationVisible) {
         [self.window makeKeyAndOrderFront:nil];
+        [self.window makeFirstResponder:self.textView];
     }
 }
 
@@ -792,6 +800,7 @@ static CGFloat PointsFromThousandths(int thousandths)
 - (void)setEditorText:(const std::wstring&)text markModified:(BOOL)modified
 {
     [self.textView setString:NSStringFromWide(text)];
+    [[self.textView undoManager] removeAllActions];
     _document.SetModified(modified);
     [self updateWindowTitle];
     [self updateStatusText];
@@ -803,27 +812,82 @@ static CGFloat PointsFromThousandths(int thousandths)
     [self insertTextAtSelection:[self buildTimeDateText]];
 }
 
+- (void)undo:(id)sender
+{
+    (void)sender;
+    NSUndoManager* undoManager = [self.textView undoManager];
+    if ([undoManager canUndo]) {
+        [undoManager undo];
+        [self updateWindowTitle];
+        [self updateStatusText];
+    }
+}
+
+- (void)redo:(id)sender
+{
+    (void)sender;
+    NSUndoManager* undoManager = [self.textView undoManager];
+    if ([undoManager canRedo]) {
+        [undoManager redo];
+        [self updateWindowTitle];
+        [self updateStatusText];
+    }
+}
+
+- (void)performFinderAction:(NSTextFinderAction)action
+{
+    NSMenuItem* actionItem = [[NSMenuItem alloc] initWithTitle:@"" action:@selector(performTextFinderAction:) keyEquivalent:@""];
+    [actionItem setTag:static_cast<NSInteger>(action)];
+    [self.window makeFirstResponder:self.textView];
+    [self.textView performTextFinderAction:actionItem];
+}
+
 - (void)findText:(id)sender
 {
     (void)sender;
-    [self.textView performTextFinderAction:@(NSTextFinderActionShowFindInterface)];
+    [self performFinderAction:NSTextFinderActionShowFindInterface];
 }
 
 - (void)findNextText:(id)sender
 {
     (void)sender;
-    [self.textView performTextFinderAction:@(NSTextFinderActionNextMatch)];
+    [self performFinderAction:NSTextFinderActionNextMatch];
 }
 
 - (void)replaceText:(id)sender
 {
     (void)sender;
-    [self.textView performTextFinderAction:@(NSTextFinderActionShowReplaceInterface)];
+    [self performFinderAction:NSTextFinderActionShowReplaceInterface];
 }
 
 - (void)goToLine:(id)sender
 {
     (void)sender;
+    const std::wstring text = [self getText];
+    const std::size_t lineCount = CountLines(text);
+
+    NSAlert* alert = [[NSAlert alloc] init];
+    [alert setMessageText:@"Go To Line"];
+    [alert setInformativeText:[NSString stringWithFormat:@"Line number (1-%zu):", lineCount]];
+    [alert addButtonWithTitle:@"Go To"];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    NSTextField* input = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 220, 24)];
+    [input setStringValue:@"1"];
+    [alert setAccessoryView:input];
+    [[alert window] setInitialFirstResponder:input];
+
+    if ([alert runModal] != NSAlertFirstButtonReturn) {
+        [self.window makeFirstResponder:self.textView];
+        return;
+    }
+
+    const int lineNumber = [input intValue];
+    std::wstring errorMessage;
+    if (![self goToLineNumber:lineNumber errorMessage:errorMessage]) {
+        ShowError(self.window, NSStringFromWide(errorMessage));
+    }
+    [self.window makeFirstResponder:self.textView];
 }
 
 - (void)toggleWordWrap:(id)sender
