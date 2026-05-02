@@ -1,7 +1,7 @@
 # Implementation Plan: Mac-First Cross-Platform Classic Notepad
 
 Date: 2026-04-20  
-Status: proposed plan for review before execution.
+Status: historical proposal. The repository now contains native Win32, GTK4 Linux, and AppKit macOS targets; current build and verification commands live in the root `README.md`.
 
 ## 0) Principles
 

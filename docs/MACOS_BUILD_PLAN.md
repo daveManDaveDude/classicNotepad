@@ -1,11 +1,11 @@
 # macOS Build And Port Plan
 
 Date: 2026-05-02  
-Status: planning note from project review.
+Status: implemented. The original plan is retained below as historical context and acceptance coverage.
 
 ## Goal
 
-Add a native macOS version of Classic Notepad that runs first on Apple Silicon Macs, then ships as a universal build for both Apple Silicon and Intel Macs.
+Maintain the native macOS version of Classic Notepad. The app now runs as an AppKit bundle on Apple Silicon and can be built as a universal `arm64;x86_64` Release app.
 
 The macOS app should keep the same project direction as the existing Windows and Linux versions:
 
@@ -16,65 +16,66 @@ The macOS app should keep the same project direction as the existing Windows and
 
 ## Current State
 
-The repository already has a strong foundation for a macOS port:
+The repository now includes the native macOS app target:
 
 - `ClassicNotepadCore` builds on macOS using the portable platform sources.
-- The current macOS code includes AppKit helpers for spelling and appearance:
+- `ClassicNotepadMac.app` builds from:
+  - `src/platform/macos/mac_main.mm`
+  - `src/platform/macos/mac_app.h`
+  - `src/platform/macos/mac_app.mm`
+  - `src/platform/macos/mac_automation.h`
+  - `src/platform/macos/mac_automation.mm`
+  - `src/platform/macos/Info.plist.in`
+- The macOS code includes AppKit helpers for spelling and appearance:
   - `src/platform/macos/mac_spelling.mm`
   - `src/platform/macos/mac_appearance.mm`
 - `MacSpellingCompileTests` verifies that the current AppKit helper code compiles and runs.
 - `TextConversionTests` verifies the shared document/encoding/line-ending behavior on macOS.
+- The shared JSON-lines automation runner accepts `--platform macos`.
+- The visible macOS app supports file workflow, edit commands, Find/Find Next/Replace, Go To, word wrap, font metadata, status bar, page setup/print sink coverage, appearance override, and AppKit spelling configuration.
+- The macOS File menu contains New, Open, Save, Save As, Page Setup, and Print. Close and Exit are intentionally not duplicated in that menu; Quit remains in the standard application menu.
 
-Verified on an Apple Silicon Mac:
-
-```bash
-cmake -S . -B build-macos-make -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Debug
-cmake --build build-macos-make --config Debug
-ctest --test-dir build-macos-make --output-on-failure
-```
-
-Result:
-
-- `MacSpellingCompileTests` passed.
-- `TextConversionTests` passed.
-- Produced binaries were `arm64`.
-
-Verified universal helper/test build:
+Current Debug build and CTest path:
 
 ```bash
-cmake -S . -B build-macos-universal -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Debug -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
-cmake --build build-macos-universal --config Debug
-ctest --test-dir build-macos-universal --output-on-failure
-lipo -archs build-macos-universal/TextConversionTests
-lipo -archs build-macos-universal/MacSpellingCompileTests
+scripts/build-macos.sh
+scripts/test-macos.sh
 ```
 
-Result:
+Current automation path:
 
-- Both tests passed.
-- `lipo` reported `x86_64 arm64` for both test executables.
+```bash
+python3 tests/automation/run_automation_tests.py --binary build-macos/ClassicNotepadMac.app/Contents/MacOS/ClassicNotepadMac --platform macos
+```
 
-## Review Findings
+Current universal Release build path:
+
+```bash
+scripts/build-macos.sh --configuration Release --universal
+lipo -archs build-macos/ClassicNotepadMac.app/Contents/MacOS/ClassicNotepadMac
+```
+
+Current package path:
+
+```bash
+scripts/package-macos.sh --fresh
+```
+
+## Resolved Review Findings
 
 ### P1: No Runnable macOS App Target
 
-`CMakeLists.txt` currently only builds the macOS appearance/spelling helper library and a compile smoke test inside the `APPLE` branch. There is no AppKit executable, `MACOSX_BUNDLE` target, `Info.plist`, app icon, menu/window entrypoint, or automation host yet.
-
-Impact: macOS currently verifies helper code but cannot run Classic Notepad as an app.
+Resolved. `CMakeLists.txt` now defines `ClassicNotepadMac` as a `MACOSX_BUNDLE` executable with `Info.plist`, icon resources, menu/window entrypoint, and automation host sources.
 
 ### P1: Automation Cannot Target macOS
 
-`tests/automation/run_automation_tests.py` only accepts `windows` and `linux` as platform names.
-
-Impact: even after a macOS app target exists, it cannot join the existing semantic parity suite until the runner and platform-specific skips support `macos`.
+Resolved. `tests/automation/run_automation_tests.py` accepts `macos`, and the macOS automation host implements the shared JSON-lines command surface.
 
 ### P2: macOS Build Path Is Undocumented
 
-The public setup docs are still Windows-first with Linux/WSL coverage. There is no macOS quickstart, build script, universal build command, bundle/run command, signing note, or Intel verification path yet.
+Resolved. The root README documents macOS build, test, automation, universal Release build, and package commands.
 
-Impact: a contributor on macOS can discover that helper tests build, but there is no documented path to build, run, test, or package the future app.
-
-## Recommended Implementation Plan
+## Original Implementation Plan
 
 ### 1. Establish The Apple Silicon Baseline
 

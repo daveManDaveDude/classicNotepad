@@ -2,13 +2,13 @@
 
 Date: 2026-04-26
 
-Status: active plan for the `feature/cross-platform` branch.
+Status: historical migration plan. The source tree now includes native Windows, Linux, and macOS targets; current build and verification commands live in the root `README.md`.
 
 ## Goal
 
-Convert the existing working Win32 Classic Notepad source into a cross-platform source tree while keeping Windows as the only required build/run target for the current phase.
+Convert the existing working Win32 Classic Notepad source into a cross-platform source tree while keeping Windows as the only required build/run target for the initial phase.
 
-The near-term success condition is not a macOS or Linux GUI. It is a Windows build that still behaves like the finished Classic Notepad, with shared core code that is cleanly buildable by non-Windows toolchains when native macOS/Linux adapters are added.
+The original near-term success condition was a Windows build that still behaved like the finished Classic Notepad, with shared core code cleanly buildable by non-Windows toolchains. That condition has been superseded by implemented native Linux and macOS adapters.
 
 ## Context From Existing Docs
 
@@ -82,7 +82,7 @@ Completed in the first implementation slice:
 - `ClassicNotepadCore` no longer requires Win32 APIs for document file I/O or text encoding.
 - Windows file I/O still uses `CreateFileW`, `ReadFile`, `WriteFile`, `FlushFileBuffers`, and `MoveFileExW`.
 - Windows ANSI behavior still uses `CP_ACP`.
-- Portable fallback sources exist for future macOS/Linux builds.
+- Portable fallback sources exist for macOS/Linux builds.
 - CMake builds the Win32 GUI only on Windows.
 - CMake includes a Windows-only portable-core smoke test target.
 

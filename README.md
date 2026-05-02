@@ -3,9 +3,19 @@
 <img width="931" height="300" alt="image" src="https://github.com/user-attachments/assets/2fa66227-88b2-4052-9a6d-071b25944fbf" />
 
 
-Classic Notepad is a finished single-document Win32/C++ recreation of classic Windows Notepad, with a native GTK4 Linux parity target and an early native AppKit macOS target in the same repository. It keeps the plain local editor feel: one window, one text document, native desktop dialogs, no tabs, no cloud features, no telemetry, and no editor extras that would pull it away from the classic experience.
+Classic Notepad is a single-document native desktop recreation of classic Windows Notepad, with Win32, GTK4 Linux, and AppKit macOS targets in the same repository. It keeps the plain local editor feel: one window, one text document, native desktop dialogs, no tabs, no cloud features, no telemetry, and no editor extras that would pull it away from the classic experience.
 
-The project is built with C++17, Win32, CMake, and the free Visual Studio C++ Build Tools. It is intended to be opened, built, tested, and debugged from Visual Studio Code.
+Current version: `1.2.1`.
+
+The project is built with C++17, native platform UI layers, and CMake. It is intended to be opened, built, tested, and debugged from Visual Studio Code or the platform build scripts.
+
+## Platform Targets
+
+| Platform | App | Status |
+| --- | --- | --- |
+| Windows | `ClassicNotepad.exe` | Full native Win32 target with automated parity coverage. |
+| Linux | `ClassicNotepadGtk` | Native GTK4 target with automated parity coverage and optional `libspelling` British English spell checking. |
+| macOS | `ClassicNotepadMac.app` | Native AppKit target with automated parity coverage, AppKit spelling/appearance integration, and universal Release build support. |
 
 ## Finished Feature Set
 
@@ -36,7 +46,7 @@ The project is built with C++17, Win32, CMake, and the free Visual Studio C++ Bu
 - Spell check context actions include suggestions, Ignore Once, and Add to Dictionary.
 - Keyboard accelerators: `Ctrl+N`, `Ctrl+O`, `Ctrl+S`, `Ctrl+Shift+S`, `Ctrl+F`, `F3`, `Ctrl+H`, `Ctrl+G`, `Ctrl+A`, `F5`, `Ctrl+Z`, `Ctrl+X`, `Ctrl+C`, `Ctrl+V`, and `Del`.
 - Focused console tests for encoding, line-ending, document round-trip, metadata, new-file, and spelling text utility behavior.
-- Shared JSON-lines automation suite for Windows and Linux feature parity.
+- Shared JSON-lines automation suite for Windows, Linux, and macOS feature parity.
 
 ## Linux GTK Parity Target
 
@@ -56,7 +66,9 @@ Accepted Linux v1 capability differences:
 
 ## macOS AppKit Target
 
-The macOS target currently builds as `ClassicNotepadMac.app`. This is an early runnable AppKit app: it opens one plain-text window, uses the shared core document loader/saver, supports New, Open, Save, Save As, command-line file open, missing command-line file creation prompts, unsaved-change prompts, editor commands, find/replace/go-to automation, word wrap, font metadata, a status bar, AppKit appearance overrides, and exits when the window closes.
+The macOS target builds as `ClassicNotepadMac.app`. It opens one plain-text AppKit window, uses the shared core document loader/saver, supports New, Open, Save, Save As, command-line file open, missing command-line file creation prompts, unsaved-change prompts, editor commands, Find/Find Next/Replace, Go To, word wrap, font metadata, a status bar, AppKit appearance overrides, and closes the app when the document window closes.
+
+The macOS File menu intentionally contains New, Open, Save, Save As, Page Setup, and Print. Close and Exit are not duplicated there; Quit lives in the standard application menu as `Quit Classic Notepad`.
 
 Required macOS tools:
 
@@ -90,6 +102,19 @@ The default macOS script build sets `CMAKE_OSX_ARCHITECTURES=arm64`. Universal b
 
 ```bash
 scripts/build-macos.sh --build-dir build-macos-universal --universal
+```
+
+Build the current Release app in the default `build-macos/` directory:
+
+```bash
+scripts/build-macos.sh --configuration Release
+```
+
+Build the current universal Release app:
+
+```bash
+scripts/build-macos.sh --configuration Release --universal
+lipo -archs build-macos/ClassicNotepadMac.app/Contents/MacOS/ClassicNotepadMac
 ```
 
 Create a local signed universal zip package:
@@ -275,7 +300,7 @@ Build release:
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 -Configuration Release
 ```
 
-Release builds through `scripts\build.ps1` increment the patch number in `VERSION` and embed it in the app. Debug builds, including F5 from VS Code, leave `VERSION` unchanged. To rebuild Release without consuming a version number, add `-SkipVersionIncrement`.
+Windows Release builds through `scripts\build.ps1` increment the patch number in `VERSION` and embed it in the app. Debug builds, including F5 from VS Code, leave `VERSION` unchanged. To rebuild Windows Release without consuming a version number, add `-SkipVersionIncrement`. macOS and Linux builds embed the current `VERSION` value; bump `VERSION` before those Release builds when cutting a new release.
 
 Clean generated files:
 
@@ -367,6 +392,10 @@ src/
       gtk_main.cpp               GTK entry point
       gtk_spelling.cpp, .h       Optional GTK/libspelling British English spell service
     macos/
+      Info.plist.in             macOS app bundle metadata template
+      mac_app.mm, .h            AppKit application, menus, dialogs, editor, printing, status, appearance, and automation host adapter
+      mac_automation.mm, .h     macOS JSON-lines automation controller
+      mac_main.mm               macOS entry point
       mac_appearance.mm, .h      AppKit appearance override and semantic text-view colors
       mac_spelling.mm, .h        AppKit spelling configuration helpers
 
@@ -380,11 +409,14 @@ docs/
 tests/
   text_conversion_tests.cpp   Console tests for text/document/spell utility behavior
   linux_spelling_probe.cpp    Ubuntu-only libspelling/dictionary probe when available
-  automation/                 Shared Windows/Linux semantic automation suite
+  automation/                 Shared Windows/Linux/macOS semantic automation suite
 
 scripts/
   build.ps1                  Configure and build with CMake
   build-ubuntu.ps1           Configure, build, and test under Ubuntu/WSL
+  build-macos.sh             Configure and build the macOS AppKit target
+  package-macos.sh           Build, ad-hoc sign, verify, test, and zip the universal macOS app
+  test-macos.sh              Run macOS CTest targets
   test.ps1                   Run CTest
   clean.ps1                  Remove generated build output
 ```
@@ -413,10 +445,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-ubuntu.ps1 -
 wsl.exe -d Ubuntu-24.04 -- bash -lc "cd /mnt/c/vibe/classicNotepad && python3 tests/automation/run_automation_tests.py --binary build-ubuntu/ClassicNotepadGtk --platform linux"
 ```
 
+The expected macOS verification pass is:
+
+```bash
+scripts/build-macos.sh
+scripts/test-macos.sh
+python3 tests/automation/run_automation_tests.py --binary build-macos/ClassicNotepadMac.app/Contents/MacOS/ClassicNotepadMac --platform macos
+```
+
 Release sanity checks:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 -Configuration Release -SkipVersionIncrement
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1 -Configuration Release
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-ubuntu.ps1 -Distro Ubuntu-24.04 -BuildDir build-ubuntu-release -Configuration Release
+```
+
+macOS Release sanity checks:
+
+```bash
+scripts/build-macos.sh --configuration Release --universal
+scripts/test-macos.sh --configuration Release
+lipo -archs build-macos/ClassicNotepadMac.app/Contents/MacOS/ClassicNotepadMac
 ```

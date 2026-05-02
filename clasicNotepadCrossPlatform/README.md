@@ -6,11 +6,12 @@ Current implementation status:
 
 - Windows remains the full native Win32 app.
 - Linux builds as the native GTK4 `ClassicNotepadGtk` target on Ubuntu/WSL.
-- The shared JSON-lines automation suite now passes against both Windows Debug and Linux Debug binaries.
+- macOS builds as the native AppKit `ClassicNotepadMac.app` target.
+- The shared JSON-lines automation suite supports Windows, Linux, and macOS binaries.
 - Linux now uses optional GTK/libspelling British English spell checking when `libspelling-1-dev` and `hunspell-en-gb` are installed; missing packages or dictionaries remain graceful unavailable states.
 - Shared appearance state is implemented for `System`, `Light`, and `Dark`, with the deterministic `CLASSIC_NOTEPAD_THEME` override.
 - Linux GTK applies app-specific light/dark CSS classes and reports `appearanceTheme`, `effectiveAppearance`, `darkMode`, and `highContrast` through automation.
-- macOS has an AppKit appearance helper for application/window overrides and semantic `NSTextView` colors; the full macOS editor target is still future adapter work.
+- macOS uses AppKit appearance helpers, semantic `NSTextView` colors, AppKit spelling configuration, and universal Release build support.
 
 Current contents:
 
@@ -24,3 +25,4 @@ Current contents:
 - `docs/06_LINUX_FEATURE_PARITY_AND_AUTOMATION_PLAN.md`
 
 Linux build environment setup is documented in `../docs/LINUX_BUILD_ENVIRONMENT.md`.
+macOS build and package instructions are documented in `../README.md` and `../docs/MACOS_BUILD_PLAN.md`.

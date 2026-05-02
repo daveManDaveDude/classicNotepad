@@ -252,7 +252,7 @@ Implementation completed 2026-04-26:
 - The helper applies `System`, `Light`, and `Dark` through AppKit `NSAppearance` at application or window scope.
 - Plain `NSTextView` appearance uses semantic AppKit colors: `textBackgroundColor`, `textColor`, and text-color insertion point.
 - `tests/macos_spelling_compile.mm` now compiles both spelling and appearance helper paths.
-- The repository still does not contain the full macOS editor target, so editor-wide macOS visual verification remains tied to future macOS adapter bring-up.
+- The repository now contains the full `ClassicNotepadMac.app` editor target. Editor-wide macOS visual verification can be performed against the AppKit app with `CLASSIC_NOTEPAD_THEME=system|light|dark`.
 
 ## Phase 6: Linux Dark Mode
 
@@ -318,7 +318,7 @@ Automated:
 - Linux compile test with spelling enabled.
 - Linux compile test with spelling disabled or dependency missing.
 - Theme-state unit tests for `System`, `Light`, `Dark`, and invalid env values.
-- Windows and Linux automation tests for `CLASSIC_NOTEPAD_THEME=system|light|dark`, invalid fallback, and runtime theme switching.
+- Windows, Linux, and macOS automation tests for `CLASSIC_NOTEPAD_THEME=system|light|dark`, invalid fallback, and runtime theme switching.
 
 Manual:
 
@@ -338,7 +338,7 @@ Manual:
 5. Add macOS spelling through `NSTextView`/`NSSpellChecker`.
 6. Add Linux spelling UI integration.
 7. Add the shared appearance state and test override. Completed 2026-04-26.
-8. Add macOS dark-mode polish. Completed 2026-04-26 as an AppKit helper; full macOS editor verification remains future adapter work.
+8. Add macOS dark-mode polish. Completed first as an AppKit helper, then verified through the `ClassicNotepadMac.app` target.
 9. Add Linux CSS-based dark mode. Completed 2026-04-26.
 10. Run the full test matrix on Windows, macOS, Ubuntu desktop, and WSL.
 
