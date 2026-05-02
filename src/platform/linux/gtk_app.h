@@ -95,7 +95,6 @@ public:
     void HandleAbout();
     void DismissOpenMenus();
     void DismissOpenMenusAndResetModels();
-    void RestoreClassicArrowCursor();
     int AutomationMappedMenuPopoverCount() const;
     bool AutomationActivateMenuLabel(const std::wstring& label);
     void HandleWindowPress(double x, double y);

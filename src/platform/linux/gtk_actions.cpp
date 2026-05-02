@@ -7,15 +7,11 @@
 namespace classic_notepad::linux_ui {
 namespace {
 
-gboolean RestoreClassicArrowCursorAfterAction(gpointer userData);
-void QueueCursorRestore(GtkNotepadApp* app);
-
 template <typename Action>
 void RunMenuAction(gpointer userData, Action action)
 {
     auto* app = static_cast<GtkNotepadApp*>(userData);
     action(*app);
-    QueueCursorRestore(app);
 }
 
 void OnNew(GSimpleAction*, GVariant*, gpointer userData)
@@ -128,21 +124,18 @@ void OnSpellingReplaceIndex(GSimpleAction* action, GVariant*, gpointer userData)
 
     auto* app = static_cast<GtkNotepadApp*>(userData);
     app->HandleReplaceSpellingSuggestion(static_cast<std::size_t>(digit - '0'));
-    QueueCursorRestore(app);
 }
 
 void OnSpellingIgnore(GSimpleAction*, GVariant*, gpointer userData)
 {
     auto* app = static_cast<GtkNotepadApp*>(userData);
     app->HandleIgnoreContextSpelling();
-    QueueCursorRestore(app);
 }
 
 void OnSpellingAdd(GSimpleAction*, GVariant*, gpointer userData)
 {
     auto* app = static_cast<GtkNotepadApp*>(userData);
     app->HandleAddContextSpelling();
-    QueueCursorRestore(app);
 }
 
 gboolean DismissOpenMenusAfterAction(gpointer userData);
@@ -193,25 +186,13 @@ gboolean ApplyAppearanceThemeAfterMenuDismissal(gpointer userData)
     auto* pending = static_cast<PendingAppearanceThemeChange*>(userData);
     pending->app->DismissOpenMenusAndResetModels();
     pending->app->SetAppearanceTheme(pending->theme);
-    pending->app->RestoreClassicArrowCursor();
     delete pending;
-    return G_SOURCE_REMOVE;
-}
-
-gboolean RestoreClassicArrowCursorAfterAction(gpointer userData)
-{
-    static_cast<GtkNotepadApp*>(userData)->RestoreClassicArrowCursor();
     return G_SOURCE_REMOVE;
 }
 
 void QueueMenuDismissal(GtkNotepadApp* app)
 {
     g_idle_add(DismissOpenMenusAfterAction, app);
-}
-
-void QueueCursorRestore(GtkNotepadApp* app)
-{
-    g_idle_add(RestoreClassicArrowCursorAfterAction, app);
 }
 
 void QueueAppearanceThemeChange(GtkNotepadApp* app, classic_notepad::AppearanceTheme theme)

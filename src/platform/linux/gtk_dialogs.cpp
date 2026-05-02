@@ -6,7 +6,6 @@
 #include <cstdlib>
 #include <cwchar>
 #include <string>
-#include <vector>
 
 #ifndef CLASSIC_NOTEPAD_ICON_PATH
 #define CLASSIC_NOTEPAD_ICON_PATH "assets/icons/classic_notepad_large_transparent.png"
@@ -65,104 +64,6 @@ struct FontDialogState {
 };
 
 void SetSelectedPath(FileDialogState& state, GFile* file);
-
-GdkCursor* ClassicDialogArrowCursor()
-{
-    static GdkCursor* cursor = nullptr;
-    if (cursor != nullptr) {
-        return cursor;
-    }
-
-    constexpr int kWidth = 14;
-    constexpr int kHeight = 20;
-    constexpr int kChannels = 4;
-    std::vector<guchar> pixels(kWidth * kHeight * kChannels, 0);
-
-    auto setPixel = [&pixels](int x, int y, guchar red, guchar green, guchar blue, guchar alpha) {
-        if (x < 0 || x >= kWidth || y < 0 || y >= kHeight) {
-            return;
-        }
-
-        const int offset = ((y * kWidth) + x) * kChannels;
-        pixels[static_cast<std::size_t>(offset)] = red;
-        pixels[static_cast<std::size_t>(offset + 1)] = green;
-        pixels[static_cast<std::size_t>(offset + 2)] = blue;
-        pixels[static_cast<std::size_t>(offset + 3)] = alpha;
-    };
-
-    auto setBlack = [&setPixel](int x, int y) {
-        setPixel(x, y, 0, 0, 0, 255);
-    };
-    auto setWhite = [&setPixel](int x, int y) {
-        setPixel(x, y, 255, 255, 255, 255);
-    };
-
-    for (int y = 0; y <= 13; ++y) {
-        const int edge = y <= 10 ? y : 19 - y;
-        setBlack(0, y);
-        setBlack(edge, y);
-        for (int x = 1; x < edge; ++x) {
-            setWhite(x, y);
-        }
-    }
-
-    setBlack(4, 13);
-    setBlack(5, 14);
-    setBlack(5, 15);
-    setBlack(6, 16);
-    setBlack(6, 17);
-    setBlack(7, 18);
-    setBlack(7, 19);
-    setBlack(8, 19);
-    setBlack(8, 18);
-    setBlack(7, 17);
-    setBlack(7, 16);
-    setBlack(6, 15);
-    setBlack(6, 14);
-    setWhite(5, 13);
-    setWhite(6, 15);
-    setWhite(7, 18);
-
-    GBytes* bytes = g_bytes_new(pixels.data(), pixels.size());
-    GdkTexture* texture = gdk_memory_texture_new(
-        kWidth,
-        kHeight,
-        GDK_MEMORY_R8G8B8A8,
-        bytes,
-        kWidth * kChannels);
-    cursor = gdk_cursor_new_from_texture(texture, 0, 0, nullptr);
-    g_object_unref(texture);
-    g_bytes_unref(bytes);
-    return cursor;
-}
-
-void ApplyClassicDialogArrowCursor(GtkWidget* widget)
-{
-    if (widget == nullptr) {
-        return;
-    }
-
-    gtk_widget_set_cursor(widget, ClassicDialogArrowCursor());
-    for (GtkWidget* child = gtk_widget_get_first_child(widget); child != nullptr; child = gtk_widget_get_next_sibling(child)) {
-        ApplyClassicDialogArrowCursor(child);
-    }
-}
-
-void ForceClassicDialogArrowCursor(GtkWidget* widget)
-{
-    if (widget == nullptr) {
-        return;
-    }
-
-    GdkCursor* cursor = ClassicDialogArrowCursor();
-    gtk_widget_set_cursor(widget, cursor);
-
-    GtkNative* native = gtk_widget_get_native(widget);
-    GdkSurface* surface = native == nullptr ? nullptr : gtk_native_get_surface(native);
-    if (surface != nullptr) {
-        gdk_surface_set_cursor(surface, cursor);
-    }
-}
 
 void ButtonClicked(GtkButton* button, gpointer userData)
 {
@@ -230,7 +131,6 @@ void ConfigureDialogWindow(GtkWidget* dialog, GtkWindow* parent, const char* tit
     if (parent != nullptr) {
         gtk_window_set_transient_for(GTK_WINDOW(dialog), parent);
     }
-    ApplyClassicDialogArrowCursor(dialog);
 }
 
 GtkWidget* CreateDialogContent(GtkWidget* dialog)
@@ -506,9 +406,7 @@ int RunMessageDialog(
         AddButton(row, thirdLabel, thirdResponse, state);
     }
 
-    ApplyClassicDialogArrowCursor(dialog);
     gtk_window_present(GTK_WINDOW(dialog));
-    ForceClassicDialogArrowCursor(dialog);
     g_main_loop_run(state.loop);
     g_main_loop_unref(state.loop);
     return state.response;
@@ -572,9 +470,7 @@ std::wstring RunFileDialog(
     g_signal_connect(cancelButton, "clicked", G_CALLBACK(FileDialogCancelClicked), nullptr);
     gtk_window_set_default_widget(GTK_WINDOW(dialog), acceptButton);
 
-    ApplyClassicDialogArrowCursor(dialog);
     gtk_window_present(GTK_WINDOW(dialog));
-    ForceClassicDialogArrowCursor(dialog);
     g_main_loop_run(state.loop);
     g_main_loop_unref(state.loop);
     return state.accepted ? state.path : std::wstring();
@@ -828,9 +724,7 @@ std::wstring ShowFontDialog(GtkWindow* parent, const std::wstring& currentFont)
     g_signal_connect(cancelButton, "clicked", G_CALLBACK(FontDialogCancelClicked), nullptr);
     gtk_window_set_default_widget(GTK_WINDOW(dialog), okButton);
 
-    ApplyClassicDialogArrowCursor(dialog);
     gtk_window_present(GTK_WINDOW(dialog));
-    ForceClassicDialogArrowCursor(dialog);
     g_main_loop_run(state.loop);
     g_main_loop_unref(state.loop);
     return state.accepted ? state.description : std::wstring();
@@ -901,9 +795,7 @@ void ShowAboutDialog(GtkWindow* parent, const std::wstring& version)
     gtk_widget_grab_focus(okButton);
     gtk_window_set_default_widget(GTK_WINDOW(dialog), okButton);
 
-    ApplyClassicDialogArrowCursor(dialog);
     gtk_window_present(GTK_WINDOW(dialog));
-    ForceClassicDialogArrowCursor(dialog);
     g_main_loop_run(state.loop);
     g_main_loop_unref(state.loop);
 }

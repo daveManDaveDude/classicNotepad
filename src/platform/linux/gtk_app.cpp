@@ -24,18 +24,10 @@
 namespace classic_notepad::linux_ui {
 namespace {
 
-void ApplyClassicCursorThemeSize(GtkWidget* widget);
-void ApplyClassicArrowCursor(GtkWidget* widget);
-void ApplyClassicTextCursor(GtkWidget* widget, const std::wstring& fontDescription);
-void ForceClassicTextCursor(GtkWidget* widget);
-void ForceClassicArrowCursor(GtkWidget* widget);
 void PopdownMappedPopovers(GtkWidget* widget);
 int CountMappedPopovers(GtkWidget* widget);
 bool ActivateFirstWidgetWithLabel(GtkWidget* widget, const char* label);
 gboolean OnEditorKeyPressed(GtkEventControllerKey* controller, guint keyval, guint keycode, GdkModifierType state, gpointer userData);
-void OnEditorPointerEntered(GtkEventControllerMotion*, double, double, gpointer userData);
-void OnEditorPointerMoved(GtkEventControllerMotion*, double, double, gpointer userData);
-void OnEditorPointerLeft(GtkEventControllerMotion*, gpointer userData);
 void OnContextSpellingSuggestionClicked(GtkButton* button, gpointer userData);
 void OnContextSpellingIgnoreClicked(GtkButton*, gpointer userData);
 void OnContextSpellingAddClicked(GtkButton*, gpointer userData);
@@ -75,13 +67,6 @@ void OnGtkSettingsAppearanceChanged(GObject*, GParamSpec*, gpointer userData)
     static_cast<GtkNotepadApp*>(userData)->RefreshAppearanceFromSystem();
 }
 
-void OnWindowScaleFactorChanged(GObject* object, GParamSpec*, gpointer)
-{
-    if (GTK_IS_WIDGET(object)) {
-        ApplyClassicCursorThemeSize(GTK_WIDGET(object));
-    }
-}
-
 void OnWindowPressed(GtkGestureClick*, int, double x, double y, gpointer userData)
 {
     static_cast<GtkNotepadApp*>(userData)->HandleWindowPress(x, y);
@@ -94,21 +79,6 @@ void OnEditorPressed(GtkGestureClick* gesture, int, double x, double y, gpointer
         static_cast<unsigned int>(gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(gesture))),
         x,
         y);
-}
-
-void OnEditorPointerEntered(GtkEventControllerMotion*, double, double, gpointer userData)
-{
-    ForceClassicTextCursor(GTK_WIDGET(userData));
-}
-
-void OnEditorPointerMoved(GtkEventControllerMotion*, double, double, gpointer userData)
-{
-    ForceClassicTextCursor(GTK_WIDGET(userData));
-}
-
-void OnEditorPointerLeft(GtkEventControllerMotion*, gpointer userData)
-{
-    ForceClassicArrowCursor(GTK_WIDGET(userData));
 }
 
 void OnContextPopoverClosedSignal(GtkPopover* popover, gpointer userData)
@@ -428,42 +398,6 @@ std::string CssSizeFromPangoDescription(PangoFontDescription* description)
     return output.str();
 }
 
-int FontPixelHeightFromPangoDescription(PangoFontDescription* description)
-{
-    if (description == nullptr) {
-        return 15;
-    }
-
-    const int pangoSize = pango_font_description_get_size(description);
-    if (pangoSize <= 0) {
-        return 15;
-    }
-
-    const double size = static_cast<double>(pangoSize) / static_cast<double>(PANGO_SCALE);
-    if (pango_font_description_get_size_is_absolute(description)) {
-        return static_cast<int>(std::lround(size));
-    }
-
-    constexpr double kCssPixelsPerPoint = 96.0 / 72.0;
-    return static_cast<int>(std::lround(size * kCssPixelsPerPoint));
-}
-
-int TextCursorHeightFromFont(const std::wstring& fontDescription)
-{
-    const std::string utf8Description = Utf8FromWide(fontDescription);
-    PangoFontDescription* description = pango_font_description_from_string(utf8Description.c_str());
-    const int fontPixelHeight = FontPixelHeightFromPangoDescription(description);
-    if (description != nullptr) {
-        pango_font_description_free(description);
-    }
-
-    int cursorHeight = std::clamp(fontPixelHeight + 5, 15, 70);
-    if (cursorHeight % 2 == 0) {
-        ++cursorHeight;
-    }
-    return cursorHeight;
-}
-
 struct ClipboardReadState {
     GMainLoop* loop = nullptr;
     std::wstring text;
@@ -714,301 +648,6 @@ int ReadSettingsEnum(GtkSettings* settings, const char* name, int fallback)
     return result;
 }
 
-int BaseCursorThemeSize(GtkSettings* settings)
-{
-    static int baseSize = 0;
-    if (baseSize > 0) {
-        return baseSize;
-    }
-
-    int configuredSize = 0;
-    if (settings != nullptr && SettingsHasProperty(settings, "gtk-cursor-theme-size")) {
-        g_object_get(settings, "gtk-cursor-theme-size", &configuredSize, nullptr);
-    }
-
-    constexpr int kClassicCursorThemeSize = 12;
-    baseSize = configuredSize > 0 ? std::min(configuredSize, kClassicCursorThemeSize) : kClassicCursorThemeSize;
-    return baseSize;
-}
-
-void ApplyClassicCursorThemeSize(GtkWidget* widget)
-{
-    GtkSettings* settings = gtk_settings_get_default();
-    if (!SettingsHasProperty(settings, "gtk-cursor-theme-size")) {
-        return;
-    }
-
-    const int scaleFactor = widget == nullptr ? 1 : std::max(1, gtk_widget_get_scale_factor(widget));
-    constexpr int kMinimumCursorThemeSize = 8;
-    const int baseSize = BaseCursorThemeSize(settings);
-    const int targetSize = scaleFactor > 1
-        ? std::max(kMinimumCursorThemeSize, baseSize / scaleFactor)
-        : baseSize;
-
-    int currentSize = 0;
-    g_object_get(settings, "gtk-cursor-theme-size", &currentSize, nullptr);
-    if (currentSize != targetSize) {
-        g_object_set(settings, "gtk-cursor-theme-size", targetSize, nullptr);
-    }
-}
-
-GdkCursor* ClassicArrowCursor()
-{
-    static GdkCursor* cursor = nullptr;
-    if (cursor != nullptr) {
-        return cursor;
-    }
-
-    constexpr int kWidth = 14;
-    constexpr int kHeight = 20;
-    constexpr int kChannels = 4;
-    std::vector<guchar> pixels(kWidth * kHeight * kChannels, 0);
-
-    auto setPixel = [&pixels](int x, int y, guchar red, guchar green, guchar blue, guchar alpha) {
-        if (x < 0 || x >= kWidth || y < 0 || y >= kHeight) {
-            return;
-        }
-
-        const int offset = ((y * kWidth) + x) * kChannels;
-        pixels[static_cast<std::size_t>(offset)] = red;
-        pixels[static_cast<std::size_t>(offset + 1)] = green;
-        pixels[static_cast<std::size_t>(offset + 2)] = blue;
-        pixels[static_cast<std::size_t>(offset + 3)] = alpha;
-    };
-
-    auto setBlack = [&setPixel](int x, int y) {
-        setPixel(x, y, 0, 0, 0, 255);
-    };
-    auto setWhite = [&setPixel](int x, int y) {
-        setPixel(x, y, 255, 255, 255, 255);
-    };
-
-    for (int y = 0; y <= 13; ++y) {
-        const int edge = y <= 10 ? y : 19 - y;
-        setBlack(0, y);
-        setBlack(edge, y);
-        for (int x = 1; x < edge; ++x) {
-            setWhite(x, y);
-        }
-    }
-
-    setBlack(4, 13);
-    setBlack(5, 14);
-    setBlack(5, 15);
-    setBlack(6, 16);
-    setBlack(6, 17);
-    setBlack(7, 18);
-    setBlack(7, 19);
-    setBlack(8, 19);
-    setBlack(8, 18);
-    setBlack(7, 17);
-    setBlack(7, 16);
-    setBlack(6, 15);
-    setBlack(6, 14);
-    setWhite(5, 13);
-    setWhite(6, 15);
-    setWhite(7, 18);
-
-    GBytes* bytes = g_bytes_new(pixels.data(), pixels.size());
-    GdkTexture* texture = gdk_memory_texture_new(
-        kWidth,
-        kHeight,
-        GDK_MEMORY_R8G8B8A8,
-        bytes,
-        kWidth * kChannels);
-    cursor = gdk_cursor_new_from_texture(texture, 0, 0, nullptr);
-    g_object_unref(texture);
-    g_bytes_unref(bytes);
-    return cursor;
-}
-
-void ApplyClassicArrowCursor(GtkWidget* widget)
-{
-    if (widget == nullptr) {
-        return;
-    }
-
-    gtk_widget_set_cursor(widget, ClassicArrowCursor());
-    for (GtkWidget* child = gtk_widget_get_first_child(widget); child != nullptr; child = gtk_widget_get_next_sibling(child)) {
-        ApplyClassicArrowCursor(child);
-    }
-}
-
-constexpr const char* kClassicTextCursorDataKey = "classic-notepad-text-cursor";
-
-GdkCursor* CreateClassicTextCursor(int cursorHeight)
-{
-    const int height = std::clamp(cursorHeight, 15, 70);
-    int width = std::max(5, (height + 4) / 5);
-    if (width % 2 == 0) {
-        ++width;
-    }
-    const int centerX = width / 2;
-    const int hotspotY = height / 2;
-    constexpr int kChannels = 4;
-    std::vector<guchar> pixels(static_cast<std::size_t>(width * height * kChannels), 0);
-
-    auto setPixel = [&pixels, width, height](int x, int y, guchar red, guchar green, guchar blue, guchar alpha) {
-        if (x < 0 || x >= width || y < 0 || y >= height) {
-            return;
-        }
-
-        const int offset = ((y * width) + x) * kChannels;
-        pixels[static_cast<std::size_t>(offset)] = red;
-        pixels[static_cast<std::size_t>(offset + 1)] = green;
-        pixels[static_cast<std::size_t>(offset + 2)] = blue;
-        pixels[static_cast<std::size_t>(offset + 3)] = alpha;
-    };
-
-    for (int y = 1; y < height - 1; ++y) {
-        setPixel(centerX - 1, y, 255, 255, 255, 220);
-        setPixel(centerX, y, 0, 0, 0, 255);
-        setPixel(centerX + 1, y, 255, 255, 255, 220);
-    }
-
-    for (int x = 1; x < width - 1; ++x) {
-        setPixel(x, 0, 0, 0, 0, 255);
-        setPixel(x, height - 1, 0, 0, 0, 255);
-    }
-
-    GBytes* bytes = g_bytes_new(pixels.data(), pixels.size());
-    GdkTexture* texture = gdk_memory_texture_new(
-        width,
-        height,
-        GDK_MEMORY_R8G8B8A8,
-        bytes,
-        width * kChannels);
-    GdkCursor* cursor = gdk_cursor_new_from_texture(texture, centerX, hotspotY, nullptr);
-    g_object_unref(texture);
-    g_bytes_unref(bytes);
-    return cursor;
-}
-
-void ApplyClassicTextCursor(GtkWidget* widget, GdkCursor* cursor)
-{
-    if (widget == nullptr || cursor == nullptr) {
-        return;
-    }
-
-    gtk_widget_set_cursor(widget, cursor);
-    g_object_set_data_full(
-        G_OBJECT(widget),
-        kClassicTextCursorDataKey,
-        g_object_ref(cursor),
-        [](gpointer data) {
-            g_object_unref(data);
-        });
-
-    for (GtkWidget* child = gtk_widget_get_first_child(widget); child != nullptr; child = gtk_widget_get_next_sibling(child)) {
-        ApplyClassicTextCursor(child, cursor);
-    }
-}
-
-void ApplyClassicTextCursor(GtkWidget* widget, const std::wstring& fontDescription)
-{
-    if (widget == nullptr) {
-        return;
-    }
-
-    GdkCursor* cursor = CreateClassicTextCursor(TextCursorHeightFromFont(fontDescription));
-    ApplyClassicTextCursor(widget, cursor);
-    g_object_unref(cursor);
-}
-
-void ForceClassicTextCursor(GtkWidget* widget)
-{
-    if (widget == nullptr) {
-        return;
-    }
-
-    GdkCursor* cursor = static_cast<GdkCursor*>(
-        g_object_get_data(G_OBJECT(widget), kClassicTextCursorDataKey));
-    if (cursor == nullptr) {
-        cursor = CreateClassicTextCursor(TextCursorHeightFromFont(L"Monospace 11"));
-        if (cursor == nullptr) {
-            return;
-        }
-        g_object_set_data_full(
-            G_OBJECT(widget),
-            kClassicTextCursorDataKey,
-            g_object_ref(cursor),
-            [](gpointer data) {
-                g_object_unref(data);
-            });
-        g_object_unref(cursor);
-        cursor = static_cast<GdkCursor*>(
-            g_object_get_data(G_OBJECT(widget), kClassicTextCursorDataKey));
-    }
-
-    gtk_widget_set_cursor(widget, cursor);
-
-    GtkNative* native = gtk_widget_get_native(widget);
-    GdkSurface* surface = native == nullptr ? nullptr : gtk_native_get_surface(native);
-    if (surface != nullptr) {
-        gdk_surface_set_cursor(surface, cursor);
-    }
-}
-
-void ForceClassicArrowCursor(GtkWidget* widget)
-{
-    if (widget == nullptr) {
-        return;
-    }
-
-    GdkCursor* cursor = ClassicArrowCursor();
-    gtk_widget_set_cursor(widget, cursor);
-
-    GtkNative* native = gtk_widget_get_native(widget);
-    GdkSurface* surface = native == nullptr ? nullptr : gtk_native_get_surface(native);
-    if (surface != nullptr) {
-        gdk_surface_set_cursor(surface, cursor);
-    }
-}
-
-void ApplyClassicArrowCursorToToplevels()
-{
-    GListModel* toplevels = gtk_window_get_toplevels();
-    if (toplevels == nullptr) {
-        return;
-    }
-
-    const guint count = g_list_model_get_n_items(toplevels);
-    for (guint index = 0; index < count; ++index) {
-        GObject* item = static_cast<GObject*>(g_list_model_get_item(toplevels, index));
-        if (item != nullptr && GTK_IS_WIDGET(item)) {
-            GtkWidget* widget = GTK_WIDGET(item);
-            ApplyClassicArrowCursor(widget);
-            ForceClassicArrowCursor(widget);
-        }
-        if (item != nullptr) {
-            g_object_unref(item);
-        }
-    }
-}
-
-struct ToplevelCursorWatchState {
-    int remainingTicks = 0;
-};
-
-gboolean RestoreClassicArrowCursorToToplevels(gpointer userData)
-{
-    auto* state = static_cast<ToplevelCursorWatchState*>(userData);
-    ApplyClassicArrowCursorToToplevels();
-
-    --state->remainingTicks;
-    if (state->remainingTicks <= 0) {
-        delete state;
-        return G_SOURCE_REMOVE;
-    }
-
-    return G_SOURCE_CONTINUE;
-}
-
-void WatchToplevelDialogCursors()
-{
-    g_timeout_add(50, RestoreClassicArrowCursorToToplevels, new ToplevelCursorWatchState {80});
-}
-
 classic_notepad::AppearanceTheme ThemeFromEnvironment()
 {
     const char* value = g_getenv(classic_notepad::kAppearanceThemeEnvironmentVariable);
@@ -1228,7 +867,6 @@ int GtkNotepadApp::RunAutomation(bool visible)
         gtk_window_present(GTK_WINDOW(window_));
     }
     PumpEvents();
-    ApplyClassicCursorThemeSize(window_);
 
     GtkAutomationController controller(*this);
     const int result = controller.Run();
@@ -1246,14 +884,12 @@ void GtkNotepadApp::Activate(GtkApplication* application)
 {
     if (window_ != nullptr) {
         gtk_window_present(GTK_WINDOW(window_));
-        ApplyClassicCursorThemeSize(window_);
         return;
     }
 
     BuildWindow(application);
     HandleInitialFilePath(false);
     gtk_window_present(GTK_WINDOW(window_));
-    ApplyClassicCursorThemeSize(window_);
 }
 
 void GtkNotepadApp::PumpEvents()
@@ -1351,12 +987,10 @@ void GtkNotepadApp::HandlePageSetup()
         return;
     }
 
-    WatchToplevelDialogCursors();
     GtkPageSetup* selected = gtk_print_run_page_setup_dialog(
         Window(),
         EnsurePageSetup(),
         EnsurePrintSettings());
-    RestoreClassicArrowCursor();
     if (selected == nullptr) {
         return;
     }
@@ -1382,13 +1016,11 @@ void GtkNotepadApp::HandlePrint()
     g_signal_connect(operation, "draw-page", G_CALLBACK(OnDrawPrintPage), this);
 
     GError* error = nullptr;
-    WatchToplevelDialogCursors();
     const GtkPrintOperationResult result = gtk_print_operation_run(
         operation,
         GTK_PRINT_OPERATION_ACTION_PRINT_DIALOG,
         Window(),
         &error);
-    RestoreClassicArrowCursor();
 
     if (error != nullptr) {
         ShowError(WideFromUtf8(error->message));
@@ -1602,8 +1234,6 @@ void GtkNotepadApp::DismissOpenMenus()
     if (contextPopover_ != nullptr) {
         gtk_popover_popdown(GTK_POPOVER(contextPopover_));
     }
-
-    RestoreClassicArrowCursor();
 }
 
 void GtkNotepadApp::DismissOpenMenusAndResetModels()
@@ -1619,21 +1249,6 @@ void GtkNotepadApp::DismissOpenMenusAndResetModels()
             g_object_unref(model);
         }
     }
-
-    RestoreClassicArrowCursor();
-}
-
-void GtkNotepadApp::RestoreClassicArrowCursor()
-{
-    ApplyClassicCursorThemeSize(window_);
-    ApplyClassicArrowCursor(window_);
-    if (root_ != nullptr) {
-        ApplyClassicArrowCursor(root_);
-    }
-    if (contextPopover_ != nullptr) {
-        ApplyClassicArrowCursor(contextPopover_);
-    }
-    ForceClassicArrowCursor(window_);
 }
 
 int GtkNotepadApp::AutomationMappedMenuPopoverCount() const
@@ -2664,7 +2279,6 @@ void GtkNotepadApp::ApplyFont()
     gtk_css_provider_load_from_data(fontProvider_, css.c_str(), static_cast<gssize>(css.size()));
 #endif
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(textView_), FALSE);
-    ApplyClassicTextCursor(textView_, fontDescription_);
 }
 
 void GtkNotepadApp::EnsureThemeProvider()
@@ -2906,13 +2520,10 @@ void GtkNotepadApp::ShowEditorContextMenuAt(const GdkRectangle& point)
     gtk_popover_set_has_arrow(GTK_POPOVER(contextPopover_), FALSE);
     gtk_widget_set_parent(contextPopover_, textView_);
     GtkWidget* content = CreateEditorContextMenuContent();
-    ApplyClassicArrowCursor(content);
     gtk_popover_set_child(GTK_POPOVER(contextPopover_), content);
-    ApplyClassicArrowCursor(contextPopover_);
     gtk_popover_set_pointing_to(GTK_POPOVER(contextPopover_), &point);
     g_signal_connect(contextPopover_, "closed", G_CALLBACK(OnContextPopoverClosedSignal), this);
     gtk_popover_popup(GTK_POPOVER(contextPopover_));
-    ForceClassicArrowCursor(contextPopover_);
 }
 
 void GtkNotepadApp::InstallContextMenu()
@@ -3066,9 +2677,6 @@ void GtkNotepadApp::BuildWindow(GtkApplication* application)
     gtk_window_set_default_size(GTK_WINDOW(window_), 800, 500);
     g_signal_connect(window_, "close-request", G_CALLBACK(OnCloseRequest), this);
     g_signal_connect(window_, "destroy", G_CALLBACK(OnWindowDestroy), this);
-    g_signal_connect(window_, "notify::scale-factor", G_CALLBACK(OnWindowScaleFactorChanged), nullptr);
-    ApplyClassicCursorThemeSize(window_);
-    ApplyClassicArrowCursor(window_);
 
     GtkGesture* windowClick = gtk_gesture_click_new();
     gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(windowClick), GTK_PHASE_CAPTURE);
@@ -3089,7 +2697,6 @@ void GtkNotepadApp::BuildWindow(GtkApplication* application)
     gtk_widget_set_vexpand(scrolledWindow, TRUE);
     gtk_widget_set_hexpand(scrolledWindow, TRUE);
     gtk_box_append(GTK_BOX(root_), scrolledWindow);
-    ApplyClassicArrowCursor(root_);
 
 #if CLASSIC_NOTEPAD_HAS_LIBSPELLING
     spelling_ = std::make_unique<GtkSpellingService>();
@@ -3098,19 +2705,9 @@ void GtkNotepadApp::BuildWindow(GtkApplication* application)
     textView_ = gtk_text_view_new();
 #endif
     gtk_widget_add_css_class(textView_, "classic-notepad-editor");
-    ApplyClassicTextCursor(textView_, fontDescription_);
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(textView_), TRUE);
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(textView_), wordWrap_ ? GTK_WRAP_WORD_CHAR : GTK_WRAP_NONE);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolledWindow), textView_);
-    ApplyClassicTextCursor(textView_, fontDescription_);
-    ForceClassicTextCursor(textView_);
-
-    GtkEventController* editorMotion = gtk_event_controller_motion_new();
-    gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(editorMotion), GTK_PHASE_BUBBLE);
-    g_signal_connect(editorMotion, "enter", G_CALLBACK(OnEditorPointerEntered), textView_);
-    g_signal_connect(editorMotion, "motion", G_CALLBACK(OnEditorPointerMoved), textView_);
-    g_signal_connect(editorMotion, "leave", G_CALLBACK(OnEditorPointerLeft), textView_);
-    gtk_widget_add_controller(textView_, editorMotion);
 
     GtkEventController* editorKey = gtk_event_controller_key_new();
     gtk_event_controller_set_propagation_phase(GTK_EVENT_CONTROLLER(editorKey), GTK_PHASE_CAPTURE);
