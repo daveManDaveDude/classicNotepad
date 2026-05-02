@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cwchar>
 #include <string>
+#include <vector>
 
 #ifndef CLASSIC_NOTEPAD_ICON_PATH
 #define CLASSIC_NOTEPAD_ICON_PATH "assets/icons/classic_notepad_large_transparent.png"
@@ -23,7 +24,9 @@ struct MessageLoopState {
 struct FileDialogState {
     GMainLoop* loop = nullptr;
     std::wstring path;
+    GtkWidget* chooser = nullptr;
     bool save = false;
+    bool accepted = false;
 };
 
 struct FindDialogState {
@@ -57,7 +60,109 @@ struct GoToDialogState {
 struct FontDialogState {
     GMainLoop* loop = nullptr;
     std::wstring description;
+    GtkWidget* chooser = nullptr;
+    bool accepted = false;
 };
+
+void SetSelectedPath(FileDialogState& state, GFile* file);
+
+GdkCursor* ClassicDialogArrowCursor()
+{
+    static GdkCursor* cursor = nullptr;
+    if (cursor != nullptr) {
+        return cursor;
+    }
+
+    constexpr int kWidth = 14;
+    constexpr int kHeight = 20;
+    constexpr int kChannels = 4;
+    std::vector<guchar> pixels(kWidth * kHeight * kChannels, 0);
+
+    auto setPixel = [&pixels](int x, int y, guchar red, guchar green, guchar blue, guchar alpha) {
+        if (x < 0 || x >= kWidth || y < 0 || y >= kHeight) {
+            return;
+        }
+
+        const int offset = ((y * kWidth) + x) * kChannels;
+        pixels[static_cast<std::size_t>(offset)] = red;
+        pixels[static_cast<std::size_t>(offset + 1)] = green;
+        pixels[static_cast<std::size_t>(offset + 2)] = blue;
+        pixels[static_cast<std::size_t>(offset + 3)] = alpha;
+    };
+
+    auto setBlack = [&setPixel](int x, int y) {
+        setPixel(x, y, 0, 0, 0, 255);
+    };
+    auto setWhite = [&setPixel](int x, int y) {
+        setPixel(x, y, 255, 255, 255, 255);
+    };
+
+    for (int y = 0; y <= 13; ++y) {
+        const int edge = y <= 10 ? y : 19 - y;
+        setBlack(0, y);
+        setBlack(edge, y);
+        for (int x = 1; x < edge; ++x) {
+            setWhite(x, y);
+        }
+    }
+
+    setBlack(4, 13);
+    setBlack(5, 14);
+    setBlack(5, 15);
+    setBlack(6, 16);
+    setBlack(6, 17);
+    setBlack(7, 18);
+    setBlack(7, 19);
+    setBlack(8, 19);
+    setBlack(8, 18);
+    setBlack(7, 17);
+    setBlack(7, 16);
+    setBlack(6, 15);
+    setBlack(6, 14);
+    setWhite(5, 13);
+    setWhite(6, 15);
+    setWhite(7, 18);
+
+    GBytes* bytes = g_bytes_new(pixels.data(), pixels.size());
+    GdkTexture* texture = gdk_memory_texture_new(
+        kWidth,
+        kHeight,
+        GDK_MEMORY_R8G8B8A8,
+        bytes,
+        kWidth * kChannels);
+    cursor = gdk_cursor_new_from_texture(texture, 0, 0, nullptr);
+    g_object_unref(texture);
+    g_bytes_unref(bytes);
+    return cursor;
+}
+
+void ApplyClassicDialogArrowCursor(GtkWidget* widget)
+{
+    if (widget == nullptr) {
+        return;
+    }
+
+    gtk_widget_set_cursor(widget, ClassicDialogArrowCursor());
+    for (GtkWidget* child = gtk_widget_get_first_child(widget); child != nullptr; child = gtk_widget_get_next_sibling(child)) {
+        ApplyClassicDialogArrowCursor(child);
+    }
+}
+
+void ForceClassicDialogArrowCursor(GtkWidget* widget)
+{
+    if (widget == nullptr) {
+        return;
+    }
+
+    GdkCursor* cursor = ClassicDialogArrowCursor();
+    gtk_widget_set_cursor(widget, cursor);
+
+    GtkNative* native = gtk_widget_get_native(widget);
+    GdkSurface* surface = native == nullptr ? nullptr : gtk_native_get_surface(native);
+    if (surface != nullptr) {
+        gdk_surface_set_cursor(surface, cursor);
+    }
+}
 
 void ButtonClicked(GtkButton* button, gpointer userData)
 {
@@ -125,6 +230,7 @@ void ConfigureDialogWindow(GtkWidget* dialog, GtkWindow* parent, const char* tit
     if (parent != nullptr) {
         gtk_window_set_transient_for(GTK_WINDOW(dialog), parent);
     }
+    ApplyClassicDialogArrowCursor(dialog);
 }
 
 GtkWidget* CreateDialogContent(GtkWidget* dialog)
@@ -278,6 +384,78 @@ void OnFontDialogReady(GObject* sourceObject, GAsyncResult* result, gpointer use
 }
 #endif
 
+void FontDialogOkClicked(GtkButton* button, gpointer userData)
+{
+    auto* state = static_cast<FontDialogState*>(userData);
+    if (state->chooser != nullptr) {
+        PangoFontDescription* description = gtk_font_chooser_get_font_desc(GTK_FONT_CHOOSER(state->chooser));
+        if (description != nullptr) {
+            char* text = pango_font_description_to_string(description);
+            if (text != nullptr) {
+                state->description = WideFromUtf8(text);
+                g_free(text);
+            }
+            pango_font_description_free(description);
+        }
+    }
+
+    state->accepted = true;
+    GtkRoot* root = gtk_widget_get_root(GTK_WIDGET(button));
+    if (root != nullptr && GTK_IS_WINDOW(root)) {
+        gtk_window_destroy(GTK_WINDOW(root));
+    }
+}
+
+void FontDialogCancelClicked(GtkButton* button, gpointer)
+{
+    GtkRoot* root = gtk_widget_get_root(GTK_WIDGET(button));
+    if (root != nullptr && GTK_IS_WINDOW(root)) {
+        gtk_window_destroy(GTK_WINDOW(root));
+    }
+}
+
+void FontDialogDestroyed(GtkWidget*, gpointer userData)
+{
+    auto* state = static_cast<FontDialogState*>(userData);
+    if (state->loop != nullptr && g_main_loop_is_running(state->loop)) {
+        g_main_loop_quit(state->loop);
+    }
+}
+
+void FileDialogAcceptClicked(GtkButton* button, gpointer userData)
+{
+    auto* state = static_cast<FileDialogState*>(userData);
+    if (state->chooser != nullptr) {
+        GFile* file = gtk_file_chooser_get_file(GTK_FILE_CHOOSER(state->chooser));
+        SetSelectedPath(*state, file);
+        if (file != nullptr) {
+            g_object_unref(file);
+        }
+    }
+
+    state->accepted = !state->path.empty();
+    GtkRoot* root = gtk_widget_get_root(GTK_WIDGET(button));
+    if (root != nullptr && GTK_IS_WINDOW(root)) {
+        gtk_window_destroy(GTK_WINDOW(root));
+    }
+}
+
+void FileDialogCancelClicked(GtkButton* button, gpointer)
+{
+    GtkRoot* root = gtk_widget_get_root(GTK_WIDGET(button));
+    if (root != nullptr && GTK_IS_WINDOW(root)) {
+        gtk_window_destroy(GTK_WINDOW(root));
+    }
+}
+
+void FileDialogDestroyed(GtkWidget*, gpointer userData)
+{
+    auto* state = static_cast<FileDialogState*>(userData);
+    if (state->loop != nullptr && g_main_loop_is_running(state->loop)) {
+        g_main_loop_quit(state->loop);
+    }
+}
+
 int RunMessageDialog(
     GtkWindow* parent,
     const char* title,
@@ -328,7 +506,9 @@ int RunMessageDialog(
         AddButton(row, thirdLabel, thirdResponse, state);
     }
 
+    ApplyClassicDialogArrowCursor(dialog);
     gtk_window_present(GTK_WINDOW(dialog));
+    ForceClassicDialogArrowCursor(dialog);
     g_main_loop_run(state.loop);
     g_main_loop_unref(state.loop);
     return state.response;
@@ -347,31 +527,6 @@ void SetSelectedPath(FileDialogState& state, GFile* file)
     }
 }
 
-#if GTK_CHECK_VERSION(4, 10, 0)
-void OnFileDialogReady(GObject* sourceObject, GAsyncResult* result, gpointer userData)
-{
-    auto* state = static_cast<FileDialogState*>(userData);
-    GError* error = nullptr;
-    GtkFileDialog* dialog = GTK_FILE_DIALOG(sourceObject);
-    GFile* file = state->save
-        ? gtk_file_dialog_save_finish(dialog, result, &error)
-        : gtk_file_dialog_open_finish(dialog, result, &error);
-
-    SetSelectedPath(*state, file);
-
-    if (file != nullptr) {
-        g_object_unref(file);
-    }
-
-    if (error != nullptr) {
-        g_error_free(error);
-    }
-
-    if (state->loop != nullptr && g_main_loop_is_running(state->loop)) {
-        g_main_loop_quit(state->loop);
-    }
-}
-
 std::wstring RunFileDialog(
     GtkWindow* parent,
     bool save,
@@ -379,81 +534,51 @@ std::wstring RunFileDialog(
     const char* acceptLabel,
     const std::wstring& suggestedName)
 {
-    GtkFileDialog* dialog = gtk_file_dialog_new();
-    gtk_file_dialog_set_title(dialog, title);
-    gtk_file_dialog_set_accept_label(dialog, acceptLabel);
-    gtk_file_dialog_set_modal(dialog, TRUE);
-
-    if (save && !suggestedName.empty()) {
-        const std::string utf8Name = Utf8FromWide(suggestedName);
-        gtk_file_dialog_set_initial_name(dialog, utf8Name.c_str());
-    }
-
     FileDialogState state;
     state.loop = g_main_loop_new(nullptr, FALSE);
     state.save = save;
 
-    if (save) {
-        gtk_file_dialog_save(dialog, parent, nullptr, OnFileDialogReady, &state);
-    } else {
-        gtk_file_dialog_open(dialog, parent, nullptr, OnFileDialogReady, &state);
-    }
-
-    g_main_loop_run(state.loop);
-    g_main_loop_unref(state.loop);
-    g_object_unref(dialog);
-    return state.path;
-}
-#else
-void OnFileChooserNativeResponse(GtkNativeDialog* dialog, int response, gpointer userData)
-{
-    auto* state = static_cast<FileDialogState*>(userData);
-    if (response == GTK_RESPONSE_ACCEPT) {
-        GFile* file = gtk_file_chooser_get_file(GTK_FILE_CHOOSER(dialog));
-        if (file != nullptr) {
-            SetSelectedPath(*state, file);
-            g_object_unref(file);
-        }
-    }
-
-    if (state->loop != nullptr && g_main_loop_is_running(state->loop)) {
-        g_main_loop_quit(state->loop);
-    }
-}
-
-std::wstring RunFileDialog(
-    GtkWindow* parent,
-    bool save,
-    const char* title,
-    const char* acceptLabel,
-    const std::wstring& suggestedName)
-{
     const GtkFileChooserAction action = save ? GTK_FILE_CHOOSER_ACTION_SAVE : GTK_FILE_CHOOSER_ACTION_OPEN;
-    GtkFileChooserNative* dialog = gtk_file_chooser_native_new(
-        title,
-        parent,
-        action,
-        acceptLabel,
-        "_Cancel");
-    gtk_native_dialog_set_modal(GTK_NATIVE_DIALOG(dialog), TRUE);
+    GtkWidget* dialog = gtk_window_new();
+    ConfigureDialogWindow(dialog, parent, title, 760);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 760, 520);
+    g_signal_connect(dialog, "destroy", G_CALLBACK(FileDialogDestroyed), &state);
+
+    GtkWidget* content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_set_margin_start(content, 12);
+    gtk_widget_set_margin_end(content, 12);
+    gtk_widget_set_margin_top(content, 12);
+    gtk_widget_set_margin_bottom(content, 12);
+    gtk_window_set_child(GTK_WINDOW(dialog), content);
+
+    state.chooser = gtk_file_chooser_widget_new(action);
+    gtk_widget_set_hexpand(state.chooser, TRUE);
+    gtk_widget_set_vexpand(state.chooser, TRUE);
 
     if (!suggestedName.empty() && action == GTK_FILE_CHOOSER_ACTION_SAVE) {
         const std::string utf8Name = Utf8FromWide(suggestedName);
-        gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dialog), utf8Name.c_str());
+        gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(state.chooser), utf8Name.c_str());
     }
 
-    FileDialogState state;
-    state.loop = g_main_loop_new(nullptr, FALSE);
-    state.save = save;
-    g_signal_connect(dialog, "response", G_CALLBACK(OnFileChooserNativeResponse), &state);
+    gtk_box_append(GTK_BOX(content), state.chooser);
 
-    gtk_native_dialog_show(GTK_NATIVE_DIALOG(dialog));
+    GtkWidget* row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_halign(row, GTK_ALIGN_END);
+    gtk_box_append(GTK_BOX(content), row);
+
+    GtkWidget* acceptButton = AddDialogButton(row, acceptLabel);
+    GtkWidget* cancelButton = AddDialogButton(row, "Cancel");
+    g_signal_connect(acceptButton, "clicked", G_CALLBACK(FileDialogAcceptClicked), &state);
+    g_signal_connect(cancelButton, "clicked", G_CALLBACK(FileDialogCancelClicked), nullptr);
+    gtk_window_set_default_widget(GTK_WINDOW(dialog), acceptButton);
+
+    ApplyClassicDialogArrowCursor(dialog);
+    gtk_window_present(GTK_WINDOW(dialog));
+    ForceClassicDialogArrowCursor(dialog);
     g_main_loop_run(state.loop);
     g_main_loop_unref(state.loop);
-    g_object_unref(dialog);
-    return state.path;
+    return state.accepted ? state.path : std::wstring();
 }
-#endif
 
 } // namespace
 
@@ -664,32 +789,51 @@ bool ShowGoToDialog(GtkWindow* parent, int currentLine, int maxLine, int& select
 
 std::wstring ShowFontDialog(GtkWindow* parent, const std::wstring& currentFont)
 {
-#if GTK_CHECK_VERSION(4, 10, 0)
-    GtkFontDialog* dialog = gtk_font_dialog_new();
-    gtk_font_dialog_set_title(dialog, "Font");
-    gtk_font_dialog_set_modal(dialog, TRUE);
+    FontDialogState state;
+    state.loop = g_main_loop_new(nullptr, FALSE);
+
+    GtkWidget* dialog = gtk_window_new();
+    ConfigureDialogWindow(dialog, parent, "Font", 740);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 740, 520);
+    g_signal_connect(dialog, "destroy", G_CALLBACK(FontDialogDestroyed), &state);
+
+    GtkWidget* content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_set_margin_start(content, 12);
+    gtk_widget_set_margin_end(content, 12);
+    gtk_widget_set_margin_top(content, 12);
+    gtk_widget_set_margin_bottom(content, 12);
+    gtk_window_set_child(GTK_WINDOW(dialog), content);
+
+    state.chooser = gtk_font_chooser_widget_new();
+    gtk_widget_set_hexpand(state.chooser, TRUE);
+    gtk_widget_set_vexpand(state.chooser, TRUE);
 
     const std::string utf8CurrentFont = Utf8FromWide(currentFont);
     PangoFontDescription* initialDescription = utf8CurrentFont.empty()
         ? nullptr
         : pango_font_description_from_string(utf8CurrentFont.c_str());
-
-    FontDialogState state;
-    state.loop = g_main_loop_new(nullptr, FALSE);
-    gtk_font_dialog_choose_font(dialog, parent, initialDescription, nullptr, OnFontDialogReady, &state);
-
-    g_main_loop_run(state.loop);
-    g_main_loop_unref(state.loop);
     if (initialDescription != nullptr) {
+        gtk_font_chooser_set_font_desc(GTK_FONT_CHOOSER(state.chooser), initialDescription);
         pango_font_description_free(initialDescription);
     }
-    g_object_unref(dialog);
-    return state.description;
-#else
-    (void)parent;
-    (void)currentFont;
-    return {};
-#endif
+    gtk_box_append(GTK_BOX(content), state.chooser);
+
+    GtkWidget* row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_halign(row, GTK_ALIGN_END);
+    gtk_box_append(GTK_BOX(content), row);
+
+    GtkWidget* okButton = AddDialogButton(row, "OK");
+    GtkWidget* cancelButton = AddDialogButton(row, "Cancel");
+    g_signal_connect(okButton, "clicked", G_CALLBACK(FontDialogOkClicked), &state);
+    g_signal_connect(cancelButton, "clicked", G_CALLBACK(FontDialogCancelClicked), nullptr);
+    gtk_window_set_default_widget(GTK_WINDOW(dialog), okButton);
+
+    ApplyClassicDialogArrowCursor(dialog);
+    gtk_window_present(GTK_WINDOW(dialog));
+    ForceClassicDialogArrowCursor(dialog);
+    g_main_loop_run(state.loop);
+    g_main_loop_unref(state.loop);
+    return state.accepted ? state.description : std::wstring();
 }
 
 void ShowErrorDialog(GtkWindow* parent, const std::wstring& message)
@@ -757,7 +901,9 @@ void ShowAboutDialog(GtkWindow* parent, const std::wstring& version)
     gtk_widget_grab_focus(okButton);
     gtk_window_set_default_widget(GTK_WINDOW(dialog), okButton);
 
+    ApplyClassicDialogArrowCursor(dialog);
     gtk_window_present(GTK_WINDOW(dialog));
+    ForceClassicDialogArrowCursor(dialog);
     g_main_loop_run(state.loop);
     g_main_loop_unref(state.loop);
 }

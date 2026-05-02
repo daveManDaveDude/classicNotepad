@@ -182,6 +182,92 @@ void ConfigurePlainSourceView(GtkSourceView* view)
     gtk_source_view_set_background_pattern(view, GTK_SOURCE_BACKGROUND_PATTERN_TYPE_NONE);
 }
 
+bool IsGtkWordCharacter(gunichar character)
+{
+    return g_unichar_isalnum(character) != FALSE || character == '_';
+}
+
+bool IterIsInsideWord(const GtkTextIter& iter)
+{
+    return IsGtkWordCharacter(gtk_text_iter_get_char(&iter));
+}
+
+bool MoveIterInsideNearbyWord(GtkTextIter& iter)
+{
+    if (IterIsInsideWord(iter)) {
+        return true;
+    }
+
+    GtkTextIter previous = iter;
+    if (gtk_text_iter_backward_char(&previous) != FALSE && IterIsInsideWord(previous)) {
+        iter = previous;
+        return true;
+    }
+
+    GtkTextIter next = iter;
+    if (gtk_text_iter_forward_char(&next) != FALSE && IterIsInsideWord(next)) {
+        iter = next;
+        return true;
+    }
+
+    return false;
+}
+
+void ClearAttachedActionGroup(GtkWidget*& view)
+{
+    if (view != nullptr) {
+        gtk_widget_insert_action_group(view, "spelling", nullptr);
+        g_object_remove_weak_pointer(G_OBJECT(view), reinterpret_cast<gpointer*>(&view));
+        view = nullptr;
+    }
+}
+
+void ClearAttachedBuffer(GtkTextBuffer*& buffer)
+{
+    if (buffer != nullptr) {
+        g_object_remove_weak_pointer(G_OBJECT(buffer), reinterpret_cast<gpointer*>(&buffer));
+        buffer = nullptr;
+    }
+}
+
+std::wstring TextFromGtkBuffer(GtkTextBuffer* buffer)
+{
+    if (buffer == nullptr) {
+        return {};
+    }
+
+    GtkTextIter start;
+    GtkTextIter end;
+    gtk_text_buffer_get_start_iter(buffer, &start);
+    gtk_text_buffer_get_end_iter(buffer, &end);
+
+    char* text = gtk_text_buffer_get_text(buffer, &start, &end, TRUE);
+    const std::wstring result = WideFromUtf8ForSpelling(text);
+    g_free(text);
+    return result;
+}
+
+GtkTextTag* EnsureSpellingErrorTag(GtkTextBuffer* buffer, GtkTextTag* existingTag)
+{
+    if (buffer == nullptr) {
+        return nullptr;
+    }
+
+    if (existingTag != nullptr) {
+        return existingTag;
+    }
+
+    GdkRGBA underlineColor { 1.0, 0.0, 0.0, 1.0 };
+    return gtk_text_buffer_create_tag(
+        buffer,
+        "classic-notepad-spelling-error",
+        "underline",
+        PANGO_UNDERLINE_ERROR,
+        "underline-rgba",
+        &underlineColor,
+        nullptr);
+}
+
 } // namespace
 
 GtkSpellingService::GtkSpellingService()
@@ -212,6 +298,9 @@ GtkSpellingService::GtkSpellingService()
 
 GtkSpellingService::~GtkSpellingService()
 {
+    ClearAttachedActionGroup(attachedView_);
+    ClearAttachedBuffer(attachedBuffer_);
+
     if (adapter_ != nullptr) {
         g_object_unref(adapter_);
         adapter_ = nullptr;
@@ -249,8 +338,12 @@ GtkWidget* GtkSpellingService::CreatePlainTextView() const
     return view;
 }
 
-void GtkSpellingService::Attach(GtkTextBuffer* buffer)
+void GtkSpellingService::Attach(GtkTextBuffer* buffer, GtkWidget* textView)
 {
+    ClearAttachedActionGroup(attachedView_);
+    ClearAttachedBuffer(attachedBuffer_);
+    errorTag_ = nullptr;
+
     if (adapter_ != nullptr) {
         g_object_unref(adapter_);
         adapter_ = nullptr;
@@ -259,14 +352,18 @@ void GtkSpellingService::Attach(GtkTextBuffer* buffer)
     if (capability_ != classic_notepad::SpellCapability::Available ||
         checker_ == nullptr ||
         buffer == nullptr ||
+        textView == nullptr ||
+        !GTK_IS_TEXT_VIEW(textView) ||
         !GTK_SOURCE_IS_BUFFER(buffer)) {
         return;
     }
 
-    adapter_ = spelling_text_buffer_adapter_new(GTK_SOURCE_BUFFER(buffer), checker_);
-    spelling_text_buffer_adapter_set_language(adapter_, languageCode_.c_str());
-    spelling_text_buffer_adapter_set_enabled(adapter_, TRUE);
-    spelling_text_buffer_adapter_invalidate_all(adapter_);
+    attachedBuffer_ = buffer;
+    g_object_add_weak_pointer(G_OBJECT(attachedBuffer_), reinterpret_cast<gpointer*>(&attachedBuffer_));
+    attachedView_ = textView;
+    g_object_add_weak_pointer(G_OBJECT(attachedView_), reinterpret_cast<gpointer*>(&attachedView_));
+    errorTag_ = EnsureSpellingErrorTag(attachedBuffer_, errorTag_);
+    RefreshUnderlines();
 }
 
 GMenuModel* GtkSpellingService::ContextMenuModel() const
@@ -280,9 +377,74 @@ GMenuModel* GtkSpellingService::ContextMenuModel() const
 
 void GtkSpellingService::InvalidateAll()
 {
-    if (adapter_ != nullptr) {
-        spelling_text_buffer_adapter_invalidate_all(adapter_);
+    RefreshUnderlines();
+}
+
+void GtkSpellingService::RefreshUnderlines()
+{
+    if (attachedBuffer_ == nullptr) {
+        return;
     }
+
+    errorTag_ = EnsureSpellingErrorTag(attachedBuffer_, errorTag_);
+    if (errorTag_ == nullptr) {
+        return;
+    }
+
+    GtkTextIter start;
+    GtkTextIter end;
+    gtk_text_buffer_get_start_iter(attachedBuffer_, &start);
+    gtk_text_buffer_get_end_iter(attachedBuffer_, &end);
+    gtk_text_buffer_remove_tag(attachedBuffer_, errorTag_, &start, &end);
+
+    if (capability_ != classic_notepad::SpellCapability::Available || checker_ == nullptr) {
+        return;
+    }
+
+    const std::wstring text = TextFromGtkBuffer(attachedBuffer_);
+    for (const classic_notepad::TextRange& range : classic_notepad::FindSpellCheckWordRanges(text)) {
+        const std::wstring word = text.substr(range.start, range.length);
+        if (CheckWord(checker_, word)) {
+            continue;
+        }
+
+        GtkTextIter errorStart;
+        GtkTextIter errorEnd;
+        gtk_text_buffer_get_iter_at_offset(attachedBuffer_, &errorStart, static_cast<int>(std::min<std::size_t>(range.start, static_cast<std::size_t>(G_MAXINT))));
+        gtk_text_buffer_get_iter_at_offset(attachedBuffer_, &errorEnd, static_cast<int>(std::min<std::size_t>(range.start + range.length, static_cast<std::size_t>(G_MAXINT))));
+        gtk_text_buffer_apply_tag(attachedBuffer_, errorTag_, &errorStart, &errorEnd);
+    }
+}
+
+bool GtkSpellingService::MoveCursorToContextPosition(GtkTextView* textView, double x, double y)
+{
+    if (textView == nullptr || gtk_text_view_get_buffer(textView) == nullptr) {
+        return false;
+    }
+
+    int bufferX = 0;
+    int bufferY = 0;
+    gtk_text_view_window_to_buffer_coords(
+        textView,
+        GTK_TEXT_WINDOW_WIDGET,
+        static_cast<int>(x),
+        static_cast<int>(y),
+        &bufferX,
+        &bufferY);
+
+    GtkTextIter iter;
+    int trailing = 0;
+    if (gtk_text_view_get_iter_at_position(textView, &iter, &trailing, bufferX, bufferY) == FALSE) {
+        return false;
+    }
+
+    if (trailing > 0) {
+        gtk_text_iter_forward_chars(&iter, trailing);
+    }
+    MoveIterInsideNearbyWord(iter);
+
+    gtk_text_buffer_place_cursor(gtk_text_view_get_buffer(textView), &iter);
+    return true;
 }
 
 std::vector<classic_notepad::SpellIssue> GtkSpellingService::CheckText(const std::wstring& text) const

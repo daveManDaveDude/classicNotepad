@@ -2,37 +2,50 @@
 
 #include "gtk_app.h"
 
+#include <string>
+
 namespace classic_notepad::linux_ui {
 namespace {
 
+gboolean RestoreClassicArrowCursorAfterAction(gpointer userData);
+void QueueCursorRestore(GtkNotepadApp* app);
+
+template <typename Action>
+void RunMenuAction(gpointer userData, Action action)
+{
+    auto* app = static_cast<GtkNotepadApp*>(userData);
+    action(*app);
+    QueueCursorRestore(app);
+}
+
 void OnNew(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleNew();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandleNew(); });
 }
 
 void OnOpen(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleOpen();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandleOpen(); });
 }
 
 void OnSave(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleSave();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandleSave(); });
 }
 
 void OnSaveAs(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleSaveAs();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandleSaveAs(); });
 }
 
 void OnPageSetup(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandlePageSetup();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandlePageSetup(); });
 }
 
 void OnPrint(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandlePrint();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandlePrint(); });
 }
 
 void OnExit(GSimpleAction*, GVariant*, gpointer userData)
@@ -42,57 +55,94 @@ void OnExit(GSimpleAction*, GVariant*, gpointer userData)
 
 void OnUndo(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleUndo();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandleUndo(); });
 }
 
 void OnCut(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleCut();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandleCut(); });
 }
 
 void OnCopy(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleCopy();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandleCopy(); });
 }
 
 void OnPaste(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandlePaste();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandlePaste(); });
 }
 
 void OnDelete(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleDelete();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandleDelete(); });
 }
 
 void OnFind(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleFind();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandleFind(); });
 }
 
 void OnFindNext(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleFindNext();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandleFindNext(); });
 }
 
 void OnReplace(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleReplace();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandleReplace(); });
 }
 
 void OnGoTo(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleGoTo();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandleGoTo(); });
 }
 
 void OnSelectAll(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleSelectAll();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandleSelectAll(); });
 }
 
 void OnTimeDate(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleTimeDate();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandleTimeDate(); });
+}
+
+void OnSpellingReplaceIndex(GSimpleAction* action, GVariant*, gpointer userData)
+{
+    const char* name = g_action_get_name(G_ACTION(action));
+    if (name == nullptr) {
+        return;
+    }
+
+    constexpr const char* kPrefix = "spelling-replace-";
+    const std::string actionName(name);
+    if (actionName.rfind(kPrefix, 0) != 0 || actionName.size() <= std::char_traits<char>::length(kPrefix)) {
+        return;
+    }
+
+    const char digit = actionName[std::char_traits<char>::length(kPrefix)];
+    if (digit < '0' || digit > '4') {
+        return;
+    }
+
+    auto* app = static_cast<GtkNotepadApp*>(userData);
+    app->HandleReplaceSpellingSuggestion(static_cast<std::size_t>(digit - '0'));
+    QueueCursorRestore(app);
+}
+
+void OnSpellingIgnore(GSimpleAction*, GVariant*, gpointer userData)
+{
+    auto* app = static_cast<GtkNotepadApp*>(userData);
+    app->HandleIgnoreContextSpelling();
+    QueueCursorRestore(app);
+}
+
+void OnSpellingAdd(GSimpleAction*, GVariant*, gpointer userData)
+{
+    auto* app = static_cast<GtkNotepadApp*>(userData);
+    app->HandleAddContextSpelling();
+    QueueCursorRestore(app);
 }
 
 gboolean DismissOpenMenusAfterAction(gpointer userData);
@@ -118,7 +168,7 @@ void OnWordWrapChangeState(GSimpleAction*, GVariant* value, gpointer userData)
 
 void OnFont(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleChooseFont();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandleChooseFont(); });
 }
 
 void OnStatusBarChangeState(GSimpleAction*, GVariant* value, gpointer userData)
@@ -143,13 +193,25 @@ gboolean ApplyAppearanceThemeAfterMenuDismissal(gpointer userData)
     auto* pending = static_cast<PendingAppearanceThemeChange*>(userData);
     pending->app->DismissOpenMenusAndResetModels();
     pending->app->SetAppearanceTheme(pending->theme);
+    pending->app->RestoreClassicArrowCursor();
     delete pending;
+    return G_SOURCE_REMOVE;
+}
+
+gboolean RestoreClassicArrowCursorAfterAction(gpointer userData)
+{
+    static_cast<GtkNotepadApp*>(userData)->RestoreClassicArrowCursor();
     return G_SOURCE_REMOVE;
 }
 
 void QueueMenuDismissal(GtkNotepadApp* app)
 {
     g_idle_add(DismissOpenMenusAfterAction, app);
+}
+
+void QueueCursorRestore(GtkNotepadApp* app)
+{
+    g_idle_add(RestoreClassicArrowCursorAfterAction, app);
 }
 
 void QueueAppearanceThemeChange(GtkNotepadApp* app, classic_notepad::AppearanceTheme theme)
@@ -178,7 +240,7 @@ void OnAppearanceDark(GSimpleAction*, GVariant*, gpointer userData)
 
 void OnAbout(GSimpleAction*, GVariant*, gpointer userData)
 {
-    static_cast<GtkNotepadApp*>(userData)->HandleAbout();
+    RunMenuAction(userData, [](GtkNotepadApp& app) { app.HandleAbout(); });
 }
 
 const GActionEntry kActions[] = {
@@ -200,6 +262,13 @@ const GActionEntry kActions[] = {
     {"go-to", OnGoTo, nullptr, nullptr, nullptr},
     {"select-all", OnSelectAll, nullptr, nullptr, nullptr},
     {"time-date", OnTimeDate, nullptr, nullptr, nullptr},
+    {"spelling-replace-0", OnSpellingReplaceIndex, nullptr, nullptr, nullptr},
+    {"spelling-replace-1", OnSpellingReplaceIndex, nullptr, nullptr, nullptr},
+    {"spelling-replace-2", OnSpellingReplaceIndex, nullptr, nullptr, nullptr},
+    {"spelling-replace-3", OnSpellingReplaceIndex, nullptr, nullptr, nullptr},
+    {"spelling-replace-4", OnSpellingReplaceIndex, nullptr, nullptr, nullptr},
+    {"spelling-ignore", OnSpellingIgnore, nullptr, nullptr, nullptr},
+    {"spelling-add", OnSpellingAdd, nullptr, nullptr, nullptr},
     {"word-wrap", nullptr, nullptr, "false", OnWordWrapChangeState},
     {"font", OnFont, nullptr, nullptr, nullptr},
     {"status-bar", nullptr, nullptr, "true", OnStatusBarChangeState},

@@ -95,11 +95,16 @@ public:
     void HandleAbout();
     void DismissOpenMenus();
     void DismissOpenMenusAndResetModels();
+    void RestoreClassicArrowCursor();
     int AutomationMappedMenuPopoverCount() const;
     bool AutomationActivateMenuLabel(const std::wstring& label);
     void HandleWindowPress(double x, double y);
     void HandleEditorPress(GtkGestureClick* gesture, unsigned int button, double x, double y);
+    bool HandleEditorKeyboardContextMenu();
     void OnContextPopoverClosed(GtkWidget* popover);
+    void HandleReplaceSpellingSuggestion(std::size_t suggestionIndex);
+    void HandleIgnoreContextSpelling();
+    void HandleAddContextSpelling();
 
     bool NewDocument();
     bool OpenFile(const std::wstring& path, std::wstring& errorMessage);
@@ -182,6 +187,12 @@ private:
     bool SystemPrefersDark() const;
     bool DetectHighContrastTheme() const;
     void InstallContextMenu();
+    void RebuildContextMenu();
+    GtkWidget* CreateEditorContextMenuContent();
+    void ShowEditorContextMenuAt(const GdkRectangle& point);
+    bool PrepareSpellingContextAtCursor();
+    void ClearSpellingContext();
+    bool ReplaceSpellingWord(std::size_t start, std::size_t length, const std::wstring& replacement);
     GtkPageSetup* EnsurePageSetup();
     GtkPrintSettings* EnsurePrintSettings();
     void StorePageSetup(GtkPageSetup* pageSetup);
@@ -192,6 +203,10 @@ private:
     std::wstring statusText_;
     std::wstring findText_;
     std::wstring replaceText_;
+    std::wstring contextSpellingWord_;
+    std::size_t contextSpellingStart_ = 0;
+    std::size_t contextSpellingLength_ = 0;
+    std::vector<std::wstring> contextSpellingSuggestions_;
     bool findMatchCase_ = false;
     bool findWholeWord_ = false;
     bool findSearchDown_ = true;

@@ -25,9 +25,11 @@ public:
     const std::vector<std::string>& AvailableLanguages() const;
 
     GtkWidget* CreatePlainTextView() const;
-    void Attach(GtkTextBuffer* buffer);
+    void Attach(GtkTextBuffer* buffer, GtkWidget* textView);
     GMenuModel* ContextMenuModel() const;
     void InvalidateAll();
+    void RefreshUnderlines();
+    bool MoveCursorToContextPosition(GtkTextView* textView, double x, double y);
 
     std::vector<classic_notepad::SpellIssue> CheckText(const std::wstring& text) const;
     std::vector<std::wstring> Suggest(const std::wstring& word, std::size_t limit) const;
@@ -38,6 +40,9 @@ private:
     SpellingProvider* provider_ = nullptr;
     SpellingChecker* checker_ = nullptr;
     SpellingTextBufferAdapter* adapter_ = nullptr;
+    GtkTextBuffer* attachedBuffer_ = nullptr;
+    GtkWidget* attachedView_ = nullptr;
+    GtkTextTag* errorTag_ = nullptr;
     classic_notepad::SpellCapability capability_ = classic_notepad::SpellCapability::MissingBackend;
     std::string languageCode_;
     std::vector<std::string> availableLanguages_;
