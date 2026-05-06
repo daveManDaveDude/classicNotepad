@@ -4128,6 +4128,28 @@ void ClassicNotepadApp::DrawSpellingUnderlines(HWND editorWindow)
 
     RECT clientRect{};
     GetClientRect(editorWindow, &clientRect);
+    if (IsRectEmpty(&clientRect)) {
+        if (previousPen != nullptr) {
+            SelectObject(deviceContext, previousPen);
+        }
+        if (pen != nullptr) {
+            DeleteObject(pen);
+        }
+        if (previousFont != nullptr) {
+            SelectObject(deviceContext, previousFont);
+        }
+        ReleaseDC(editorWindow, deviceContext);
+        return;
+    }
+
+    HRGN clipRegion = CreateRectRgn(
+        clientRect.left,
+        clientRect.top,
+        clientRect.right,
+        clientRect.bottom);
+    if (clipRegion != nullptr) {
+        SelectClipRgn(deviceContext, clipRegion);
+    }
 
     TEXTMETRICW textMetrics{};
     GetTextMetricsW(deviceContext, &textMetrics);
@@ -4173,8 +4195,12 @@ void ClassicNotepadApp::DrawSpellingUnderlines(HWND editorWindow)
 
             const int baselineOffset = std::max(1, static_cast<int>(textMetrics.tmAscent + 1));
             const int y = startPoint.y + baselineOffset;
-            int x = startPoint.x;
-            const int endX = std::max(startPoint.x + 1, endPoint.x);
+            if (y - 2 < clientRect.top || y + 2 >= clientRect.bottom) {
+                continue;
+            }
+
+            int x = std::max(startPoint.x, clientRect.left);
+            const int endX = std::min(std::max(startPoint.x + 1, endPoint.x), clientRect.right);
             bool up = true;
             while (x < endX) {
                 const int nextX = std::min(x + 4, endX);
@@ -4186,6 +4212,10 @@ void ClassicNotepadApp::DrawSpellingUnderlines(HWND editorWindow)
         }
     }
 
+    if (clipRegion != nullptr) {
+        SelectClipRgn(deviceContext, nullptr);
+        DeleteObject(clipRegion);
+    }
     if (previousPen != nullptr) {
         SelectObject(deviceContext, previousPen);
     }
@@ -6830,7 +6860,10 @@ LRESULT CALLBACK ClassicNotepadApp::EditorWindowProc(HWND window, UINT message, 
             message == WM_SIZE) {
             app->RefreshSpellCheck(false);
         }
-        InvalidateRect(window, nullptr, FALSE);
+        InvalidateRect(
+            window,
+            nullptr,
+            (message == WM_MOUSEWHEEL || message == WM_HSCROLL || message == WM_VSCROLL) ? TRUE : FALSE);
         break;
 
     case WM_MOUSEMOVE:
