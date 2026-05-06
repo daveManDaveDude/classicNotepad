@@ -77,6 +77,33 @@ static NSString* WindowTitle(const Document& document)
     return NSStringFromWide(title);
 }
 
+static void ConfigureStandardWindowControls(NSWindow* window)
+{
+    if (window == nil) {
+        return;
+    }
+
+    [window setStyleMask:([window styleMask] |
+                          NSWindowStyleMaskTitled |
+                          NSWindowStyleMaskClosable |
+                          NSWindowStyleMaskMiniaturizable |
+                          NSWindowStyleMaskResizable)];
+
+    NSArray<NSNumber*>* buttons = @[
+        @(NSWindowCloseButton),
+        @(NSWindowMiniaturizeButton),
+        @(NSWindowZoomButton)
+    ];
+
+    for (NSNumber* buttonNumber in buttons) {
+        NSButton* button = [window standardWindowButton:static_cast<NSWindowButton>([buttonNumber integerValue])];
+        if (button != nil) {
+            [button setHidden:NO];
+            [button setEnabled:YES];
+        }
+    }
+}
+
 static void ShowError(NSWindow* parent, NSString* message)
 {
     NSAlert* alert = [[NSAlert alloc] init];
@@ -499,6 +526,7 @@ static CGFloat PointsFromThousandths(int thousandths)
 
     [self.window setDelegate:self];
     [self.window center];
+    ConfigureStandardWindowControls(self.window);
 
     NSView* contentView = [self.window contentView];
     const CGFloat statusHeight = 24.0;

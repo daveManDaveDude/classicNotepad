@@ -62,6 +62,50 @@ gboolean OnCloseRequest(GtkWindow*, gpointer userData)
     return static_cast<GtkNotepadApp*>(userData)->ConfirmDiscard() ? FALSE : TRUE;
 }
 
+void OnTitleMinimizeClicked(GtkButton*, gpointer userData)
+{
+    if (GtkWindow* window = static_cast<GtkNotepadApp*>(userData)->Window()) {
+        gtk_window_minimize(window);
+    }
+}
+
+void OnTitleMaximizeClicked(GtkButton*, gpointer userData)
+{
+    if (GtkWindow* window = static_cast<GtkNotepadApp*>(userData)->Window()) {
+        if (gtk_window_is_maximized(window)) {
+            gtk_window_unmaximize(window);
+        } else {
+            gtk_window_maximize(window);
+        }
+    }
+}
+
+void OnTitleCloseClicked(GtkButton*, gpointer userData)
+{
+    if (GtkWindow* window = static_cast<GtkNotepadApp*>(userData)->Window()) {
+        gtk_window_close(window);
+    }
+}
+
+GtkWidget* CreateTitleIconButton(
+    const char* iconName,
+    const char* tooltip,
+    const char* styleClass,
+    GCallback callback,
+    gpointer userData)
+{
+    GtkWidget* image = gtk_image_new_from_icon_name(iconName);
+    gtk_image_set_pixel_size(GTK_IMAGE(image), 16);
+
+    GtkWidget* button = gtk_button_new();
+    gtk_button_set_child(GTK_BUTTON(button), image);
+    gtk_widget_set_tooltip_text(button, tooltip);
+    gtk_widget_add_css_class(button, "titlebutton");
+    gtk_widget_add_css_class(button, styleClass);
+    g_signal_connect(button, "clicked", callback, userData);
+    return button;
+}
+
 void OnGtkSettingsAppearanceChanged(GObject*, GParamSpec*, gpointer userData)
 {
     static_cast<GtkNotepadApp*>(userData)->RefreshAppearanceFromSystem();
@@ -2675,6 +2719,40 @@ void GtkNotepadApp::BuildWindow(GtkApplication* application)
 {
     window_ = gtk_application_window_new(application);
     gtk_window_set_default_size(GTK_WINDOW(window_), 800, 500);
+    gtk_window_set_decorated(GTK_WINDOW(window_), TRUE);
+    gtk_window_set_resizable(GTK_WINDOW(window_), TRUE);
+
+    GtkWidget* titleBar = gtk_header_bar_new();
+    gtk_header_bar_set_show_title_buttons(GTK_HEADER_BAR(titleBar), FALSE);
+
+    GtkWidget* titleControls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_box_append(
+        GTK_BOX(titleControls),
+        CreateTitleIconButton(
+            "window-minimize-symbolic",
+            "Minimize",
+            "minimize",
+            G_CALLBACK(OnTitleMinimizeClicked),
+            this));
+    gtk_box_append(
+        GTK_BOX(titleControls),
+        CreateTitleIconButton(
+            "window-maximize-symbolic",
+            "Maximize",
+            "maximize",
+            G_CALLBACK(OnTitleMaximizeClicked),
+            this));
+    gtk_box_append(
+        GTK_BOX(titleControls),
+        CreateTitleIconButton(
+            "window-close-symbolic",
+            "Close",
+            "close",
+            G_CALLBACK(OnTitleCloseClicked),
+            this));
+    gtk_header_bar_pack_end(GTK_HEADER_BAR(titleBar), titleControls);
+    gtk_window_set_titlebar(GTK_WINDOW(window_), titleBar);
+
     g_signal_connect(window_, "close-request", G_CALLBACK(OnCloseRequest), this);
     g_signal_connect(window_, "destroy", G_CALLBACK(OnWindowDestroy), this);
 

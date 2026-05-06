@@ -5,7 +5,7 @@
 
 Classic Notepad is a single-document native desktop recreation of classic Windows Notepad, with Win32, GTK4 Linux, and AppKit macOS targets in the same repository. It keeps the plain local editor feel: one window, one text document, native desktop dialogs, no tabs, no cloud features, no telemetry, and no editor extras that would pull it away from the classic experience.
 
-Current version: `1.2.1`.
+Current version: `1.2.2`.
 
 The project is built with C++17, native platform UI layers, and CMake. It is intended to be opened, built, tested, and debugged from Visual Studio Code or the platform build scripts.
 
