@@ -2,6 +2,8 @@
 #include "appearance.h"
 #include "encoding.h"
 #include "line_endings.h"
+#include "large_file_index.h"
+#include "large_document.h"
 #include "spelling.h"
 #include "spell_text_utils.h"
 #include "text_metadata.h"
@@ -144,6 +146,15 @@ void TestLineEndingConversion()
         classic_notepad::NormalizeLineEndingsForEditor(L"one\ntwo\nthree"),
         L"one\r\ntwo\r\nthree",
         "LF-only pasted text is normalized to editor line endings");
+
+    for (const std::wstring input : { L"", L"plain", L"a\nb", L"a\rb", L"a\r\nb", L"a\r\nb\nc\r" }) {
+        std::wstring inPlace = input;
+        classic_notepad::NormalizeLineEndingsForEditorInPlace(inPlace);
+        ExpectText(
+            inPlace,
+            classic_notepad::NormalizeLineEndingsForEditor(input),
+            "In-place editor line-ending normalization matches copy normalization");
+    }
 
     ExpectText(
         classic_notepad::ConvertLineEndingsFromEditor(L"a\r\nb\r\n", LineEndingStyle::Crlf),
@@ -338,6 +349,133 @@ void TestDocumentNewFilePath()
     std::filesystem::remove_all(testRoot);
 }
 
+void TestLargeFileStreamingIndex()
+{
+    using classic_notepad::LargeFileEncoding;
+    using classic_notepad::LargeFileLineScanner;
+
+    {
+        LargeFileLineScanner scanner(LargeFileEncoding::Utf8, 0);
+        std::vector<std::uint64_t> lines{0};
+        const std::vector<std::uint8_t> first{ 'o', 'n', 'e', '\r' };
+        const std::vector<std::uint8_t> second{ '\n', 't', 'w', 'o', '\n' };
+        Expect(scanner.Consume(first.data(), first.size(), 0, lines), "Large scanner accepts first chunk");
+        Expect(scanner.Consume(second.data(), second.size(), 4, lines), "Large scanner accepts CRLF continuation chunk");
+        Expect(scanner.Finish(lines), "Large scanner finishes CRLF input");
+        Expect(lines == std::vector<std::uint64_t>({0, 5, 9}), "CRLF split across chunks has correct offsets");
+        Expect(scanner.CrlfCount() == 1U && scanner.LfCount() == 1U, "CRLF/LF counts cross chunk boundaries");
+    }
+
+    {
+        LargeFileLineScanner scanner(LargeFileEncoding::Utf8, 0);
+        std::vector<std::uint64_t> lines{0};
+        const std::vector<std::uint8_t> first{ 'a', 0xE2U };
+        const std::vector<std::uint8_t> second{ 0x82U, 0xACU, '\n', 'b' };
+        Expect(scanner.Consume(first.data(), first.size(), 0, lines), "UTF-8 split lead byte is retained");
+        Expect(scanner.Consume(second.data(), second.size(), 2, lines), "UTF-8 split continuation bytes are accepted");
+        Expect(scanner.Finish(lines), "UTF-8 split sequence finishes validly");
+        Expect(lines == std::vector<std::uint64_t>({0, 5}), "UTF-8 split sequence line offset is correct");
+    }
+
+    {
+        const std::vector<std::uint8_t> utf8Bom{0xEFU, 0xBBU, 0xBFU, 'x'};
+        const std::vector<std::uint8_t> utf16Bom{0xFFU, 0xFEU, 'x', 0};
+        Expect(
+            classic_notepad::DetectLargeFileEncoding(utf8Bom.data(), utf8Bom.size()).dataOffset == 3U,
+            "Large scanner recognizes UTF-8 BOM");
+        const auto utf16 = classic_notepad::DetectLargeFileEncoding(utf16Bom.data(), utf16Bom.size());
+        Expect(utf16.encoding == LargeFileEncoding::Utf16Le && utf16.dataOffset == 2U, "Large scanner recognizes UTF-16 LE BOM");
+    }
+
+    {
+        LargeFileLineScanner scanner(LargeFileEncoding::Utf16Le, 0);
+        std::vector<std::uint64_t> lines{0};
+        const std::vector<std::uint8_t> first{ 'a', 0, '\r' };
+        const std::vector<std::uint8_t> second{ 0, '\n', 0, 'b', 0 };
+        Expect(scanner.Consume(first.data(), first.size(), 0, lines), "UTF-16 odd chunk is retained");
+        Expect(scanner.Consume(second.data(), second.size(), 3, lines), "UTF-16 CRLF split is accepted");
+        Expect(scanner.Finish(lines), "UTF-16 scanner finishes validly");
+        Expect(lines == std::vector<std::uint64_t>({0, 6}), "UTF-16 CRLF offset is correct");
+    }
+
+    {
+        constexpr std::uint64_t nearMaximum = (std::numeric_limits<std::uint64_t>::max)() - 4U;
+        LargeFileLineScanner scanner(LargeFileEncoding::Utf8, nearMaximum);
+        std::vector<std::uint64_t> lines{nearMaximum};
+        const std::vector<std::uint8_t> text{ 'x', '\n' };
+        Expect(scanner.Consume(text.data(), text.size(), nearMaximum, lines), "Large scanner supports near-64-bit-max offsets");
+        Expect(scanner.Finish(lines), "Large scanner finishes near-64-bit-max offsets");
+        Expect(lines.back() == nearMaximum + 2U, "Large scanner preserves 64-bit offset values");
+
+        LargeFileLineScanner overflowScanner(LargeFileEncoding::Utf8, (std::numeric_limits<std::uint64_t>::max)() - 1U);
+        std::vector<std::uint64_t> overflowLines{(std::numeric_limits<std::uint64_t>::max)() - 1U};
+        Expect(!overflowScanner.Consume(text.data(), text.size(), (std::numeric_limits<std::uint64_t>::max)() - 1U, overflowLines),
+            "Large scanner rejects overflowing chunk range");
+    }
+
+    {
+        LargeFileLineScanner abandoned(LargeFileEncoding::Utf8, 0);
+        std::vector<std::uint64_t> abandonedLines{0};
+        const std::vector<std::uint8_t> crOnly{'a', '\r'};
+        Expect(abandoned.Consume(crOnly.data(), crOnly.size(), 0, abandonedLines), "Partial old scan accepts CR");
+        LargeFileLineScanner replacement(LargeFileEncoding::Utf8, 0);
+        std::vector<std::uint64_t> replacementLines{0};
+        const std::vector<std::uint8_t> newText{'b', '\n'};
+        Expect(replacement.Consume(newText.data(), newText.size(), 0, replacementLines) && replacement.Finish(replacementLines),
+            "Replacement scan owns independent state");
+        Expect(replacementLines == std::vector<std::uint64_t>({0, 2}), "Replacement scan does not inherit pending CR state");
+    }
+}
+
+void TestLargeDocumentPieceTable()
+{
+    using classic_notepad::LargeDocument;
+    using classic_notepad::LargeDocumentOriginalPiece;
+    using classic_notepad::LargeFileEncoding;
+
+    const std::string source = "one\r\ntwo\r\nthree\r\n";
+    auto reader = [&source](std::uint64_t offset, std::size_t length, std::vector<std::uint8_t>& bytes) {
+        if (offset > source.size() || length > source.size() - static_cast<std::size_t>(offset)) return false;
+        bytes.assign(source.begin() + static_cast<std::size_t>(offset),
+            source.begin() + static_cast<std::size_t>(offset) + length);
+        return true;
+    };
+    LargeDocument document(LargeFileEncoding::Utf8, reader);
+    std::wstring error;
+    Expect(document.Initialize({ LargeDocumentOriginalPiece{ 0, static_cast<std::uint64_t>(source.size()), static_cast<std::uint64_t>(source.size()) } }, error),
+        "Large document initializes an immutable source piece");
+
+    std::uint64_t afterStart = 0;
+    std::uint64_t afterEnd = 0;
+    Expect(document.Replace(0, 0, L"BEGIN ", 0, 0, afterStart, afterEnd, error), "Large document inserts at beginning");
+    Expect(document.Replace(11, 14, L"TWO", 11, 14, afterStart, afterEnd, error), "Large document replaces across a split source piece");
+    Expect(document.Replace(document.CharacterCount(), document.CharacterCount(), L"END", document.CharacterCount(), document.CharacterCount(), afterStart, afterEnd, error),
+        "Large document inserts at end");
+    std::wstring text;
+    Expect(document.ReadRange(0, document.CharacterCount(), text, error), "Large document reads a cross-piece range");
+    ExpectText(text, L"BEGIN one\r\nTWO\r\nthree\r\nEND", "Large document cross-piece edits preserve text");
+    Expect(document.PieceCount() >= 3U, "Large document keeps multiple pieces instead of copying the original suffix");
+    Expect(document.InsertedBufferBytes() >= 2U * sizeof(wchar_t), "Large document tracks append-only inserted buffers");
+
+    classic_notepad::LargeDocumentMatch match;
+    Expect(document.Find(L"TWO", 0, true, true, true, match, error), "Large document finds text across pieces");
+    Expect(match.start == 11U && match.length == 3U, "Large document find returns 64-bit logical coordinates");
+    Expect(document.Find(L"one", document.CharacterCount(), false, true, false, match, error), "Large document finds backward");
+
+    bool cancelled = false;
+    Expect(document.ReplaceAll(L"e", L"E", false, false, cancelled, {}, error) > 0U && !cancelled,
+        "Large document replace-all streams through pieces");
+    Expect(document.Undo(afterStart, afterEnd, error), "Large document undoes replace-all edits without a snapshot");
+    Expect(document.Undo(afterStart, afterEnd, error), "Large document supports multiple undo records");
+
+    LargeDocument utf16(LargeFileEncoding::Utf8, [](std::uint64_t, std::size_t, std::vector<std::uint8_t>&) { return false; });
+    Expect(utf16.Initialize({}, error), "Large document initializes an empty document");
+    const std::wstring nonBmp = std::wstring(L"A") + wchar_t(0xD83D) + wchar_t(0xDE00) + L"B";
+    Expect(utf16.Replace(0, 0, nonBmp, 0, 0, afterStart, afterEnd, error), "Large document accepts non-BMP inserted Unicode");
+    Expect(utf16.ReadRange(0, utf16.CharacterCount(), text, error), "Large document reads non-BMP inserted Unicode");
+    ExpectText(text, nonBmp, "Large document preserves non-BMP inserted Unicode");
+}
+
 void TestSpellWordExpansion()
 {
     using classic_notepad::ExpandWordRangeAt;
@@ -451,6 +589,8 @@ int main()
     TestDocumentMetadata();
     TestTextMetadataFormatting();
     TestDocumentNewFilePath();
+    TestLargeFileStreamingIndex();
+    TestLargeDocumentPieceTable();
     TestSpellWordExpansion();
     TestSpellRangeOverlap();
     TestSpellCapabilityLabels();

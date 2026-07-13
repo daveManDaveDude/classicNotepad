@@ -146,7 +146,8 @@ lipo -archs build-macos-universal/ClassicNotepadMac.app/Contents/MacOS/ClassicNo
 - The Win32 edit control normalizes line endings while editing.
 - Normal Save writes the line-ending style detected when the file was opened.
 - Mixed line endings are tracked as mixed and saved using the dominant detected style.
-- Large files are supported up to available memory and platform limits (the fixed 256 MB guard was removed).
+- Windows files at or above 48 MiB open in a dedicated editable large-document mode. It keeps the immutable source in a 64-bit mapping, renders only visible lines, builds its line-offset index on a cancellable worker thread, and overlays changes through a 64-bit piece table; ordinary files continue to use the editable Win32 `EDIT` control.
+- Large-document mode supports UTF-8 (with or without BOM), ASCII, and UTF-16 LE with BOM. Invalid UTF-8 or legacy ANSI content is reported as unsupported rather than decoded lossily. Edits, selection, bounded clipboard operations, undo, find/replace, Go To, Time/Date, Save, and Save As operate without loading the full document into a `std::wstring`. Save streams pieces to a sibling temporary file and atomically replaces the destination after a successful flush. Printing, full-document clipboard allocation, and wrapped visual layout remain bounded/unsupported in the custom surface.
 - Save now uses an atomic temp-file replace flow to reduce data-loss risk on interruptions.
 
 ## Spell Checking
@@ -250,6 +251,12 @@ Run tests after building:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1 -Configuration Debug
+```
+
+Run the repeatable Windows Release large-file acceptance test after a Release build. It creates and deletes a 700 MiB temporary UTF-8 CRLF fixture, verifies first usable display, background indexing, beginning/end access, source integrity, and working-set telemetry:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-large-file.ps1
 ```
 
 Build and test the native GTK target under Ubuntu/WSL:

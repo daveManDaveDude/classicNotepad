@@ -3,6 +3,11 @@
 #include "ansi_encoding.h"
 
 #include <cstdint>
+#include <limits>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace classic_notepad {
 namespace {
@@ -66,6 +71,33 @@ bool ReadWideCodePoint(const std::wstring& text, std::size_t& index, std::uint32
 bool DecodeUtf8(const std::uint8_t* data, std::size_t size, std::wstring& text)
 {
     text.clear();
+#ifdef _WIN32
+    if (size == 0U) {
+        return true;
+    }
+    if (size <= static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+        const int sourceLength = static_cast<int>(size);
+        const int wideLength = MultiByteToWideChar(
+            CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            reinterpret_cast<const char*>(data),
+            sourceLength,
+            nullptr,
+            0);
+        if (wideLength <= 0) {
+            return false;
+        }
+
+        text.resize(static_cast<std::size_t>(wideLength));
+        return MultiByteToWideChar(
+            CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            reinterpret_cast<const char*>(data),
+            sourceLength,
+            text.data(),
+            wideLength) == wideLength;
+    }
+#endif
     text.reserve(size);
 
     for (std::size_t index = 0; index < size;) {
@@ -191,12 +223,18 @@ bool DecodeUtf16Le(const std::uint8_t* data, std::size_t size, std::wstring& tex
     return true;
 }
 
-bool EncodeUtf16Le(const std::wstring& text, std::vector<std::uint8_t>& bytes, std::wstring& errorMessage)
+bool EncodeUtf16Le(
+    const std::wstring& text,
+    bool includeBom,
+    std::vector<std::uint8_t>& bytes,
+    std::wstring& errorMessage)
 {
     bytes.clear();
-    bytes.reserve((text.size() * 2U) + 2U);
-    bytes.push_back(0xFFU);
-    bytes.push_back(0xFEU);
+    bytes.reserve((text.size() * 2U) + (includeBom ? 2U : 0U));
+    if (includeBom) {
+        bytes.push_back(0xFFU);
+        bytes.push_back(0xFEU);
+    }
 
     std::size_t index = 0;
     while (index < text.size()) {
@@ -273,14 +311,29 @@ bool EncodeTextBytes(
 {
     errorMessage.clear();
 
+    return EncodeTextChunk(text, encoding, true, bytes, errorMessage);
+}
+
+bool EncodeTextChunk(
+    const std::wstring& text,
+    TextEncoding encoding,
+    bool includeBom,
+    std::vector<std::uint8_t>& bytes,
+    std::wstring& errorMessage)
+{
+    errorMessage.clear();
+
     switch (encoding) {
     case TextEncoding::Utf8NoBom:
         return EncodeUtf8(text, false, bytes, errorMessage);
     case TextEncoding::Utf8Bom:
-        return EncodeUtf8(text, true, bytes, errorMessage);
+        return EncodeUtf8(text, includeBom, bytes, errorMessage);
     case TextEncoding::Utf16LeBom:
-        return EncodeUtf16Le(text, bytes, errorMessage);
+        return EncodeUtf16Le(text, includeBom, bytes, errorMessage);
     case TextEncoding::Ansi:
+        if (!includeBom) {
+            // ANSI has no BOM; this call remains valid for incremental output.
+        }
         return EncodeAnsiText(text, bytes, errorMessage);
     default:
         errorMessage = L"Unknown text encoding.";

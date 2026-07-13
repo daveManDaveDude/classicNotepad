@@ -4,6 +4,7 @@
 
 #include "appearance.h"
 #include "document.h"
+#include "large_file_view.h"
 #include "spell_check.h"
 
 #include <windows.h>
@@ -11,6 +12,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -29,6 +31,31 @@ public:
     struct AutomationSelection {
         DWORD start = 0;
         DWORD end = 0;
+    };
+
+    struct AutomationLargeFileState {
+        bool active = false;
+        bool readOnly = false;
+        bool editable = false;
+        bool modified = false;
+        bool indexingComplete = false;
+        bool encodingValid = true;
+        std::uint64_t fileSize = 0;
+        std::uint64_t indexedBytes = 0;
+        std::uint64_t indexedLines = 0;
+        std::uint64_t totalLines = 0;
+        std::uint64_t firstUsableMilliseconds = 0;
+        std::uint64_t fullIndexMilliseconds = 0;
+        std::uint64_t characterCount = 0;
+        std::uint64_t caret = 0;
+        std::uint64_t selectionStart = 0;
+        std::uint64_t selectionEnd = 0;
+        std::uint64_t topLine = 0;
+        std::uint64_t generation = 0;
+        std::uint64_t pieceCount = 0;
+        std::uint64_t insertedBufferBytes = 0;
+        std::uint64_t saveProgressBytes = 0;
+        bool saveInProgress = false;
     };
 
     explicit ClassicNotepadApp(HINSTANCE instance);
@@ -72,7 +99,7 @@ public:
         const std::wstring& replacement,
         bool matchCase,
         bool wholeWord);
-    bool AutomationGoToLine(int lineNumber, std::wstring& errorMessage);
+    bool AutomationGoToLine(std::uint64_t lineNumber, std::wstring& errorMessage);
     void AutomationInsertTimeDate();
     void AutomationSetWordWrap(bool enabled);
     bool AutomationGetWordWrap() const;
@@ -92,6 +119,13 @@ public:
     classic_notepad::AppearanceTheme AutomationAppearanceTheme() const;
     bool AutomationHighContrastThemeActive() const;
     void AutomationSetAppearanceTheme(classic_notepad::AppearanceTheme theme);
+    AutomationLargeFileState AutomationGetLargeFileState() const;
+    bool AutomationGetLargeFileLine(std::uint64_t oneBasedLine, std::wstring& text, std::wstring& errorMessage) const;
+    bool AutomationGetLargeFileTextRange(
+        std::uint64_t start,
+        std::uint64_t length,
+        std::wstring& text,
+        std::wstring& errorMessage) const;
 
 private:
     enum class ScrollBarOrientation {
@@ -244,6 +278,10 @@ private:
     void HandleChooseFont();
     void HandleToggleStatusBar();
     bool LoadDocument(const std::wstring& path);
+    bool LoadLargeDocument(const std::wstring& path, std::wstring& errorMessage);
+    void ExitLargeFileMode();
+    bool IsLargeFileMode() const;
+    void ShowLargeFileReadOnlyMessage();
     bool ConfirmSaveChanges();
     std::wstring GetEditorText() const;
     std::wstring GetSelectedText() const;
@@ -296,6 +334,7 @@ private:
     HWND horizontalScrollBar_ = nullptr;
     HWND scrollCorner_ = nullptr;
     HWND editor_ = nullptr;
+    std::unique_ptr<LargeFileView> largeFileView_;
     HWND statusBar_ = nullptr;
     HWND findDialog_ = nullptr;
     HWND replaceDialog_ = nullptr;

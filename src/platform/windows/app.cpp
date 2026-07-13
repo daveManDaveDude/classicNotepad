@@ -1560,6 +1560,7 @@ ClassicNotepadApp::ClassicNotepadApp(HINSTANCE instance)
 
 ClassicNotepadApp::~ClassicNotepadApp()
 {
+    largeFileView_.reset();
     if (mainWindow_ != nullptr && spellCheckTimerId_ != 0) {
         KillTimer(mainWindow_, spellCheckTimerId_);
         spellCheckTimerId_ = 0;
@@ -2327,6 +2328,9 @@ void ClassicNotepadApp::ApplyThemeToWindows()
         UpdateEditorFrameStyle();
         InvalidateRect(editor_, nullptr, TRUE);
     }
+    if (largeFileView_ != nullptr) {
+        largeFileView_->SetTheme(editorFont_, darkModeEnabled_);
+    }
 
     if (statusBar_ != nullptr) {
         UpdateStatusBarSizeGripStyle();
@@ -2649,6 +2653,20 @@ LRESULT ClassicNotepadApp::HandleNotify(LPARAM lParam) const
 
 void ClassicNotepadApp::ResizeEditor()
 {
+    if (IsLargeFileMode()) {
+        const RECT hostRect = GetEditorHostRect();
+        largeFileView_->SetBounds(hostRect);
+        if (verticalScrollBar_ != nullptr) {
+            ShowWindow(verticalScrollBar_, SW_HIDE);
+        }
+        if (horizontalScrollBar_ != nullptr) {
+            ShowWindow(horizontalScrollBar_, SW_HIDE);
+        }
+        if (scrollCorner_ != nullptr) {
+            ShowWindow(scrollCorner_, SW_HIDE);
+        }
+        return;
+    }
     if (editor_ == nullptr) {
         return;
     }
@@ -2839,6 +2857,18 @@ void ClassicNotepadApp::UpdateEditorFrameStyle()
 
 void ClassicNotepadApp::UpdateScrollBars()
 {
+    if (IsLargeFileMode()) {
+        if (verticalScrollBar_ != nullptr) {
+            ShowWindow(verticalScrollBar_, SW_HIDE);
+        }
+        if (horizontalScrollBar_ != nullptr) {
+            ShowWindow(horizontalScrollBar_, SW_HIDE);
+        }
+        if (scrollCorner_ != nullptr) {
+            ShowWindow(scrollCorner_, SW_HIDE);
+        }
+        return;
+    }
     if (editor_ == nullptr) {
         return;
     }
@@ -3230,7 +3260,7 @@ bool ClassicNotepadApp::NeedsVerticalScrollBar(int availableHeight) const
     }
 
     const int lineCount = std::max<int>(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
-    return lineCount * GetEditorLineHeight() > availableHeight;
+    return static_cast<long long>(lineCount) * GetEditorLineHeight() > availableHeight;
 }
 
 bool ClassicNotepadApp::NeedsHorizontalScrollBar(int availableWidth) const
@@ -3678,13 +3708,45 @@ void ClassicNotepadApp::UpdateTitle()
     }
 
     title += document_.DisplayName();
+    if (IsLargeFileMode()) {
+        title += L" [Large File]";
+    }
     title += L" - Classic Notepad";
     SetWindowTextW(mainWindow_, title.c_str());
 }
 
 void ClassicNotepadApp::UpdateMenuState(HMENU menu)
 {
-    if (menu == nullptr || editor_ == nullptr) {
+    if (menu == nullptr) {
+        return;
+    }
+
+    if (IsLargeFileMode()) {
+        const LargeFileViewInfo info = largeFileView_->GetInfo();
+        const UINT editState = info.editable ? MF_ENABLED : MF_GRAYED;
+        EnableMenuItem(menu, ID_FILE_SAVE, MF_BYCOMMAND | (info.modified ? MF_ENABLED : MF_GRAYED));
+        EnableMenuItem(menu, ID_FILE_SAVE_AS, MF_BYCOMMAND | editState);
+        EnableMenuItem(menu, ID_FILE_PAGE_SETUP, MF_BYCOMMAND | MF_ENABLED);
+        EnableMenuItem(menu, ID_FILE_PRINT, MF_BYCOMMAND | MF_GRAYED);
+        EnableMenuItem(menu, ID_EDIT_UNDO, MF_BYCOMMAND | editState);
+        EnableMenuItem(menu, ID_EDIT_CUT, MF_BYCOMMAND | editState);
+        EnableMenuItem(menu, ID_EDIT_COPY, MF_BYCOMMAND | editState);
+        EnableMenuItem(menu, ID_EDIT_PASTE, MF_BYCOMMAND | editState);
+        EnableMenuItem(menu, ID_EDIT_DELETE, MF_BYCOMMAND | editState);
+        EnableMenuItem(menu, ID_EDIT_FIND, MF_BYCOMMAND | editState);
+        EnableMenuItem(menu, ID_EDIT_FIND_NEXT, MF_BYCOMMAND | editState);
+        EnableMenuItem(menu, ID_EDIT_REPLACE, MF_BYCOMMAND | editState);
+        EnableMenuItem(menu, ID_EDIT_GO_TO, MF_BYCOMMAND | editState);
+        EnableMenuItem(menu, ID_EDIT_SELECT_ALL, MF_BYCOMMAND | editState);
+        EnableMenuItem(menu, ID_EDIT_TIME_DATE, MF_BYCOMMAND | editState);
+        EnableMenuItem(menu, ID_FORMAT_WORD_WRAP, MF_BYCOMMAND | MF_GRAYED);
+        EnableMenuItem(menu, ID_FORMAT_FONT, MF_BYCOMMAND | MF_ENABLED);
+        EnableMenuItem(menu, ID_VIEW_STATUS_BAR, MF_BYCOMMAND | MF_ENABLED);
+        CheckMenuItem(menu, ID_FORMAT_WORD_WRAP, MF_BYCOMMAND | MF_UNCHECKED);
+        CheckMenuItem(menu, ID_VIEW_STATUS_BAR, MF_BYCOMMAND | (statusBarVisible_ ? MF_CHECKED : MF_UNCHECKED));
+        return;
+    }
+    if (editor_ == nullptr) {
         return;
     }
 
@@ -3717,6 +3779,27 @@ void ClassicNotepadApp::UpdateMenuState(HMENU menu)
 void ClassicNotepadApp::UpdateStatusBar()
 {
     if (statusBar_ == nullptr || editor_ == nullptr) {
+        return;
+    }
+
+    if (IsLargeFileMode()) {
+        const LargeFileViewInfo info = largeFileView_->GetInfo();
+        const std::uint64_t indexPercent = info.fileSize == 0U
+            ? 0U
+            : std::min<std::uint64_t>(100U, static_cast<std::uint64_t>(
+                static_cast<long double>(info.indexedBytes) * 100.0L / static_cast<long double>(info.fileSize)));
+        statusBarParts_[0] = info.modified ? L"Large file (modified)" : L"Large file (editable)";
+        statusBarParts_[1] = info.indexingComplete
+            ? L"Indexed " + classic_notepad::FormatNumberWithSeparators(static_cast<std::size_t>(info.indexedLines)) + L" lines"
+            : L"Indexing " + std::to_wstring(indexPercent) + L"%";
+        statusBarParts_[2] = L"Ln " + classic_notepad::FormatNumberWithSeparators(static_cast<std::size_t>(info.topLine + 1U)) +
+            L", Col 1, Char " + classic_notepad::FormatNumberWithSeparators(static_cast<std::size_t>(info.caret));
+        statusBarParts_[3] = info.encoding == classic_notepad::LargeFileEncoding::Utf16Le ? L"UTF-16 LE" : L"UTF-8";
+        UpdateStatusBarPartLayout();
+        for (std::size_t index = 0; index < statusBarParts_.size(); ++index) {
+            const WPARAM part = static_cast<WPARAM>(index) | SBT_OWNERDRAW | SBT_NOBORDERS;
+            SendMessageW(statusBar_, SB_SETTEXTW, part, static_cast<LPARAM>(index));
+        }
         return;
     }
 
@@ -4450,6 +4533,7 @@ void ClassicNotepadApp::HandleInitialFilePath(const std::wstring& path)
 
 void ClassicNotepadApp::CreateNewDocumentForPath(const std::wstring& path)
 {
+    ExitLargeFileMode();
     document_.ResetNewFile(path);
     SetEditorText(L"");
     UpdateTitle();
@@ -4489,6 +4573,7 @@ void ClassicNotepadApp::HandleNew()
         return;
     }
 
+    ExitLargeFileMode();
     document_.ResetUntitled();
     SetEditorText(L"");
     UpdateTitle();
@@ -4511,6 +4596,17 @@ void ClassicNotepadApp::HandleOpen()
 
 bool ClassicNotepadApp::HandleSave()
 {
+    if (IsLargeFileMode()) {
+        std::wstring errorMessage;
+        if (!largeFileView_->Save(document_.Path(), document_.Encoding(), document_.SaveLineEnding(), true, errorMessage)) {
+            ShowError(errorMessage);
+            return false;
+        }
+        document_.SetModified(false);
+        UpdateTitle();
+        UpdateStatusBar();
+        return true;
+    }
     if (!document_.HasPath()) {
         return HandleSaveAs();
     }
@@ -4528,6 +4624,20 @@ bool ClassicNotepadApp::HandleSave()
 
 bool ClassicNotepadApp::HandleSaveAs()
 {
+    if (IsLargeFileMode()) {
+        const std::wstring path = ShowSaveFileDialog();
+        if (path.empty()) return false;
+        std::wstring errorMessage;
+        if (!largeFileView_->Save(path, document_.Encoding(), document_.SaveLineEnding(), true, errorMessage)) {
+            ShowError(errorMessage);
+            return false;
+        }
+        document_.OpenReadOnlyLargeFile(path, document_.Encoding());
+        document_.SetModified(false);
+        UpdateTitle();
+        UpdateStatusBar();
+        return true;
+    }
     const std::wstring path = ShowSaveFileDialog();
     if (path.empty()) {
         return false;
@@ -4586,6 +4696,10 @@ void ClassicNotepadApp::HandlePageSetup()
 
 void ClassicNotepadApp::HandlePrint()
 {
+    if (IsLargeFileMode()) {
+        ShowLargeFileReadOnlyMessage();
+        return;
+    }
     PRINTDLGW printDialog{};
     printDialog.lStructSize = sizeof(printDialog);
     printDialog.hwndOwner = mainWindow_;
@@ -4638,6 +4752,11 @@ void ClassicNotepadApp::HandlePrint()
 
 void ClassicNotepadApp::HandleUndo()
 {
+    if (IsLargeFileMode()) {
+        std::wstring error;
+        if (!largeFileView_->Undo(error) && !error.empty()) ShowError(error);
+        return;
+    }
     SendMessageW(editor_, EM_UNDO, 0, 0);
     UpdateStatusBar();
     UpdateScrollBars();
@@ -4646,6 +4765,11 @@ void ClassicNotepadApp::HandleUndo()
 
 void ClassicNotepadApp::HandleCut()
 {
+    if (IsLargeFileMode()) {
+        std::wstring error;
+        if (!largeFileView_->CutSelection(error) && !error.empty()) ShowError(error);
+        return;
+    }
     SendMessageW(editor_, WM_CUT, 0, 0);
     UpdateStatusBar();
     UpdateScrollBars();
@@ -4654,26 +4778,46 @@ void ClassicNotepadApp::HandleCut()
 
 void ClassicNotepadApp::HandleCopy()
 {
+    if (IsLargeFileMode()) {
+        std::wstring error;
+        if (!largeFileView_->CopySelection(error) && !error.empty()) ShowError(error);
+        largeFileView_->Focus();
+        return;
+    }
     SendMessageW(editor_, WM_COPY, 0, 0);
     SetFocus(editor_);
 }
 
 void ClassicNotepadApp::HandlePaste()
 {
+    if (IsLargeFileMode()) {
+        std::wstring clipboardText;
+        std::wstring error;
+        if (TryReadClipboardText(mainWindow_, clipboardText) && !largeFileView_->PasteText(clipboardText, error) && !error.empty()) ShowError(error);
+        return;
+    }
     std::wstring clipboardText;
     if (TryReadClipboardText(mainWindow_, clipboardText)) {
         const std::wstring normalizedText = classic_notepad::NormalizeLineEndingsForEditor(clipboardText);
+        // EN_CHANGE is sent synchronously by EM_REPLACESEL. Defer the expensive
+        // status/scrollbar pass until the caret has moved to the pasted text.
+        suppressEditorChange_ = true;
         ReplaceSelection(normalizedText);
+        suppressEditorChange_ = false;
         SendMessageW(editor_, EM_SCROLLCARET, 0, 0);
+        HandleEditorChanged();
     }
 
-    UpdateStatusBar();
-    UpdateScrollBars();
     SetFocus(editor_);
 }
 
 void ClassicNotepadApp::HandleDelete()
 {
+    if (IsLargeFileMode()) {
+        std::wstring error;
+        if (!largeFileView_->DeleteSelection(false, error) && !error.empty()) ShowError(error);
+        return;
+    }
     DWORD selectionStart = 0;
     DWORD selectionEnd = 0;
     GetSelectionRange(selectionStart, selectionEnd);
@@ -4692,6 +4836,19 @@ void ClassicNotepadApp::HandleDelete()
 
 void ClassicNotepadApp::HandleFind()
 {
+    if (IsLargeFileMode()) {
+        if (findDialog_ != nullptr) { SetFocus(findDialog_); return; }
+        if (replaceDialog_ != nullptr) CloseFindReplaceDialogs();
+        findReplace_ = {};
+        findReplace_.lStructSize = sizeof(findReplace_);
+        findReplace_.hwndOwner = mainWindow_;
+        findReplace_.lpstrFindWhat = findBuffer_.data();
+        findReplace_.wFindWhatLen = static_cast<WORD>(findBuffer_.size());
+        findReplace_.Flags = findFlags_;
+        findDialog_ = FindTextW(&findReplace_);
+        if (findDialog_ == nullptr) ShowError(L"The Find dialog could not be shown.");
+        return;
+    }
     if (GetWindowTextLengthW(editor_) <= 0) {
         return;
     }
@@ -4722,6 +4879,14 @@ void ClassicNotepadApp::HandleFind()
 
 void ClassicNotepadApp::HandleFindNext()
 {
+    if (IsLargeFileMode()) {
+        if (findBuffer_[0] == L'\0') { HandleFind(); return; }
+        std::wstring error;
+        largeFileView_->Find(findBuffer_.data(), (findFlags_ & FR_MATCHCASE) != 0, (findFlags_ & FR_WHOLEWORD) != 0,
+            (findFlags_ & FR_DOWN) != 0, error);
+        if (!error.empty()) ShowError(error);
+        return;
+    }
     if (findBuffer_[0] == L'\0') {
         HandleFind();
         return;
@@ -4732,6 +4897,21 @@ void ClassicNotepadApp::HandleFindNext()
 
 void ClassicNotepadApp::HandleReplace()
 {
+    if (IsLargeFileMode()) {
+        if (replaceDialog_ != nullptr) { SetFocus(replaceDialog_); return; }
+        if (findDialog_ != nullptr) CloseFindReplaceDialogs();
+        findReplace_ = {};
+        findReplace_.lStructSize = sizeof(findReplace_);
+        findReplace_.hwndOwner = mainWindow_;
+        findReplace_.lpstrFindWhat = findBuffer_.data();
+        findReplace_.wFindWhatLen = static_cast<WORD>(findBuffer_.size());
+        findReplace_.lpstrReplaceWith = replaceBuffer_.data();
+        findReplace_.wReplaceWithLen = static_cast<WORD>(replaceBuffer_.size());
+        findReplace_.Flags = findFlags_;
+        replaceDialog_ = ReplaceTextW(&findReplace_);
+        if (replaceDialog_ == nullptr) ShowError(L"The Replace dialog could not be shown.");
+        return;
+    }
     if (GetWindowTextLengthW(editor_) <= 0) {
         return;
     }
@@ -4764,6 +4944,14 @@ void ClassicNotepadApp::HandleReplace()
 
 void ClassicNotepadApp::HandleGoTo()
 {
+    if (IsLargeFileMode()) {
+        const LargeFileViewInfo info = largeFileView_->GetInfo();
+        const int current = static_cast<int>(std::min<std::uint64_t>(info.topLine + 1U, static_cast<std::uint64_t>((std::numeric_limits<int>::max)())));
+        const int maximum = static_cast<int>(std::min<std::uint64_t>(info.totalLines, static_cast<std::uint64_t>((std::numeric_limits<int>::max)())));
+        const int target = ShowGoToDialog(std::max(1, current), std::max(1, maximum));
+        if (target > 0) { std::wstring error; if (!largeFileView_->GoToLine(static_cast<std::uint64_t>(target), error)) ShowError(error); }
+        return;
+    }
     DWORD selectionStart = 0;
     DWORD selectionEnd = 0;
     GetSelectionRange(selectionStart, selectionEnd);
@@ -4778,6 +4966,11 @@ void ClassicNotepadApp::HandleGoTo()
 
 void ClassicNotepadApp::HandleSelectAll()
 {
+    if (IsLargeFileMode()) {
+        largeFileView_->SelectAll();
+        largeFileView_->Focus();
+        return;
+    }
     SendMessageW(editor_, EM_SETSEL, 0, -1);
     UpdateStatusBar();
     SetFocus(editor_);
@@ -4785,6 +4978,11 @@ void ClassicNotepadApp::HandleSelectAll()
 
 void ClassicNotepadApp::HandleTimeDate()
 {
+    if (IsLargeFileMode()) {
+        std::wstring error;
+        if (!largeFileView_->InsertText(BuildTimeDateText(), error) && !error.empty()) ShowError(error);
+        return;
+    }
     ReplaceSelection(BuildTimeDateText());
     UpdateStatusBar();
     SetFocus(editor_);
@@ -4792,6 +4990,10 @@ void ClassicNotepadApp::HandleTimeDate()
 
 void ClassicNotepadApp::HandleToggleWordWrap()
 {
+    if (IsLargeFileMode()) {
+        ShowError(L"Word wrap is unavailable while the large-document renderer is using 64-bit unwrapped line coordinates.");
+        return;
+    }
     if (editor_ == nullptr) {
         wordWrap_ = !wordWrap_;
         return;
@@ -4870,6 +5072,9 @@ void ClassicNotepadApp::HandleChooseFont()
     editorFont_ = newFont;
     ownsEditorFont_ = true;
     SendMessageW(editor_, WM_SETFONT, reinterpret_cast<WPARAM>(editorFont_), TRUE);
+    if (largeFileView_ != nullptr) {
+        largeFileView_->SetTheme(editorFont_, darkModeEnabled_);
+    }
     if (ownedOldFont && oldFont != nullptr) {
         DeleteObject(oldFont);
     }
@@ -4879,7 +5084,11 @@ void ClassicNotepadApp::HandleChooseFont()
     UpdateStatusBar();
     UpdateScrollBars();
     InvalidateRect(editor_, nullptr, FALSE);
-    SetFocus(editor_);
+    if (largeFileView_ != nullptr) {
+        largeFileView_->Focus();
+    } else {
+        SetFocus(editor_);
+    }
 }
 
 void ClassicNotepadApp::HandleToggleStatusBar()
@@ -4894,11 +5103,33 @@ void ClassicNotepadApp::HandleToggleStatusBar()
     UpdateScrollBars();
     UpdateMenuState(ActiveMenu());
     UpdateMenuChrome();
-    SetFocus(editor_);
+    if (largeFileView_ != nullptr) {
+        largeFileView_->Focus();
+    } else {
+        SetFocus(editor_);
+    }
 }
 
 bool ClassicNotepadApp::LoadDocument(const std::wstring& path)
 {
+    std::uint64_t fileSize = 0;
+    std::wstring thresholdError;
+    const bool useLargeFileMode = LargeFileView::ShouldUseLargeFile(path, fileSize, thresholdError);
+    if (!thresholdError.empty()) {
+        ShowError(thresholdError);
+        UpdateTitle();
+        return false;
+    }
+    if (useLargeFileMode) {
+        std::wstring errorMessage;
+        if (!LoadLargeDocument(path, errorMessage)) {
+            ShowError(errorMessage);
+            UpdateTitle();
+            return false;
+        }
+        return true;
+    }
+
     std::wstring editorText;
     std::wstring errorMessage;
 
@@ -4908,14 +5139,64 @@ bool ClassicNotepadApp::LoadDocument(const std::wstring& path)
         return false;
     }
 
+    ExitLargeFileMode();
     SetEditorText(editorText);
     UpdateTitle();
     SetFocus(editor_);
     return true;
 }
 
+bool ClassicNotepadApp::LoadLargeDocument(const std::wstring& path, std::wstring& errorMessage)
+{
+    auto view = std::make_unique<LargeFileView>();
+    if (!view->Create(instance_, mainWindow_, IDC_MAIN_EDITOR, path, editorFont_, darkModeEnabled_, errorMessage)) {
+        return false;
+    }
+
+    const LargeFileViewInfo info = view->GetInfo();
+    Document::TextEncoding encoding = Document::TextEncoding::Utf8NoBom;
+    if (info.encoding == classic_notepad::LargeFileEncoding::Utf16Le) {
+        encoding = Document::TextEncoding::Utf16LeBom;
+    } else if (info.dataOffset == 3U) {
+        encoding = Document::TextEncoding::Utf8Bom;
+    }
+
+    ExitLargeFileMode();
+    largeFileView_ = std::move(view);
+    ShowWindow(editor_, SW_HIDE);
+    document_.OpenReadOnlyLargeFile(path, encoding);
+    ResizeEditor();
+    UpdateStatusBar();
+    UpdateTitle();
+    largeFileView_->Focus();
+    return true;
+}
+
+void ClassicNotepadApp::ExitLargeFileMode()
+{
+    if (largeFileView_ == nullptr) {
+        return;
+    }
+    largeFileView_.reset();
+    if (editor_ != nullptr) {
+        ShowWindow(editor_, SW_SHOW);
+    }
+    UpdateScrollBars();
+}
+
+bool ClassicNotepadApp::IsLargeFileMode() const
+{
+    return largeFileView_ != nullptr;
+}
+
+void ClassicNotepadApp::ShowLargeFileReadOnlyMessage()
+{
+    ShowError(L"This command is not available in large-document mode.");
+}
+
 bool ClassicNotepadApp::AutomationNewDocument()
 {
+    ExitLargeFileMode();
     document_.ResetUntitled();
     SetEditorText(L"");
     UpdateTitle();
@@ -4924,19 +5205,22 @@ bool ClassicNotepadApp::AutomationNewDocument()
 
 bool ClassicNotepadApp::AutomationOpenFile(const std::wstring& path, std::wstring& errorMessage)
 {
-    std::wstring editorText;
-    if (!document_.Load(path, editorText, errorMessage)) {
-        UpdateTitle();
-        return false;
+    if (LoadDocument(path)) {
+        return true;
     }
-
-    SetEditorText(editorText);
-    UpdateTitle();
-    return true;
+    errorMessage = L"The file could not be opened.";
+    return false;
 }
 
 bool ClassicNotepadApp::AutomationSave(std::wstring& errorMessage)
 {
+    if (IsLargeFileMode()) {
+        if (!largeFileView_->Save(document_.Path(), document_.Encoding(), document_.SaveLineEnding(), true, errorMessage)) return false;
+        document_.SetModified(false);
+        UpdateTitle();
+        UpdateStatusBar();
+        return true;
+    }
     if (!document_.Save(GetEditorText(), errorMessage)) {
         return false;
     }
@@ -4949,6 +5233,14 @@ bool ClassicNotepadApp::AutomationSave(std::wstring& errorMessage)
 
 bool ClassicNotepadApp::AutomationSaveAs(const std::wstring& path, std::wstring& errorMessage)
 {
+    if (IsLargeFileMode()) {
+        if (!largeFileView_->Save(path, document_.Encoding(), document_.SaveLineEnding(), true, errorMessage)) return false;
+        document_.OpenReadOnlyLargeFile(path, document_.Encoding());
+        document_.SetModified(false);
+        UpdateTitle();
+        UpdateStatusBar();
+        return true;
+    }
     if (!document_.SaveAs(path, GetEditorText(), errorMessage)) {
         return false;
     }
@@ -4961,11 +5253,26 @@ bool ClassicNotepadApp::AutomationSaveAs(const std::wstring& path, std::wstring&
 
 void ClassicNotepadApp::AutomationSetText(const std::wstring& text)
 {
+    if (IsLargeFileMode()) {
+        std::wstring error;
+        largeFileView_->SetSelection(0, largeFileView_->GetInfo().characterCount, error);
+        if (error.empty()) largeFileView_->InsertText(text, error);
+        if (error.empty()) document_.SetModified(true);
+        UpdateTitle();
+        return;
+    }
     ReplaceEditorTextFromCommand(text);
 }
 
 void ClassicNotepadApp::AutomationInsertText(const std::wstring& text)
 {
+    if (IsLargeFileMode()) {
+        std::wstring error;
+        if (largeFileView_->InsertText(text, error)) document_.SetModified(true);
+        UpdateTitle();
+        UpdateStatusBar();
+        return;
+    }
     ReplaceSelection(text);
     UpdateStatusBar();
     UpdateScrollBars();
@@ -4973,6 +5280,13 @@ void ClassicNotepadApp::AutomationInsertText(const std::wstring& text)
 
 std::wstring ClassicNotepadApp::AutomationGetText() const
 {
+    if (IsLargeFileMode()) {
+        std::wstring text;
+        std::wstring error;
+        const LargeFileViewInfo info = largeFileView_->GetInfo();
+        if (info.characterCount <= 1024U * 1024U) largeFileView_->GetTextRange(0, info.characterCount, text, error);
+        return text;
+    }
     return GetEditorText();
 }
 
@@ -4990,6 +5304,7 @@ std::wstring ClassicNotepadApp::AutomationGetTitle() const
 
 bool ClassicNotepadApp::AutomationIsModified() const
 {
+    if (IsLargeFileMode()) return largeFileView_->GetInfo().modified;
     return document_.IsModified();
 }
 
@@ -5022,12 +5337,24 @@ std::wstring ClassicNotepadApp::AutomationGetStatusText() const
 ClassicNotepadApp::AutomationSelection ClassicNotepadApp::AutomationGetSelection() const
 {
     AutomationSelection selection;
+    if (IsLargeFileMode()) {
+        std::uint64_t start = 0, end = 0;
+        largeFileView_->GetSelection(start, end);
+        selection.start = static_cast<DWORD>(std::min<std::uint64_t>(start, (std::numeric_limits<DWORD>::max)()));
+        selection.end = static_cast<DWORD>(std::min<std::uint64_t>(end, (std::numeric_limits<DWORD>::max)()));
+        return selection;
+    }
     GetSelectionRange(selection.start, selection.end);
     return selection;
 }
 
 void ClassicNotepadApp::AutomationSetSelection(DWORD selectionStart, DWORD selectionEnd)
 {
+    if (IsLargeFileMode()) {
+        std::wstring error;
+        largeFileView_->SetSelection(selectionStart, selectionEnd, error);
+        return;
+    }
     SendMessageW(editor_, EM_SETSEL, selectionStart, selectionEnd);
     SendMessageW(editor_, EM_SCROLLCARET, 0, 0);
     UpdateStatusBar();
@@ -5061,6 +5388,12 @@ void ClassicNotepadApp::AutomationPaste()
 
 void ClassicNotepadApp::AutomationDeleteSelection()
 {
+    if (IsLargeFileMode()) {
+        std::wstring error;
+        if (largeFileView_->DeleteSelection(false, error)) document_.SetModified(true);
+        UpdateTitle();
+        return;
+    }
     DWORD selectionStart = 0;
     DWORD selectionEnd = 0;
     GetSelectionRange(selectionStart, selectionEnd);
@@ -5080,11 +5413,23 @@ void ClassicNotepadApp::AutomationDelete()
 
 void ClassicNotepadApp::AutomationPressInsert()
 {
+    if (IsLargeFileMode()) {
+        // The large-document surface supports insert semantics only; overwrite
+        // mode is not exposed by the existing normal automation contract.
+        return;
+    }
     SendMessageW(editor_, WM_KEYDOWN, VK_INSERT, 0);
 }
 
 void ClassicNotepadApp::AutomationTypeText(const std::wstring& text)
 {
+    if (IsLargeFileMode()) {
+        std::wstring error;
+        if (largeFileView_->InsertText(text, error)) document_.SetModified(true);
+        UpdateTitle();
+        UpdateStatusBar();
+        return;
+    }
     for (const wchar_t character : text) {
         SendMessageW(editor_, WM_CHAR, static_cast<WPARAM>(character), 0);
     }
@@ -5098,6 +5443,20 @@ bool ClassicNotepadApp::AutomationFind(
     bool wholeWord,
     bool searchDown)
 {
+    if (IsLargeFileMode()) {
+        if (text.empty() || text.size() >= findBuffer_.size()) return false;
+        CopyToFixedBuffer(findBuffer_, text);
+        std::wstring selectionError;
+        const LargeFileViewInfo info = largeFileView_->GetInfo();
+        largeFileView_->SetSelection(
+            searchDown ? 0U : info.characterCount,
+            searchDown ? 0U : info.characterCount,
+            selectionError);
+        if (!selectionError.empty()) return false;
+        std::wstring error;
+        const bool found = largeFileView_->Find(text, matchCase, wholeWord, searchDown, error);
+        return found;
+    }
     if (text.empty() || text.size() >= findBuffer_.size()) {
         return false;
     }
@@ -5123,6 +5482,10 @@ bool ClassicNotepadApp::AutomationFind(
 
 bool ClassicNotepadApp::AutomationFindNext(bool matchCase, bool wholeWord, bool searchDown)
 {
+    if (IsLargeFileMode()) {
+        std::wstring error;
+        return findBuffer_[0] != L'\0' && largeFileView_->Find(findBuffer_.data(), matchCase, wholeWord, searchDown, error);
+    }
     DWORD flags = 0;
     if (searchDown) {
         flags |= FR_DOWN;
@@ -5144,6 +5507,23 @@ bool ClassicNotepadApp::AutomationReplace(
     bool wholeWord,
     bool searchDown)
 {
+    if (IsLargeFileMode()) {
+        std::wstring error;
+        std::uint64_t selectionStart = 0;
+        std::uint64_t selectionEnd = 0;
+        largeFileView_->GetSelection(selectionStart, selectionEnd);
+        std::wstring selected;
+        const bool haveSelectedMatch = selectionEnd >= selectionStart &&
+            largeFileView_->GetTextRange(selectionStart, selectionEnd - selectionStart, selected, error) &&
+            ((matchCase && selected == text) ||
+                (!matchCase && selected.size() == text.size() && std::equal(selected.begin(), selected.end(), text.begin(),
+                    [](wchar_t left, wchar_t right) { return std::towlower(left) == std::towlower(right); })));
+        if (!haveSelectedMatch && !largeFileView_->Find(text, matchCase, wholeWord, searchDown, error)) return false;
+        if (!largeFileView_->InsertText(replacement, error)) return false;
+        document_.SetModified(true);
+        UpdateTitle();
+        return true;
+    }
     if (text.empty() || text.size() >= findBuffer_.size() || replacement.size() >= replaceBuffer_.size()) {
         return false;
     }
@@ -5182,6 +5562,12 @@ std::size_t ClassicNotepadApp::AutomationReplaceAll(
     bool matchCase,
     bool wholeWord)
 {
+    if (IsLargeFileMode()) {
+        std::wstring error;
+        const std::uint64_t count = largeFileView_->ReplaceAll(text, replacement, matchCase, wholeWord, error);
+        if (count != 0U) { document_.SetModified(true); UpdateTitle(); }
+        return static_cast<std::size_t>(std::min<std::uint64_t>(count, (std::numeric_limits<std::size_t>::max)()));
+    }
     if (text.empty() || text.size() >= findBuffer_.size() || replacement.size() >= replaceBuffer_.size()) {
         return 0;
     }
@@ -5217,17 +5603,20 @@ std::size_t ClassicNotepadApp::AutomationReplaceAll(
     return replacementCount;
 }
 
-bool ClassicNotepadApp::AutomationGoToLine(int lineNumber, std::wstring& errorMessage)
+bool ClassicNotepadApp::AutomationGoToLine(std::uint64_t lineNumber, std::wstring& errorMessage)
 {
+    if (IsLargeFileMode()) {
+        return largeFileView_->GoToLine(lineNumber, errorMessage);
+    }
     const int maxLine = std::max<int>(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
-    if (lineNumber < 1 || lineNumber > maxLine) {
+    if (lineNumber < 1U || lineNumber > static_cast<std::uint64_t>(maxLine)) {
         errorMessage = L"Line number must be between 1 and ";
         errorMessage += std::to_wstring(maxLine);
         errorMessage += L".";
         return false;
     }
 
-    GoToLine(lineNumber);
+    GoToLine(static_cast<int>(lineNumber));
     return true;
 }
 
@@ -5238,6 +5627,11 @@ void ClassicNotepadApp::AutomationInsertTimeDate()
 
 void ClassicNotepadApp::AutomationSetWordWrap(bool enabled)
 {
+    if (IsLargeFileMode()) {
+        wordWrap_ = enabled;
+        UpdateMenuState(ActiveMenu());
+        return;
+    }
     if (wordWrap_ != enabled) {
         HandleToggleWordWrap();
     }
@@ -5296,6 +5690,9 @@ bool ClassicNotepadApp::AutomationSetFont(const std::wstring& fontDescription, s
     editorFont_ = newFont;
     ownsEditorFont_ = true;
     SendMessageW(editor_, WM_SETFONT, reinterpret_cast<WPARAM>(editorFont_), TRUE);
+    if (largeFileView_ != nullptr) {
+        largeFileView_->SetTheme(editorFont_, darkModeEnabled_);
+    }
     if (ownedOldFont && oldFont != nullptr) {
         DeleteObject(oldFont);
     }
@@ -5339,6 +5736,10 @@ RECT ClassicNotepadApp::AutomationGetPageMarginsThousandths() const
 
 bool ClassicNotepadApp::AutomationPrintToTestSink(const std::wstring& path, std::wstring& errorMessage) const
 {
+    if (IsLargeFileMode()) {
+        errorMessage = L"Printing a mapped large file is disabled in read-only large-file mode.";
+        return false;
+    }
     const std::wstring sinkText = BuildPrintSinkText(
         L"windows",
         AutomationGetFont(),
@@ -5366,6 +5767,10 @@ std::vector<std::wstring> ClassicNotepadApp::AutomationSuggestSpelling(
 
 bool ClassicNotepadApp::AutomationIgnoreSpelling(const std::wstring& word, std::wstring& errorMessage)
 {
+    if (IsLargeFileMode()) {
+        errorMessage = L"Large-file mode is read-only.";
+        return false;
+    }
     if (!spellCheckAvailable_) {
         errorMessage = L"Spell checking is unavailable.";
         return false;
@@ -5380,6 +5785,10 @@ bool ClassicNotepadApp::AutomationAddSpelling(
     bool dryRun,
     std::wstring& errorMessage)
 {
+    if (IsLargeFileMode()) {
+        errorMessage = L"Large-file mode is read-only.";
+        return false;
+    }
     if (!spellCheckAvailable_) {
         errorMessage = L"Spell checking is unavailable.";
         return false;
@@ -5412,6 +5821,68 @@ void ClassicNotepadApp::AutomationSetAppearanceTheme(classic_notepad::Appearance
     UpdateThemeFromSystem();
 }
 
+ClassicNotepadApp::AutomationLargeFileState ClassicNotepadApp::AutomationGetLargeFileState() const
+{
+    AutomationLargeFileState state;
+    if (largeFileView_ == nullptr) {
+        return state;
+    }
+    const LargeFileViewInfo info = largeFileView_->GetInfo();
+    state.active = info.active;
+    state.readOnly = info.readOnly;
+    state.editable = info.editable;
+    state.modified = info.modified;
+    state.indexingComplete = info.indexingComplete;
+    state.encodingValid = info.encodingValid;
+    state.fileSize = info.fileSize;
+    state.indexedBytes = info.indexedBytes;
+    state.indexedLines = info.indexedLines;
+    state.totalLines = info.totalLines;
+    state.firstUsableMilliseconds = info.firstUsableMilliseconds;
+    state.fullIndexMilliseconds = info.fullIndexMilliseconds;
+    state.characterCount = info.characterCount;
+    state.caret = info.caret;
+    state.selectionStart = info.selectionStart;
+    state.selectionEnd = info.selectionEnd;
+    state.topLine = info.topLine;
+    state.generation = info.generation;
+    state.pieceCount = info.pieceCount;
+    state.insertedBufferBytes = info.insertedBufferBytes;
+    state.saveProgressBytes = info.saveProgressBytes;
+    state.saveInProgress = info.saveInProgress;
+    return state;
+}
+
+bool ClassicNotepadApp::AutomationGetLargeFileLine(
+    std::uint64_t oneBasedLine,
+    std::wstring& text,
+    std::wstring& errorMessage) const
+{
+    if (largeFileView_ == nullptr) {
+        errorMessage = L"Large-file mode is not active.";
+        return false;
+    }
+    return largeFileView_->GetLine(oneBasedLine, text, errorMessage);
+}
+
+bool ClassicNotepadApp::AutomationGetLargeFileTextRange(
+    std::uint64_t start,
+    std::uint64_t length,
+    std::wstring& text,
+    std::wstring& errorMessage) const
+{
+    if (largeFileView_ == nullptr) {
+        errorMessage = L"Large-file mode is not active.";
+        return false;
+    }
+    constexpr std::uint64_t maximum = 1024ULL * 1024ULL;
+    if (length > maximum) {
+        errorMessage = L"Large-file text ranges are limited to 1 MiB.";
+        return false;
+    }
+    return largeFileView_->GetTextRange(start, length, text, errorMessage);
+}
+
 bool ClassicNotepadApp::ConfirmSaveChanges()
 {
     if (!document_.IsModified()) {
@@ -5433,6 +5904,9 @@ bool ClassicNotepadApp::ConfirmSaveChanges()
 
 std::wstring ClassicNotepadApp::GetEditorText() const
 {
+    if (IsLargeFileMode() || editor_ == nullptr) {
+        return {};
+    }
     const int textLength = GetWindowTextLengthW(editor_);
     if (textLength <= 0) {
         return {};
@@ -5907,6 +6381,24 @@ void ClassicNotepadApp::HandleFindReplaceMessage(LPARAM lParam)
 
     findFlags_ = findReplace->Flags & kFindOptionFlags;
 
+    if (IsLargeFileMode()) {
+        const bool matchCase = (findReplace->Flags & FR_MATCHCASE) != 0;
+        const bool wholeWord = (findReplace->Flags & FR_WHOLEWORD) != 0;
+        const bool down = (findReplace->Flags & FR_DOWN) != 0;
+        std::wstring error;
+        if ((findReplace->Flags & FR_FINDNEXT) != 0) {
+            largeFileView_->Find(findBuffer_.data(), matchCase, wholeWord, down, error);
+        } else if ((findReplace->Flags & FR_REPLACE) != 0) {
+            if (largeFileView_->Find(findBuffer_.data(), matchCase, wholeWord, down, error)) {
+                largeFileView_->InsertText(replaceBuffer_.data(), error);
+            }
+        } else if ((findReplace->Flags & FR_REPLACEALL) != 0) {
+            largeFileView_->ReplaceAll(findBuffer_.data(), replaceBuffer_.data(), matchCase, wholeWord, error);
+        }
+        if (!error.empty()) ShowError(error);
+        return;
+    }
+
     if ((findReplace->Flags & FR_FINDNEXT) != 0) {
         FindNextWithFlags(findReplace->Flags, true);
     } else if ((findReplace->Flags & FR_REPLACE) != 0) {
@@ -6101,10 +6593,15 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
     case WM_SIZE:
         ResizeEditor();
         InvalidateRect(editor_, nullptr, FALSE);
+        if (largeFileView_ != nullptr) {
+            InvalidateRect(largeFileView_->Window(), nullptr, FALSE);
+        }
         return 0;
 
     case WM_SETFOCUS:
-        if (editor_ != nullptr) {
+        if (largeFileView_ != nullptr) {
+            largeFileView_->Focus();
+        } else if (editor_ != nullptr) {
             SetFocus(editor_);
         }
         return 0;
@@ -6309,6 +6806,7 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
         return 0;
 
     case WM_DESTROY:
+        largeFileView_.reset();
         CloseFindReplaceDialogs();
         if (spellCheckTimerId_ != 0) {
             KillTimer(mainWindow_, spellCheckTimerId_);
@@ -6327,6 +6825,14 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
             return 0;
         }
         break;
+
+    case WM_APP + 101:
+        if (largeFileView_ != nullptr) {
+            document_.SetModified(largeFileView_->GetInfo().modified);
+            UpdateStatusBar();
+            UpdateTitle();
+        }
+        return 0;
 
     default:
         break;

@@ -74,6 +74,45 @@ std::wstring NormalizeLineEndingsForEditor(const std::wstring& text)
     return normalized;
 }
 
+void NormalizeLineEndingsForEditorInPlace(std::wstring& text)
+{
+    std::size_t extraCharacters = 0;
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        if (text[index] == L'\n' && (index == 0U || text[index - 1U] != L'\r')) {
+            ++extraCharacters;
+        } else if (text[index] == L'\r' && (index + 1U >= text.size() || text[index + 1U] != L'\n')) {
+            ++extraCharacters;
+        }
+    }
+
+    if (extraCharacters == 0U) {
+        return;
+    }
+
+    const std::size_t originalSize = text.size();
+    text.resize(originalSize + extraCharacters);
+    std::size_t read = originalSize;
+    std::size_t write = text.size();
+    while (read > 0U) {
+        const wchar_t character = text[--read];
+        if (character == L'\n') {
+            if (read > 0U && text[read - 1U] == L'\r') {
+                text[--write] = L'\n';
+                text[--write] = L'\r';
+                --read;
+            } else {
+                text[--write] = L'\n';
+                text[--write] = L'\r';
+            }
+        } else if (character == L'\r') {
+            text[--write] = L'\n';
+            text[--write] = L'\r';
+        } else {
+            text[--write] = character;
+        }
+    }
+}
+
 std::wstring ConvertLineEndingsFromEditor(const std::wstring& text, LineEndingStyle target)
 {
     if (target == LineEndingStyle::Crlf || target == LineEndingStyle::Mixed) {

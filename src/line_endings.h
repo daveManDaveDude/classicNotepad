@@ -22,6 +22,7 @@ struct LineEndingAnalysis {
 
 LineEndingAnalysis AnalyzeLineEndings(const std::wstring& text);
 std::wstring NormalizeLineEndingsForEditor(const std::wstring& text);
+void NormalizeLineEndingsForEditorInPlace(std::wstring& text);
 std::wstring ConvertLineEndingsFromEditor(const std::wstring& text, LineEndingStyle target);
 
 } // namespace classic_notepad

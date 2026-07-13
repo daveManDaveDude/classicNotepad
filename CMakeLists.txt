@@ -41,6 +41,10 @@ set(CLASSIC_NOTEPAD_SHARED_CORE_SOURCES
     src/file_io.h
     src/line_endings.cpp
     src/line_endings.h
+    src/large_file_index.cpp
+    src/large_file_index.h
+    src/large_document.cpp
+    src/large_document.h
     src/spelling.cpp
     src/spelling.h
     src/spell_text_utils.cpp
@@ -57,6 +61,8 @@ set(CLASSIC_NOTEPAD_PORTABLE_PLATFORM_SOURCES
 set(CLASSIC_NOTEPAD_WINDOWS_PLATFORM_SOURCES
     src/platform/windows/ansi_encoding_win32.cpp
     src/platform/windows/file_io_win32.cpp
+    src/platform/windows/large_file_view.cpp
+    src/platform/windows/large_file_view.h
 )
 
 set(CLASSIC_NOTEPAD_CORE_PLATFORM_SOURCES

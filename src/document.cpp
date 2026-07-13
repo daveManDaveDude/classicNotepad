@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 bool Document::Load(const std::wstring& path, std::wstring& editorText, std::wstring& errorMessage)
@@ -25,7 +26,10 @@ bool Document::Load(const std::wstring& path, std::wstring& editorText, std::wst
     lineEnding_ = lineEndings.style;
     // The edit control normalizes all line breaks, so mixed files save using the dominant style.
     saveLineEnding_ = lineEndings.dominantStyle;
-    editorText = classic_notepad::NormalizeLineEndingsForEditor(decoded.text);
+    // Reuse the decoded allocation. Large files previously required a second
+    // full UTF-16 copy here, causing severe paging before the editor was shown.
+    classic_notepad::NormalizeLineEndingsForEditorInPlace(decoded.text);
+    editorText = std::move(decoded.text);
     modified_ = false;
     return true;
 }
@@ -66,6 +70,15 @@ bool Document::SaveAs(const std::wstring& path, const std::wstring& editorText, 
     }
 
     return true;
+}
+
+void Document::OpenReadOnlyLargeFile(const std::wstring& path, TextEncoding encoding)
+{
+    path_ = path;
+    encoding_ = encoding;
+    lineEnding_ = LineEndingStyle::Crlf;
+    saveLineEnding_ = LineEndingStyle::Crlf;
+    modified_ = false;
 }
 
 void Document::ResetUntitled()

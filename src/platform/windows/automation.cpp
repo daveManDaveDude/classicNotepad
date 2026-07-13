@@ -558,6 +558,36 @@ std::string BuildSelectionObject(const ClassicNotepadApp::AutomationSelection& s
     return output.str();
 }
 
+std::string BuildLargeFileStateObject(const ClassicNotepadApp::AutomationLargeFileState& state)
+{
+    std::ostringstream output;
+    output << "{"
+           << "\"active\":" << (state.active ? "true" : "false")
+           << ",\"readOnly\":" << (state.readOnly ? "true" : "false")
+           << ",\"editable\":" << (state.editable ? "true" : "false")
+           << ",\"modified\":" << (state.modified ? "true" : "false")
+           << ",\"indexingComplete\":" << (state.indexingComplete ? "true" : "false")
+           << ",\"encodingValid\":" << (state.encodingValid ? "true" : "false")
+           << ",\"fileSize\":" << state.fileSize
+           << ",\"indexedBytes\":" << state.indexedBytes
+           << ",\"indexedLines\":" << state.indexedLines
+           << ",\"totalLines\":" << state.totalLines
+           << ",\"firstUsableMilliseconds\":" << state.firstUsableMilliseconds
+           << ",\"fullIndexMilliseconds\":" << state.fullIndexMilliseconds
+           << ",\"characterCount\":" << state.characterCount
+           << ",\"caret\":" << state.caret
+           << ",\"selectionStart\":" << state.selectionStart
+           << ",\"selectionEnd\":" << state.selectionEnd
+           << ",\"topLine\":" << state.topLine
+           << ",\"generation\":" << state.generation
+           << ",\"pieceCount\":" << state.pieceCount
+           << ",\"insertedBufferBytes\":" << state.insertedBufferBytes
+           << ",\"saveProgressBytes\":" << state.saveProgressBytes
+           << ",\"saveInProgress\":" << (state.saveInProgress ? "true" : "false")
+           << "}";
+    return output.str();
+}
+
 std::string BuildMarginsObject(const RECT& margins)
 {
     std::ostringstream output;
@@ -653,6 +683,7 @@ std::string BuildCapabilitiesObject(const ClassicNotepadApp& app)
     output << "{"
            << "\"platform\":\"windows\""
            << ",\"nativeUi\":\"win32\""
+           << ",\"largeFileMode\":true"
            << ",\"printing\":true"
            << ",\"pageSetup\":true"
            << ",\"fontChooser\":true"
@@ -677,6 +708,17 @@ DWORD ClampSelectionValue(long long value)
 std::wstring SelectedText(const ClassicNotepadApp& app)
 {
     const ClassicNotepadApp::AutomationSelection selection = app.AutomationGetSelection();
+    const ClassicNotepadApp::AutomationLargeFileState large = app.AutomationGetLargeFileState();
+    if (large.active) {
+        std::wstring text;
+        std::wstring error;
+        const std::uint64_t start = selection.start;
+        const std::uint64_t end = selection.end;
+        if (end >= start && app.AutomationGetLargeFileTextRange(start, end - start, text, error)) {
+            return text;
+        }
+        return {};
+    }
     const std::wstring text = app.AutomationGetText();
     const std::size_t start = std::min<std::size_t>(selection.start, text.size());
     const std::size_t end = std::min<std::size_t>(selection.end, text.size());
@@ -744,6 +786,42 @@ std::string HandleCommand(
         }
 
         return ResponseWriter(id, true).Finish();
+    }
+
+    if (name == L"getLargeFileState") {
+        ResponseWriter response(id, true);
+        response.AddRaw("largeFile", BuildLargeFileStateObject(app.AutomationGetLargeFileState()));
+        return response.Finish();
+    }
+
+    if (name == L"getLargeFileLine") {
+        const std::optional<long long> line = GetNumber(request, "line");
+        if (!line.has_value() || *line <= 0) {
+            return BuildErrorResponse(id, L"getLargeFileLine requires a positive line number.");
+        }
+        std::wstring text;
+        if (!app.AutomationGetLargeFileLine(static_cast<std::uint64_t>(*line), text, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        ResponseWriter response(id, true);
+        response.AddString("text", text);
+        return response.Finish();
+    }
+
+    if (name == L"getLargeFileRange") {
+        const std::optional<long long> start = GetNumber(request, "start");
+        const std::optional<long long> length = GetNumber(request, "length");
+        if (!start.has_value() || !length.has_value() || *start < 0 || *length < 0) {
+            return BuildErrorResponse(id, L"getLargeFileRange requires non-negative start and length values.");
+        }
+        std::wstring text;
+        if (!app.AutomationGetLargeFileTextRange(
+                static_cast<std::uint64_t>(*start), static_cast<std::uint64_t>(*length), text, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        ResponseWriter response(id, true);
+        response.AddString("text", text);
+        return response.Finish();
     }
 
     if (name == L"save") {
@@ -953,7 +1031,10 @@ std::string HandleCommand(
             return BuildErrorResponse(id, errorMessage);
         }
 
-        if (!app.AutomationGoToLine(static_cast<int>(lineNumber), errorMessage)) {
+        if (lineNumber < 0) {
+            return BuildErrorResponse(id, L"Line number must be positive.");
+        }
+        if (!app.AutomationGoToLine(static_cast<std::uint64_t>(lineNumber), errorMessage)) {
             return BuildErrorResponse(id, errorMessage);
         }
 

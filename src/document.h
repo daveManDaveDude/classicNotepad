@@ -14,6 +14,10 @@ public:
     bool Save(const std::wstring& editorText, std::wstring& errorMessage);
     bool SaveAs(const std::wstring& path, const std::wstring& editorText, std::wstring& errorMessage);
 
+    // Large-file mode deliberately records metadata without decoding the file
+    // into an editable document buffer.
+    void OpenReadOnlyLargeFile(const std::wstring& path, TextEncoding encoding);
+
     void ResetUntitled();
     void ResetNewFile(const std::wstring& path);
 
