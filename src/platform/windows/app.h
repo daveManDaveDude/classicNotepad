@@ -39,12 +39,14 @@ public:
         bool editable = false;
         bool modified = false;
         bool indexingComplete = false;
+        bool globalScrollReady = false;
         bool encodingValid = true;
         std::uint64_t fileSize = 0;
         std::uint64_t indexedBytes = 0;
         std::uint64_t indexedLines = 0;
         std::uint64_t totalLines = 0;
         std::uint64_t firstUsableMilliseconds = 0;
+        std::uint64_t firstViewportPaintMilliseconds = 0;
         std::uint64_t fullIndexMilliseconds = 0;
         std::uint64_t characterCount = 0;
         std::uint64_t caret = 0;
@@ -56,6 +58,25 @@ public:
         std::uint64_t insertedBufferBytes = 0;
         std::uint64_t saveProgressBytes = 0;
         bool saveInProgress = false;
+        std::uint64_t paintGeneration = 0;
+        std::uint64_t viewportGeneration = 0;
+        bool wordWrap = false;
+        std::uint64_t viewportVisualRows = 0;
+        std::uint64_t wrappedContinuationRows = 0;
+        std::uint64_t spellingIssueCount = 0;
+        std::uint64_t maximumLineColumns = 0;
+        int horizontalOffset = 0;
+        int horizontalMaximumOffset = 0;
+        RECT caretRectangle{};
+        bool operationInProgress = false;
+        bool operationCompleted = false;
+        bool operationSucceeded = false;
+        std::wstring operationName;
+        std::wstring operationError;
+        std::wstring operationTargetPath;
+        std::uint64_t operationGeneration = 0;
+        std::uint64_t operationProgress = 0;
+        std::uint64_t operationResultCount = 0;
     };
 
     explicit ClassicNotepadApp(HINSTANCE instance);
@@ -126,6 +147,17 @@ public:
         std::uint64_t length,
         std::wstring& text,
         std::wstring& errorMessage) const;
+    bool AutomationSendLargeFileClick(int x, int y, bool shift);
+    bool AutomationSendLargeFileDrag(int startX, int startY, int endX, int endY);
+    bool AutomationSendLargeFileKey(UINT virtualKey, bool shift, bool control);
+    bool AutomationSendLargeFileHorizontalScroll(UINT command);
+    bool AutomationSendLargeFileText(const std::wstring& text);
+    bool AutomationStartLargeFileFind(const std::wstring& text, bool matchCase, bool wholeWord, bool forward,
+        std::wstring& errorMessage);
+    bool AutomationStartLargeFileReplaceAll(const std::wstring& text, const std::wstring& replacement,
+        bool matchCase, bool wholeWord, std::wstring& errorMessage);
+    void AutomationCancelLargeFileOperation();
+    bool AutomationStartLargeFileSave(const std::wstring& path, std::wstring& errorMessage);
 
 private:
     enum class ScrollBarOrientation {
@@ -250,6 +282,7 @@ private:
     void RunSpellCheckNow();
     void DrawSpellingUnderlines(HWND editorWindow);
     bool HandleEditorContextMenu(HWND editorWindow, LPARAM lParam);
+    bool HandleLargeFileContextMenu(POINT screenPoint, std::uint64_t position);
     void ShowSpellingUnavailableMessage();
     void ShowAboutDialog();
 
@@ -302,7 +335,7 @@ private:
     void DestroyOwnedMenuFont();
     void DestroyPrintDialogHandles();
     void HandleFindReplaceMessage(LPARAM lParam);
-    int ShowGoToDialog(int currentLine, int maxLine);
+    std::uint64_t ShowGoToDialog(std::uint64_t currentLine, std::uint64_t maxLine);
     void GoToLine(int lineNumber);
     std::wstring BuildTimeDateText() const;
     std::wstring ShowOpenFileDialog();
@@ -378,6 +411,7 @@ private:
     bool comInitialized_ = false;
     SpellCheckService spellChecker_;
     std::vector<SpellingErrorRange> spellingErrors_;
+    std::vector<LargeFileSpellingRange> largeFileSpellingErrors_;
     bool spellCheckAvailable_ = false;
     bool spellCheckMessageShown_ = false;
     UINT_PTR spellCheckTimerId_ = 0;

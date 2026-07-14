@@ -174,6 +174,8 @@ if(UNIX AND NOT APPLE)
             src/platform/linux/gtk_automation.h
             src/platform/linux/gtk_dialogs.cpp
             src/platform/linux/gtk_dialogs.h
+            src/platform/linux/gtk_large_file_view.cpp
+            src/platform/linux/gtk_large_file_view.h
             src/platform/linux/gtk_main.cpp
         )
 

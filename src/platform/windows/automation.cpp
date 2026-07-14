@@ -567,12 +567,14 @@ std::string BuildLargeFileStateObject(const ClassicNotepadApp::AutomationLargeFi
            << ",\"editable\":" << (state.editable ? "true" : "false")
            << ",\"modified\":" << (state.modified ? "true" : "false")
            << ",\"indexingComplete\":" << (state.indexingComplete ? "true" : "false")
+           << ",\"globalScrollReady\":" << (state.globalScrollReady ? "true" : "false")
            << ",\"encodingValid\":" << (state.encodingValid ? "true" : "false")
            << ",\"fileSize\":" << state.fileSize
            << ",\"indexedBytes\":" << state.indexedBytes
            << ",\"indexedLines\":" << state.indexedLines
            << ",\"totalLines\":" << state.totalLines
            << ",\"firstUsableMilliseconds\":" << state.firstUsableMilliseconds
+           << ",\"firstViewportPaintMilliseconds\":" << state.firstViewportPaintMilliseconds
            << ",\"fullIndexMilliseconds\":" << state.fullIndexMilliseconds
            << ",\"characterCount\":" << state.characterCount
            << ",\"caret\":" << state.caret
@@ -584,6 +586,29 @@ std::string BuildLargeFileStateObject(const ClassicNotepadApp::AutomationLargeFi
            << ",\"insertedBufferBytes\":" << state.insertedBufferBytes
            << ",\"saveProgressBytes\":" << state.saveProgressBytes
            << ",\"saveInProgress\":" << (state.saveInProgress ? "true" : "false")
+           << ",\"paintGeneration\":" << state.paintGeneration
+           << ",\"viewportGeneration\":" << state.viewportGeneration
+           << ",\"wordWrap\":" << (state.wordWrap ? "true" : "false")
+           << ",\"viewportVisualRows\":" << state.viewportVisualRows
+           << ",\"wrappedContinuationRows\":" << state.wrappedContinuationRows
+           << ",\"spellingIssueCount\":" << state.spellingIssueCount
+           << ",\"maximumLineColumns\":" << state.maximumLineColumns
+           << ",\"horizontalOffset\":" << state.horizontalOffset
+           << ",\"horizontalMaximumOffset\":" << state.horizontalMaximumOffset
+           << ",\"caretRectangle\":{"
+           << "\"left\":" << state.caretRectangle.left
+           << ",\"top\":" << state.caretRectangle.top
+           << ",\"right\":" << state.caretRectangle.right
+           << ",\"bottom\":" << state.caretRectangle.bottom << "}"
+           << ",\"operationInProgress\":" << (state.operationInProgress ? "true" : "false")
+           << ",\"operationCompleted\":" << (state.operationCompleted ? "true" : "false")
+           << ",\"operationSucceeded\":" << (state.operationSucceeded ? "true" : "false")
+           << ",\"operationName\":" << EscapeJsonString(state.operationName)
+           << ",\"operationError\":" << EscapeJsonString(state.operationError)
+           << ",\"operationTargetPath\":" << EscapeJsonString(state.operationTargetPath)
+           << ",\"operationGeneration\":" << state.operationGeneration
+           << ",\"operationProgress\":" << state.operationProgress
+           << ",\"operationResultCount\":" << state.operationResultCount
            << "}";
     return output.str();
 }
@@ -821,6 +846,108 @@ std::string HandleCommand(
         }
         ResponseWriter response(id, true);
         response.AddString("text", text);
+        return response.Finish();
+    }
+
+    if (name == L"sendLargeFileClick") {
+        const auto x = GetNumber(request, "x");
+        const auto y = GetNumber(request, "y");
+        if (!x.has_value() || !y.has_value() ||
+            !app.AutomationSendLargeFileClick(static_cast<int>(*x), static_cast<int>(*y), GetBool(request, "shift", false))) {
+            return BuildErrorResponse(id, L"Large-file click input could not be delivered.");
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("largeFile", BuildLargeFileStateObject(app.AutomationGetLargeFileState()));
+        return response.Finish();
+    }
+
+    if (name == L"sendLargeFileDrag") {
+        const auto startX = GetNumber(request, "startX");
+        const auto startY = GetNumber(request, "startY");
+        const auto endX = GetNumber(request, "endX");
+        const auto endY = GetNumber(request, "endY");
+        if (!startX.has_value() || !startY.has_value() || !endX.has_value() || !endY.has_value() ||
+            !app.AutomationSendLargeFileDrag(static_cast<int>(*startX), static_cast<int>(*startY),
+                static_cast<int>(*endX), static_cast<int>(*endY))) {
+            return BuildErrorResponse(id, L"Large-file drag input could not be delivered.");
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("largeFile", BuildLargeFileStateObject(app.AutomationGetLargeFileState()));
+        return response.Finish();
+    }
+
+    if (name == L"sendLargeFileKey") {
+        const auto key = GetNumber(request, "key");
+        if (!key.has_value() || *key < 0 || *key > 0xffff ||
+            !app.AutomationSendLargeFileKey(static_cast<UINT>(*key),
+                GetBool(request, "shift", false), GetBool(request, "control", false))) {
+            return BuildErrorResponse(id, L"Large-file key input could not be delivered.");
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("largeFile", BuildLargeFileStateObject(app.AutomationGetLargeFileState()));
+        return response.Finish();
+    }
+
+    if (name == L"sendLargeFileHorizontalScroll") {
+        const auto scrollCommand = GetNumber(request, "scrollCommand");
+        if (!scrollCommand.has_value() || *scrollCommand < 0 || *scrollCommand > SB_ENDSCROLL ||
+            !app.AutomationSendLargeFileHorizontalScroll(static_cast<UINT>(*scrollCommand))) {
+            return BuildErrorResponse(id, L"Large-file horizontal scroll input could not be delivered.");
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("largeFile", BuildLargeFileStateObject(app.AutomationGetLargeFileState()));
+        return response.Finish();
+    }
+
+    if (name == L"sendLargeFileText") {
+        std::wstring text;
+        if (!RequireString(request, "text", text, errorMessage) || !app.AutomationSendLargeFileText(text)) {
+            return BuildErrorResponse(id, errorMessage.empty() ? L"Large-file text input could not be delivered." : errorMessage);
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("largeFile", BuildLargeFileStateObject(app.AutomationGetLargeFileState()));
+        return response.Finish();
+    }
+
+    if (name == L"startLargeFileFind") {
+        std::wstring text;
+        if (!RequireString(request, "text", text, errorMessage) ||
+            !app.AutomationStartLargeFileFind(text, GetBool(request, "matchCase", false),
+                GetBool(request, "wholeWord", false), GetBool(request, "forward", true), errorMessage)) {
+            return BuildErrorResponse(id, errorMessage.empty() ? L"The asynchronous search could not start." : errorMessage);
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("largeFile", BuildLargeFileStateObject(app.AutomationGetLargeFileState()));
+        return response.Finish();
+    }
+
+    if (name == L"startLargeFileReplaceAll") {
+        std::wstring text;
+        std::wstring replacement;
+        if (!RequireString(request, "text", text, errorMessage) ||
+            !RequireString(request, "replacement", replacement, errorMessage) ||
+            !app.AutomationStartLargeFileReplaceAll(text, replacement,
+                GetBool(request, "matchCase", false), GetBool(request, "wholeWord", false), errorMessage)) {
+            return BuildErrorResponse(id, errorMessage.empty() ? L"The asynchronous Replace All could not start." : errorMessage);
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("largeFile", BuildLargeFileStateObject(app.AutomationGetLargeFileState()));
+        return response.Finish();
+    }
+
+    if (name == L"cancelLargeFileOperation") {
+        app.AutomationCancelLargeFileOperation();
+        return ResponseWriter(id, true).Finish();
+    }
+
+    if (name == L"startLargeFileSave") {
+        std::wstring path;
+        if (!RequireString(request, "path", path, errorMessage) ||
+            !app.AutomationStartLargeFileSave(path, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage.empty() ? L"The asynchronous save could not start." : errorMessage);
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("largeFile", BuildLargeFileStateObject(app.AutomationGetLargeFileState()));
         return response.Finish();
     }
 
@@ -1219,9 +1346,7 @@ int WindowsAutomationController::Run()
 {
     bool shouldClose = false;
     std::wstring testClipboard;
-    std::string line;
-
-    while (!shouldClose && std::getline(std::cin, line)) {
+    const auto processLine = [&](const std::string& line) {
         JsonObject request;
         std::string parseError;
         std::string response;
@@ -1235,6 +1360,47 @@ int WindowsAutomationController::Run()
 
         std::cout << response << '\n';
         std::cout.flush();
+    };
+
+    HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    if (input == nullptr || input == INVALID_HANDLE_VALUE || GetFileType(input) != FILE_TYPE_PIPE) {
+        std::string line;
+        while (!shouldClose && std::getline(std::cin, line)) processLine(line);
+        return 0;
+    }
+
+    std::string pending;
+    while (!shouldClose) {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            if (message.message == WM_QUIT) {
+                shouldClose = true;
+                break;
+            }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        if (shouldClose) break;
+
+        DWORD available = 0;
+        if (!PeekNamedPipe(input, nullptr, 0, nullptr, &available, nullptr)) break;
+        if (available == 0U) {
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, 10, QS_ALLINPUT);
+            continue;
+        }
+        char buffer[4096];
+        DWORD read = 0;
+        if (!ReadFile(input, buffer, std::min<DWORD>(available, sizeof(buffer)), &read, nullptr) || read == 0U) break;
+        pending.append(buffer, buffer + read);
+        for (;;) {
+            const std::size_t newline = pending.find('\n');
+            if (newline == std::string::npos) break;
+            std::string line = pending.substr(0, newline);
+            pending.erase(0, newline + 1U);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            processLine(line);
+            if (shouldClose) break;
+        }
     }
 
     return 0;

@@ -98,6 +98,7 @@ CLASSIC_NOTEPAD_THEME=dark ./build-ubuntu/ClassicNotepadGtk
 
 ## Current Linux Capability Notes
 
+- Files at or above 48 MiB use the mapped, virtualized large-document view rather than materializing the source in `GtkTextBuffer`. Automation exposes bounded `getLargeFileState` and `getLargeFileTextRange` diagnostics, and `tests/automation/test_large_file_mode.py` verifies Linux edit/undo/save/reopen behavior with a real 48 MiB fixture.
 - File/edit/find/replace/go-to/format/view/status/printing workflows are covered by the shared automation suite.
 - Linux spell checking is available when CMake finds `libspelling-1` and Ubuntu has the GB Hunspell dictionary installed. If the backend or dictionary is absent, `getCapabilities` reports a non-available `spellCapability`, and spelling commands return graceful unavailable responses.
 - Linux dark mode is available through the shared appearance state. `getCapabilities` reports `appearanceTheme`, `effectiveAppearance`, `darkMode`, and `highContrast`; high-contrast GTK themes suppress custom light/dark colors.

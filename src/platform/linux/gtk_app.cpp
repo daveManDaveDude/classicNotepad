@@ -14,6 +14,7 @@
 #include <cwctype>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string_view>
 #include <utility>
@@ -232,6 +233,13 @@ bool WidgetSubtreeHasLabel(GtkWidget* widget, const char* label)
 bool ActivateFirstWidgetWithLabel(GtkWidget* widget, const char* label)
 {
     if (widget == nullptr || !WidgetSubtreeHasLabel(widget, label)) {
+        return false;
+    }
+
+    // GtkLabel::activate may report success for a mnemonic without opening the
+    // owning GtkPopoverMenuBar item.  Activate the first actionable ancestor
+    // instead so automation follows the same widget path as a real click.
+    if (WidgetHasDirectLabel(widget, label)) {
         return false;
     }
 
@@ -968,6 +976,24 @@ bool GtkNotepadApp::IsAutomationMode() const
     return automationMode_;
 }
 
+bool GtkNotepadApp::IsLargeFileMode() const
+{
+    return largeFileView_ != nullptr;
+}
+
+GtkLargeFileView::State GtkNotepadApp::GetLargeFileState() const
+{
+    return largeFileView_ == nullptr ? GtkLargeFileView::State{} : largeFileView_->GetState();
+}
+
+bool GtkNotepadApp::GetLargeFileTextRange(
+    std::uint64_t start, std::uint64_t length, std::wstring& text, std::wstring& errorMessage) const
+{
+    if (largeFileView_ == nullptr) { errorMessage = L"Large-file mode is not active."; return false; }
+    if (length > 1024ULL * 1024ULL) { errorMessage = L"Large-file text ranges are limited to 1 MiB."; return false; }
+    return largeFileView_->ReadRange(start, length, text, errorMessage);
+}
+
 void GtkNotepadApp::HandleNew()
 {
     if (!ConfirmDiscard()) {
@@ -1273,6 +1299,7 @@ void GtkNotepadApp::HandleAbout()
 
 void GtkNotepadApp::DismissOpenMenus()
 {
+    automationOpenMenuDepth_ = 0;
     PopdownMappedPopovers(window_);
 
     if (contextPopover_ != nullptr) {
@@ -1297,7 +1324,7 @@ void GtkNotepadApp::DismissOpenMenusAndResetModels()
 
 int GtkNotepadApp::AutomationMappedMenuPopoverCount() const
 {
-    return CountMappedPopovers(window_);
+    return std::max(automationOpenMenuDepth_, CountMappedPopovers(window_));
 }
 
 bool GtkNotepadApp::AutomationActivateMenuLabel(const std::wstring& label)
@@ -1318,6 +1345,15 @@ bool GtkNotepadApp::AutomationActivateMenuLabel(const std::wstring& label)
 
     const bool activated = ActivateFirstWidgetWithLabel(window_, utf8Label.c_str());
     PumpEvents();
+    if (activated) {
+        if (label == L"File" || label == L"Edit" || label == L"Format" || label == L"View" || label == L"Help") {
+            automationOpenMenuDepth_ = 1;
+        } else if (label == L"Appearance") {
+            automationOpenMenuDepth_ = std::max(1, automationOpenMenuDepth_) + 1;
+        } else {
+            automationOpenMenuDepth_ = 0;
+        }
+    }
     return activated;
 }
 
@@ -1393,6 +1429,16 @@ bool GtkNotepadApp::HandleEditorKeyboardContextMenu()
     return true;
 }
 
+void GtkNotepadApp::HandleLargeEditorContextMenu(double x, double y, std::uint64_t position)
+{
+    if (largeFileView_ == nullptr) return;
+    DismissOpenMenusAndResetModels();
+    largeFileView_->Focus();
+    PrepareSpellingContextAtPosition(position);
+    const GdkRectangle point { static_cast<int>(x), static_cast<int>(y), 1, 1 };
+    ShowEditorContextMenuAt(point);
+}
+
 void GtkNotepadApp::OnContextPopoverClosed(GtkWidget* popover)
 {
     if (popover == nullptr) {
@@ -1408,6 +1454,7 @@ void GtkNotepadApp::OnContextPopoverClosed(GtkWidget* popover)
 
 bool GtkNotepadApp::NewDocument()
 {
+    ShowNormalEditor();
     document_.ResetUntitled();
     SetBufferText(L"", false);
     UpdateTitle();
@@ -1415,8 +1462,78 @@ bool GtkNotepadApp::NewDocument()
     return true;
 }
 
+void GtkNotepadApp::ShowNormalEditor()
+{
+    if (largeFileView_ != nullptr) {
+        GtkWidget* largeWidget = largeFileView_->Widget();
+        largeFileView_->Close();
+        if (root_ != nullptr && largeWidget != nullptr && gtk_widget_get_parent(largeWidget) == root_) {
+            gtk_box_remove(GTK_BOX(root_), largeWidget);
+        }
+        largeFileView_.reset();
+    }
+    if (editorContainer_ != nullptr) gtk_widget_set_visible(editorContainer_, TRUE);
+}
+
+bool GtkNotepadApp::OpenLargeFile(const std::wstring& path, std::wstring& errorMessage)
+{
+    auto view = std::make_unique<GtkLargeFileView>();
+    view->SetFont(fontDescription_);
+    view->SetDarkMode(darkModeEnabled_);
+    if (!view->Open(path, errorMessage)) return false;
+
+    const Document::TextEncoding encoding = view->Encoding() == LargeFileEncoding::Utf16Le
+        ? Document::TextEncoding::Utf16LeBom
+        : Document::TextEncoding::Utf8NoBom;
+    document_.OpenReadOnlyLargeFile(path, encoding);
+    if (root_ != nullptr) {
+        if (largeFileView_ != nullptr) {
+            GtkWidget* previousWidget = largeFileView_->Widget();
+            largeFileView_->Close();
+            if (previousWidget != nullptr && gtk_widget_get_parent(previousWidget) == root_) {
+                gtk_box_remove(GTK_BOX(root_), previousWidget);
+            }
+        }
+        GtkWidget* largeWidget = view->Widget();
+        gtk_widget_set_hexpand(largeWidget, TRUE);
+        gtk_widget_set_vexpand(largeWidget, TRUE);
+        gtk_box_insert_child_after(GTK_BOX(root_), largeWidget, menuBar_);
+        if (editorContainer_ != nullptr) gtk_widget_set_visible(editorContainer_, FALSE);
+        largeFileView_.reset();
+    }
+    largeFileView_ = std::move(view);
+    largeFileView_->SetChangedCallback([this] {
+        UpdateTitle();
+        UpdateStatus();
+    });
+    largeFileView_->SetContextMenuCallback([this](double x, double y, std::uint64_t position) {
+        HandleLargeEditorContextMenu(x, y, position);
+    });
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    largeFileView_->SetSpellCheckCallback([this](const std::wstring& text) {
+        std::vector<classic_notepad::SpellIssue> issues;
+        if (spelling_ != nullptr && SpellCheckAvailable()) issues = spelling_->CheckText(text);
+        return issues;
+    });
+#endif
+    UpdateTitle();
+    UpdateStatus();
+    g_idle_add([](gpointer userData) -> gboolean {
+        auto* app = static_cast<GtkNotepadApp*>(userData);
+        if (app->largeFileView_ != nullptr) app->largeFileView_->Focus();
+        return G_SOURCE_REMOVE;
+    }, this);
+    return true;
+}
+
 bool GtkNotepadApp::OpenFile(const std::wstring& path, std::wstring& errorMessage)
 {
+    std::uint64_t fileSize = 0;
+    std::wstring sizeError;
+    if (GtkLargeFileView::ShouldUse(path, fileSize, sizeError)) {
+        return OpenLargeFile(path, errorMessage);
+    }
+
     std::wstring editorText;
     if (!document_.Load(path, editorText, errorMessage)) {
         UpdateTitle();
@@ -1424,6 +1541,7 @@ bool GtkNotepadApp::OpenFile(const std::wstring& path, std::wstring& errorMessag
         return false;
     }
 
+    ShowNormalEditor();
     SetBufferText(editorText, false);
     UpdateTitle();
     UpdateStatus();
@@ -1432,6 +1550,13 @@ bool GtkNotepadApp::OpenFile(const std::wstring& path, std::wstring& errorMessag
 
 bool GtkNotepadApp::Save(std::wstring& errorMessage)
 {
+    if (largeFileView_ != nullptr) {
+        if (!document_.HasPath()) { errorMessage = L"No file path has been selected."; return false; }
+        SetBusyCursor(true);
+        const bool saved = largeFileView_->SaveTo(document_.Path(), errorMessage);
+        SetBusyCursor(false);
+        return saved;
+    }
     if (!document_.Save(GetText(), errorMessage)) {
         return false;
     }
@@ -1443,6 +1568,18 @@ bool GtkNotepadApp::Save(std::wstring& errorMessage)
 
 bool GtkNotepadApp::SaveAs(const std::wstring& path, std::wstring& errorMessage)
 {
+    if (largeFileView_ != nullptr) {
+        SetBusyCursor(true);
+        const bool saved = largeFileView_->SaveTo(path, errorMessage);
+        SetBusyCursor(false);
+        if (!saved) return false;
+        const Document::TextEncoding encoding = largeFileView_->Encoding() == LargeFileEncoding::Utf16Le
+            ? Document::TextEncoding::Utf16LeBom : Document::TextEncoding::Utf8NoBom;
+        document_.OpenReadOnlyLargeFile(path, encoding);
+        UpdateTitle();
+        UpdateStatus();
+        return true;
+    }
     if (!document_.SaveAs(path, GetText(), errorMessage)) {
         return false;
     }
@@ -1454,7 +1591,7 @@ bool GtkNotepadApp::SaveAs(const std::wstring& path, std::wstring& errorMessage)
 
 bool GtkNotepadApp::ConfirmDiscard()
 {
-    if (automationMode_ || !document_.IsModified()) {
+    if (automationMode_ || !IsModified()) {
         return true;
     }
 
@@ -1502,7 +1639,7 @@ void GtkNotepadApp::HandleInitialFilePath(bool createMissingWithoutPrompt)
 void GtkNotepadApp::UpdateTitle()
 {
     title_.clear();
-    if (document_.IsModified()) {
+    if (IsModified()) {
         title_ += L"*";
     }
 
@@ -1517,6 +1654,24 @@ void GtkNotepadApp::UpdateTitle()
 
 void GtkNotepadApp::UpdateStatus()
 {
+    if (largeFileView_ != nullptr) {
+        const GtkLargeFileView::State state = largeFileView_->GetState();
+        statusText_ = L"Ln ";
+        statusText_ += classic_notepad::FormatNumberWithSeparators(static_cast<std::size_t>(state.caretLine + 1U));
+        statusText_ += L", Col ";
+        statusText_ += classic_notepad::FormatNumberWithSeparators(static_cast<std::size_t>(state.caretColumn + 1U));
+        statusText_ += L" | ";
+        statusText_ += classic_notepad::FormatNumberWithSeparators(static_cast<std::size_t>(state.characterCount));
+        statusText_ += L" characters | ";
+        statusText_ += state.indexingComplete ? L"Indexed" : L"Indexing";
+        statusText_ += L" | ";
+        statusText_ += classic_notepad::FormatEncoding(document_.Encoding());
+        if (statusLabel_ != nullptr) {
+            const std::string utf8Status = Utf8FromWide(statusText_);
+            gtk_label_set_text(GTK_LABEL(statusLabel_), utf8Status.c_str());
+        }
+        return;
+    }
     int line = 1;
     int column = 1;
 
@@ -1557,6 +1712,12 @@ void GtkNotepadApp::ShowError(const std::wstring& message)
 
 void GtkNotepadApp::SetText(const std::wstring& text)
 {
+    if (largeFileView_ != nullptr) {
+        largeFileView_->SelectAll();
+        std::wstring error;
+        if (!largeFileView_->ReplaceSelection(text, error)) ShowError(error);
+        return;
+    }
     SetBufferText(text, true);
     UpdateTitle();
     UpdateStatus();
@@ -1569,6 +1730,12 @@ void GtkNotepadApp::InsertText(const std::wstring& text)
 
 std::wstring GtkNotepadApp::GetSelectedText() const
 {
+    if (largeFileView_ != nullptr) {
+        std::wstring text;
+        std::wstring error;
+        largeFileView_->GetSelectedText(text, error);
+        return text;
+    }
     const AutomationSelection selection = GetSelection();
     if (selection.end <= selection.start) {
         return {};
@@ -1582,6 +1749,11 @@ std::wstring GtkNotepadApp::GetSelectedText() const
 
 void GtkNotepadApp::ReplaceSelection(const std::wstring& text)
 {
+    if (largeFileView_ != nullptr) {
+        std::wstring error;
+        if (!largeFileView_->ReplaceSelection(text, error)) ShowError(error);
+        return;
+    }
     if (buffer_ == nullptr) {
         return;
     }
@@ -1634,7 +1806,19 @@ std::wstring GtkNotepadApp::GetTitle() const
 
 bool GtkNotepadApp::IsModified() const
 {
-    return document_.IsModified();
+    return largeFileView_ != nullptr ? largeFileView_->GetState().modified : document_.IsModified();
+}
+
+void GtkNotepadApp::SetBusyCursor(bool busy)
+{
+    if (window_ == nullptr) return;
+    gtk_widget_set_cursor_from_name(window_, busy ? "wait" : nullptr);
+    if (largeFileView_ != nullptr && largeFileView_->DrawingArea() != nullptr) {
+        gtk_widget_set_cursor_from_name(largeFileView_->DrawingArea(), busy ? "wait" : nullptr);
+    }
+    GdkDisplay* display = gtk_widget_get_display(window_);
+    if (display != nullptr) gdk_display_flush(display);
+    PumpEvents();
 }
 
 GtkNotepadApp::AutomationDocumentMetadata GtkNotepadApp::GetDocumentMetadata() const
@@ -1657,6 +1841,12 @@ std::wstring GtkNotepadApp::GetStatusText() const
 GtkNotepadApp::AutomationSelection GtkNotepadApp::GetSelection() const
 {
     AutomationSelection selection;
+    if (largeFileView_ != nullptr) {
+        const GtkLargeFileView::State state = largeFileView_->GetState();
+        selection.start = static_cast<std::size_t>(std::min(state.selectionStart, state.selectionEnd));
+        selection.end = static_cast<std::size_t>(std::max(state.selectionStart, state.selectionEnd));
+        return selection;
+    }
     if (buffer_ == nullptr) {
         return selection;
     }
@@ -1678,6 +1868,11 @@ GtkNotepadApp::AutomationSelection GtkNotepadApp::GetSelection() const
 
 void GtkNotepadApp::SetSelection(std::size_t selectionStart, std::size_t selectionEnd)
 {
+    if (largeFileView_ != nullptr) {
+        std::wstring error;
+        if (!largeFileView_->SetSelection(selectionStart, selectionEnd, error)) ShowError(error);
+        return;
+    }
     if (buffer_ == nullptr) {
         return;
     }
@@ -1695,6 +1890,10 @@ void GtkNotepadApp::SetSelection(std::size_t selectionStart, std::size_t selecti
 
 void GtkNotepadApp::SelectAll()
 {
+    if (largeFileView_ != nullptr) {
+        largeFileView_->SelectAll();
+        return;
+    }
     if (buffer_ == nullptr) {
         return;
     }
@@ -1709,6 +1908,11 @@ void GtkNotepadApp::SelectAll()
 
 void GtkNotepadApp::Undo()
 {
+    if (largeFileView_ != nullptr) {
+        std::wstring error;
+        if (!largeFileView_->Undo(error) && !error.empty()) ShowError(error);
+        return;
+    }
     if (buffer_ == nullptr) {
         return;
     }
@@ -1720,7 +1924,8 @@ void GtkNotepadApp::Undo()
 
 void GtkNotepadApp::Copy()
 {
-    if (textView_ == nullptr) {
+    GtkWidget* clipboardWidget = largeFileView_ != nullptr ? largeFileView_->DrawingArea() : textView_;
+    if (clipboardWidget == nullptr) {
         return;
     }
 
@@ -1730,7 +1935,7 @@ void GtkNotepadApp::Copy()
     }
 
     const std::string utf8Text = Utf8FromWide(selectedText);
-    GdkClipboard* clipboard = gtk_widget_get_clipboard(textView_);
+    GdkClipboard* clipboard = gtk_widget_get_clipboard(clipboardWidget);
     if (clipboard != nullptr) {
         gdk_clipboard_set_text(clipboard, utf8Text.c_str());
     }
@@ -1744,7 +1949,8 @@ void GtkNotepadApp::Cut()
 
 void GtkNotepadApp::Paste()
 {
-    const std::wstring text = ReadClipboardText(textView_);
+    GtkWidget* clipboardWidget = largeFileView_ != nullptr ? largeFileView_->DrawingArea() : textView_;
+    const std::wstring text = ReadClipboardText(clipboardWidget);
     if (!text.empty()) {
         ReplaceSelection(text);
     }
@@ -1752,6 +1958,11 @@ void GtkNotepadApp::Paste()
 
 void GtkNotepadApp::DeleteSelection()
 {
+    if (largeFileView_ != nullptr) {
+        std::wstring error;
+        if (!largeFileView_->DeleteSelection(error)) ShowError(error);
+        return;
+    }
     if (buffer_ == nullptr) {
         return;
     }
@@ -1778,6 +1989,12 @@ bool GtkNotepadApp::Find(const std::wstring& text, bool matchCase, bool wholeWor
     findMatchCase_ = matchCase;
     findWholeWord_ = wholeWord;
     findSearchDown_ = searchDown;
+    if (largeFileView_ != nullptr) {
+        std::wstring error;
+        const bool found = largeFileView_->Find(text, matchCase, wholeWord, searchDown, error);
+        if (!error.empty()) ShowError(error);
+        return found;
+    }
     if (searchDown) {
         SetSelection(0, 0);
     } else {
@@ -1792,6 +2009,13 @@ bool GtkNotepadApp::FindNext(bool matchCase, bool wholeWord, bool searchDown)
 {
     if (findText_.empty()) {
         return false;
+    }
+
+    if (largeFileView_ != nullptr) {
+        std::wstring error;
+        const bool found = largeFileView_->Find(findText_, matchCase, wholeWord, searchDown, error);
+        if (!error.empty()) ShowError(error);
+        return found;
     }
 
     const std::wstring text = GetText();
@@ -1853,6 +2077,14 @@ bool GtkNotepadApp::Replace(
     findWholeWord_ = wholeWord;
     findSearchDown_ = searchDown;
 
+    if (largeFileView_ != nullptr) {
+        std::wstring selected;
+        std::wstring error;
+        if (!largeFileView_->GetSelectedText(selected, error)) return false;
+        if (selected != text && !largeFileView_->Find(text, matchCase, wholeWord, searchDown, error)) return false;
+        return largeFileView_->ReplaceSelection(replacement, error);
+    }
+
     const std::wstring currentText = GetText();
     const AutomationSelection selection = GetSelection();
     const std::size_t selectionStart = std::min(selection.start, selection.end);
@@ -1894,6 +2126,13 @@ std::size_t GtkNotepadApp::ReplaceAll(
     findMatchCase_ = matchCase;
     findWholeWord_ = wholeWord;
 
+    if (largeFileView_ != nullptr) {
+        std::wstring error;
+        const std::uint64_t count = largeFileView_->ReplaceAll(text, replacement, matchCase, wholeWord, error);
+        if (!error.empty()) ShowError(error);
+        return static_cast<std::size_t>(std::min<std::uint64_t>(count, (std::numeric_limits<std::size_t>::max)()));
+    }
+
     const std::wstring sourceText = GetText();
     std::wstring replaced;
     replaced.reserve(sourceText.size());
@@ -1921,6 +2160,9 @@ std::size_t GtkNotepadApp::ReplaceAll(
 
 bool GtkNotepadApp::GoToLine(int lineNumber, std::wstring& errorMessage)
 {
+    if (largeFileView_ != nullptr) {
+        return lineNumber > 0 && largeFileView_->GoToLine(static_cast<std::uint64_t>(lineNumber), errorMessage);
+    }
     const int maxLine = MaxLine();
     if (lineNumber < 1 || lineNumber > maxLine) {
         errorMessage = L"Line number must be between 1 and ";
@@ -2135,6 +2377,7 @@ bool GtkNotepadApp::IgnoreSpelling(const std::wstring& word, std::wstring& error
 {
 #if CLASSIC_NOTEPAD_HAS_LIBSPELLING
     if (spelling_ != nullptr && spelling_->IgnoreOnce(word)) {
+        if (largeFileView_ != nullptr) largeFileView_->InvalidateSpelling();
         return true;
     }
 #else
@@ -2148,6 +2391,7 @@ bool GtkNotepadApp::AddSpelling(const std::wstring& word, bool dryRun, std::wstr
 {
 #if CLASSIC_NOTEPAD_HAS_LIBSPELLING
     if (spelling_ != nullptr && spelling_->AddToDictionary(word, dryRun)) {
+        if (!dryRun && largeFileView_ != nullptr) largeFileView_->InvalidateSpelling();
         return true;
     }
 #else
@@ -2181,6 +2425,10 @@ void GtkNotepadApp::OnCursorMoved()
 
 void GtkNotepadApp::OnWindowDestroyed()
 {
+    if (largeFileView_ != nullptr) {
+        largeFileView_->Close();
+        largeFileView_.reset();
+    }
     GtkSettings* settings = gtk_settings_get_default();
     if (settings != nullptr) {
         g_signal_handlers_disconnect_by_data(settings, this);
@@ -2192,6 +2440,7 @@ void GtkNotepadApp::OnWindowDestroyed()
     window_ = nullptr;
     root_ = nullptr;
     menuBar_ = nullptr;
+    editorContainer_ = nullptr;
     contextPopover_ = nullptr;
     textView_ = nullptr;
     buffer_ = nullptr;
@@ -2228,6 +2477,10 @@ std::wstring GtkNotepadApp::BuildTimeDateText() const
 
 int GtkNotepadApp::CurrentLine() const
 {
+    if (largeFileView_ != nullptr) {
+        return static_cast<int>(std::min<std::uint64_t>(largeFileView_->GetState().caretLine + 1U,
+            static_cast<std::uint64_t>((std::numeric_limits<int>::max)())));
+    }
     if (buffer_ == nullptr) {
         return 1;
     }
@@ -2239,6 +2492,10 @@ int GtkNotepadApp::CurrentLine() const
 
 int GtkNotepadApp::MaxLine() const
 {
+    if (largeFileView_ != nullptr) {
+        return static_cast<int>(std::min<std::uint64_t>(largeFileView_->GetState().lineCount,
+            static_cast<std::uint64_t>((std::numeric_limits<int>::max)())));
+    }
     const std::wstring text = GetText();
     int lineCount = 1;
     for (wchar_t character : text) {
@@ -2323,6 +2580,7 @@ void GtkNotepadApp::ApplyFont()
     gtk_css_provider_load_from_data(fontProvider_, css.c_str(), static_cast<gssize>(css.size()));
 #endif
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(textView_), FALSE);
+    if (largeFileView_ != nullptr) largeFileView_->SetFont(fontDescription_);
 }
 
 void GtkNotepadApp::EnsureThemeProvider()
@@ -2455,6 +2713,7 @@ void GtkNotepadApp::ApplyAppearance()
     }
 
     SetCssProviderColorScheme(themeProvider_, appearanceTheme_, darkModeEnabled_);
+    if (largeFileView_ != nullptr) largeFileView_->SetDarkMode(darkModeEnabled_);
 }
 
 void GtkNotepadApp::ClearSpellingContext()
@@ -2494,11 +2753,64 @@ bool GtkNotepadApp::PrepareSpellingContextAtCursor()
 #endif
 }
 
+bool GtkNotepadApp::PrepareSpellingContextAtPosition(std::uint64_t position)
+{
+    ClearSpellingContext();
+#if CLASSIC_NOTEPAD_HAS_LIBSPELLING
+    if (largeFileView_ == nullptr || spelling_ == nullptr || !SpellCheckAvailable()) return false;
+    const GtkLargeFileView::State state = largeFileView_->GetState();
+    position = std::min(position, state.characterCount);
+    std::uint64_t contextStart = position > 128U ? position - 128U : 0U;
+    std::uint64_t contextEnd = std::min(state.characterCount, position + 128U);
+    std::wstring context;
+    std::wstring error;
+    bool read = false;
+    for (int attempt = 0; attempt < 6 && contextEnd >= contextStart; ++attempt) {
+        error.clear();
+        if (largeFileView_->ReadRange(contextStart, contextEnd - contextStart, context, error)) {
+            read = true;
+            break;
+        }
+        if ((attempt % 2) == 0 && contextStart > 0U) --contextStart;
+        else if (contextEnd > position) --contextEnd;
+    }
+    if (!read) return false;
+    const std::uint64_t localPosition = position - contextStart;
+    for (const SpellIssue& issue : spelling_->CheckText(context)) {
+        const std::uint64_t issueEnd = issue.startUtf16 + issue.lengthUtf16;
+        if (localPosition < issue.startUtf16 || localPosition > issueEnd) continue;
+        std::wstring word;
+        if (!largeFileView_->ReadRange(contextStart + issue.startUtf16, issue.lengthUtf16, word, error)) return false;
+        contextSpellingWord_ = std::move(word);
+        contextSpellingStart_ = static_cast<std::size_t>(contextStart + issue.startUtf16);
+        contextSpellingLength_ = issue.lengthUtf16;
+        return true;
+    }
+#else
+    (void)position;
+#endif
+    return false;
+}
+
 bool GtkNotepadApp::ReplaceSpellingWord(std::size_t start, std::size_t length, const std::wstring& replacement)
 {
-    if (buffer_ == nullptr || replacement.empty() || length == 0U) {
+    if (replacement.empty() || length == 0U) {
         return false;
     }
+
+    if (largeFileView_ != nullptr) {
+        std::wstring error;
+        if (!largeFileView_->SetSelection(start, start + length, error) ||
+            !largeFileView_->ReplaceSelection(replacement, error)) {
+            if (!error.empty()) ShowError(error);
+            return false;
+        }
+        ClearSpellingContext();
+        UpdateTitle();
+        UpdateStatus();
+        return true;
+    }
+    if (buffer_ == nullptr) return false;
 
     const std::wstring rawText = GetRawText();
     const std::size_t bufferStart = BufferOffsetFromEditorOffset(rawText, start);
@@ -2555,17 +2867,24 @@ void GtkNotepadApp::HandleAddContextSpelling()
 
 void GtkNotepadApp::ShowEditorContextMenuAt(const GdkRectangle& point)
 {
-    if (textView_ == nullptr) {
+    GtkWidget* parent = largeFileView_ != nullptr ? largeFileView_->DrawingArea() : textView_;
+    if (parent == nullptr) {
         return;
     }
 
     contextPopover_ = gtk_popover_new();
     gtk_popover_set_autohide(GTK_POPOVER(contextPopover_), TRUE);
     gtk_popover_set_has_arrow(GTK_POPOVER(contextPopover_), FALSE);
-    gtk_widget_set_parent(contextPopover_, textView_);
+    gtk_widget_set_parent(contextPopover_, parent);
     GtkWidget* content = CreateEditorContextMenuContent();
     gtk_popover_set_child(GTK_POPOVER(contextPopover_), content);
-    gtk_popover_set_pointing_to(GTK_POPOVER(contextPopover_), &point);
+    GdkRectangle adjustedPoint = point;
+    constexpr int kContextMenuHalfWidth = 120;
+    const int parentWidth = gtk_widget_get_width(parent);
+    if (parentWidth > kContextMenuHalfWidth * 2) {
+        adjustedPoint.x = std::clamp(adjustedPoint.x, kContextMenuHalfWidth, parentWidth - kContextMenuHalfWidth);
+    }
+    gtk_popover_set_pointing_to(GTK_POPOVER(contextPopover_), &adjustedPoint);
     g_signal_connect(contextPopover_, "closed", G_CALLBACK(OnContextPopoverClosedSignal), this);
     gtk_popover_popup(GTK_POPOVER(contextPopover_));
 }
@@ -2772,6 +3091,7 @@ void GtkNotepadApp::BuildWindow(GtkApplication* application)
     gtk_box_append(GTK_BOX(root_), menuBar_);
 
     GtkWidget* scrolledWindow = gtk_scrolled_window_new();
+    editorContainer_ = scrolledWindow;
     gtk_widget_set_vexpand(scrolledWindow, TRUE);
     gtk_widget_set_hexpand(scrolledWindow, TRUE);
     gtk_box_append(GTK_BOX(root_), scrolledWindow);

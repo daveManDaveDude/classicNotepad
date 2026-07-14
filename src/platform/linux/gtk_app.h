@@ -3,6 +3,7 @@
 #include "appearance.h"
 #include "document.h"
 #include "spelling.h"
+#include "gtk_large_file_view.h"
 
 #include <gtk/gtk.h>
 
@@ -70,6 +71,9 @@ public:
     GtkTextBuffer* Buffer() const;
     GtkWidget* TextView() const;
     bool IsAutomationMode() const;
+    bool IsLargeFileMode() const;
+    GtkLargeFileView::State GetLargeFileState() const;
+    bool GetLargeFileTextRange(std::uint64_t start, std::uint64_t length, std::wstring& text, std::wstring& errorMessage) const;
 
     void HandleNew();
     void HandleOpen();
@@ -100,6 +104,7 @@ public:
     void HandleWindowPress(double x, double y);
     void HandleEditorPress(GtkGestureClick* gesture, unsigned int button, double x, double y);
     bool HandleEditorKeyboardContextMenu();
+    void HandleLargeEditorContextMenu(double x, double y, std::uint64_t position);
     void OnContextPopoverClosed(GtkWidget* popover);
     void HandleReplaceSpellingSuggestion(std::size_t suggestionIndex);
     void HandleIgnoreContextSpelling();
@@ -115,6 +120,7 @@ public:
     void UpdateTitle();
     void UpdateStatus();
     void ShowError(const std::wstring& message);
+    void SetBusyCursor(bool busy);
 
     void SetText(const std::wstring& text);
     void InsertText(const std::wstring& text);
@@ -172,6 +178,8 @@ private:
     void BuildWindow(GtkApplication* application);
     void SetBufferText(const std::wstring& text, bool markModified);
     void SetInitialTitleAndStatus();
+    void ShowNormalEditor();
+    bool OpenLargeFile(const std::wstring& path, std::wstring& errorMessage);
     bool MissingFilePath(const std::wstring& path) const;
     std::wstring SuggestedSaveName() const;
     std::wstring GetRawText() const;
@@ -190,6 +198,7 @@ private:
     GtkWidget* CreateEditorContextMenuContent();
     void ShowEditorContextMenuAt(const GdkRectangle& point);
     bool PrepareSpellingContextAtCursor();
+    bool PrepareSpellingContextAtPosition(std::uint64_t position);
     void ClearSpellingContext();
     bool ReplaceSpellingWord(std::size_t start, std::size_t length, const std::wstring& replacement);
     GtkPageSetup* EnsurePageSetup();
@@ -215,6 +224,7 @@ private:
     GtkWidget* window_ = nullptr;
     GtkWidget* root_ = nullptr;
     GtkWidget* menuBar_ = nullptr;
+    GtkWidget* editorContainer_ = nullptr;
     GtkWidget* textView_ = nullptr;
     GtkWidget* contextPopover_ = nullptr;
     GMenuModel* contextMenuModel_ = nullptr;
@@ -225,6 +235,7 @@ private:
     GtkCssProvider* themeProvider_ = nullptr;
     GtkPageSetup* pageSetup_ = nullptr;
     GtkPrintSettings* printSettings_ = nullptr;
+    std::unique_ptr<GtkLargeFileView> largeFileView_;
 
 #if CLASSIC_NOTEPAD_HAS_LIBSPELLING
     std::unique_ptr<GtkSpellingService> spelling_;
@@ -238,6 +249,7 @@ private:
     classic_notepad::AppearanceTheme appearanceTheme_ = classic_notepad::AppearanceTheme::System;
     bool darkModeEnabled_ = false;
     bool highContrastThemeActive_ = false;
+    int automationOpenMenuDepth_ = 0;
     AutomationPageMargins pageMargins_;
 };
 

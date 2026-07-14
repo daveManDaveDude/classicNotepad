@@ -1,5 +1,6 @@
 #include "large_file_index.h"
 
+#include <algorithm>
 #include <limits>
 
 namespace classic_notepad {
@@ -54,13 +55,19 @@ bool LargeFileLineScanner::FeedCharacter(
     std::vector<std::uint64_t>& lineOffsets,
     std::vector<std::uint64_t>* lineCharacterOffsets)
 {
+    const auto finishLine = [this]() {
+        maximumLineColumns_ = std::max(maximumLineColumns_, currentLineColumns_);
+        currentLineColumns_ = 0;
+    };
     if (pendingCr_) {
         if (character == static_cast<std::uint32_t>('\n')) {
             ++crlfCount_;
             pendingCr_ = false;
+            finishLine();
             return AppendLineOffset(characterEnd, lineOffsets, lineCharacterOffsets);
         }
         ++crCount_;
+        finishLine();
         if (!AppendLineOffset(pendingCrEnd_, lineOffsets, lineCharacterOffsets)) {
             return false;
         }
@@ -72,7 +79,14 @@ bool LargeFileLineScanner::FeedCharacter(
         pendingCrEnd_ = characterEnd;
     } else if (character == static_cast<std::uint32_t>('\n')) {
         ++lfCount_;
+        finishLine();
         return AppendLineOffset(characterEnd, lineOffsets, lineCharacterOffsets);
+    } else {
+        const std::uint64_t units = character > 0xFFFFU ? 2U : 1U;
+        const std::uint64_t advance = character == static_cast<std::uint32_t>('\t')
+            ? 8U - (currentLineColumns_ % 8U) : units;
+        if (currentLineColumns_ > (std::numeric_limits<std::uint64_t>::max)() - advance) return false;
+        currentLineColumns_ += advance;
     }
     return true;
 }
@@ -178,9 +192,8 @@ bool LargeFileLineScanner::Consume(
                 }
                 characterCount_ += units;
             }
-            // A CR/LF byte can only be a complete UTF-8 character.
-            if (bytes[index] == static_cast<std::uint8_t>('\r') || bytes[index] == static_cast<std::uint8_t>('\n')) {
-                if (!FeedCharacter(bytes[index], offset + 1U, lineOffsets, lineCharacterOffsets)) {
+            if ((before == 0 && bytes[index] <= 0x7FU) || (before != 0 && utf8Remaining_ == 0)) {
+                if (!FeedCharacter(utf8CodePoint_, offset + 1U, lineOffsets, lineCharacterOffsets)) {
                     valid_ = false;
                     return false;
                 }
@@ -211,8 +224,11 @@ bool LargeFileLineScanner::Finish(
     if (pendingCr_) {
         ++crCount_;
         pendingCr_ = false;
+        maximumLineColumns_ = std::max(maximumLineColumns_, currentLineColumns_);
+        currentLineColumns_ = 0;
         return AppendLineOffset(pendingCrEnd_, lineOffsets, lineCharacterOffsets);
     }
+    maximumLineColumns_ = std::max(maximumLineColumns_, currentLineColumns_);
     return true;
 }
 
@@ -222,5 +238,6 @@ std::uint64_t LargeFileLineScanner::CrlfCount() const { return crlfCount_; }
 std::uint64_t LargeFileLineScanner::LfCount() const { return lfCount_; }
 std::uint64_t LargeFileLineScanner::CrCount() const { return crCount_; }
 std::uint64_t LargeFileLineScanner::CharacterCount() const { return characterCount_; }
+std::uint64_t LargeFileLineScanner::MaximumLineColumns() const { return maximumLineColumns_; }
 
 } // namespace classic_notepad

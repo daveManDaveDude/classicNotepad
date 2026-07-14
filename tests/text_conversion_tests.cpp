@@ -364,6 +364,17 @@ void TestLargeFileStreamingIndex()
         Expect(scanner.Finish(lines), "Large scanner finishes CRLF input");
         Expect(lines == std::vector<std::uint64_t>({0, 5, 9}), "CRLF split across chunks has correct offsets");
         Expect(scanner.CrlfCount() == 1U && scanner.LfCount() == 1U, "CRLF/LF counts cross chunk boundaries");
+        Expect(scanner.MaximumLineColumns() == 3U, "Large scanner tracks the longest decoded line");
+    }
+
+    {
+        LargeFileLineScanner scanner(LargeFileEncoding::Utf8, 0);
+        std::vector<std::uint64_t> lines{0};
+        const std::vector<std::uint8_t> text{'a', '\t', 'b', '\r', 'x', 'y'};
+        Expect(scanner.Consume(text.data(), text.size(), 0, lines) && scanner.Finish(lines),
+            "Large scanner accepts tabs and a lone CR line ending");
+        Expect(lines == std::vector<std::uint64_t>({0, 4}), "Lone CR ends its line before following text");
+        Expect(scanner.MaximumLineColumns() == 9U, "Longest-line columns expand tabs to eight-column stops");
     }
 
     {
@@ -456,6 +467,15 @@ void TestLargeDocumentPieceTable()
     ExpectText(text, L"BEGIN one\r\nTWO\r\nthree\r\nEND", "Large document cross-piece edits preserve text");
     Expect(document.PieceCount() >= 3U, "Large document keeps multiple pieces instead of copying the original suffix");
     Expect(document.InsertedBufferBytes() >= 2U * sizeof(wchar_t), "Large document tracks append-only inserted buffers");
+    Expect(document.LineCount() == 4U, "Large document aggregates edited logical lines");
+    classic_notepad::LargeDocumentLineColumn coordinate;
+    Expect(document.PositionToLineColumn(11U, coordinate, error) && coordinate.line == 1U && coordinate.column == 0U,
+        "Large document converts edited positions to line and column");
+    std::uint64_t lineStart = 0;
+    std::uint64_t lineEnd = 0;
+    std::uint64_t nextLine = 0;
+    Expect(document.LineRange(1U, lineStart, lineEnd, nextLine, error) && lineStart == 11U && lineEnd == 14U,
+        "Large document line lookup is driven by the edited tree");
 
     classic_notepad::LargeDocumentMatch match;
     Expect(document.Find(L"TWO", 0, true, true, true, match, error), "Large document finds text across pieces");
@@ -474,6 +494,119 @@ void TestLargeDocumentPieceTable()
     Expect(utf16.Replace(0, 0, nonBmp, 0, 0, afterStart, afterEnd, error), "Large document accepts non-BMP inserted Unicode");
     Expect(utf16.ReadRange(0, utf16.CharacterCount(), text, error), "Large document reads non-BMP inserted Unicode");
     ExpectText(text, nonBmp, "Large document preserves non-BMP inserted Unicode");
+    Expect(!utf16.IsCharacterBoundary(2U, error) && !error.empty(),
+        "Large document rejects a caret inside a surrogate pair");
+    error.clear();
+    Expect(!utf16.Replace(2U, 2U, L"x", 2U, 2U, afterStart, afterEnd, error),
+        "Large document rejects an edit inside a surrogate pair");
+    utf16.MarkSaved();
+    Expect(!utf16.IsModified(), "Large document saved-state marker clears modified state");
+    Expect(utf16.Replace(utf16.CharacterCount(), utf16.CharacterCount(), L"!", 0, 0, afterStart, afterEnd, error),
+        "Large document can edit after a saved marker");
+    Expect(utf16.IsModified(), "Large document reports edits after the saved marker");
+    Expect(utf16.Undo(afterStart, afterEnd, error) && !utf16.IsModified(),
+        "Undoing to the saved state clears modified state");
+
+    const std::string splitSource = "a\r\n";
+    auto splitReader = [&splitSource](std::uint64_t offset, std::size_t length, std::vector<std::uint8_t>& bytes) {
+        if (offset > splitSource.size() || length > splitSource.size() - static_cast<std::size_t>(offset)) return false;
+        bytes.assign(splitSource.begin() + static_cast<std::size_t>(offset),
+            splitSource.begin() + static_cast<std::size_t>(offset) + length);
+        return true;
+    };
+    LargeDocument splitCrlf(LargeFileEncoding::Utf8, splitReader);
+    Expect(splitCrlf.Initialize({{0, 2, 2}, {2, 1, 1}}, error),
+        "Large document initializes CRLF split across original pieces");
+    Expect(splitCrlf.LineCount() == 2U, "CRLF split across pieces counts as one logical break");
+
+    LargeDocument insertedCrlf(LargeFileEncoding::Utf8,
+        [](std::uint64_t, std::size_t, std::vector<std::uint8_t>&) { return false; });
+    Expect(insertedCrlf.Initialize({}, error), "Inserted-boundary document initializes");
+    Expect(insertedCrlf.Replace(0, 0, L"\r", 0, 0, afterStart, afterEnd, error) &&
+           insertedCrlf.Replace(1, 1, L"\n", 1, 1, afterStart, afterEnd, error),
+        "CR and LF can be inserted in separate pieces");
+    Expect(insertedCrlf.LineCount() == 2U, "Inserted CRLF split across pieces is one logical break");
+    Expect(insertedCrlf.Replace(0, 1, L"", 0, 0, afterStart, afterEnd, error) &&
+           insertedCrlf.LineCount() == 2U,
+        "Deleting CR from a split CRLF leaves one LF break");
+
+    const std::string newlineSource = "a\nb\rc";
+    auto newlineReader = [&newlineSource](std::uint64_t offset, std::size_t length, std::vector<std::uint8_t>& bytes) {
+        if (offset > newlineSource.size() || length > newlineSource.size() - static_cast<std::size_t>(offset)) return false;
+        bytes.assign(newlineSource.begin() + static_cast<std::size_t>(offset),
+            newlineSource.begin() + static_cast<std::size_t>(offset) + length);
+        return true;
+    };
+    LargeDocument mixedSingleBreaks(LargeFileEncoding::Utf8, newlineReader);
+    Expect(mixedSingleBreaks.Initialize({{0, static_cast<std::uint64_t>(newlineSource.size()),
+        static_cast<std::uint64_t>(newlineSource.size())}}, error) && mixedSingleBreaks.LineCount() == 3U,
+        "LF and CR source documents retain independent logical breaks");
+
+    const std::vector<std::uint8_t> utf16Source{'A', 0, '\r', 0, '\n', 0, 'B', 0};
+    auto utf16Reader = [&utf16Source](std::uint64_t offset, std::size_t length, std::vector<std::uint8_t>& bytes) {
+        if (offset > utf16Source.size() || length > utf16Source.size() - static_cast<std::size_t>(offset)) return false;
+        bytes.assign(utf16Source.begin() + static_cast<std::size_t>(offset),
+            utf16Source.begin() + static_cast<std::size_t>(offset) + length);
+        return true;
+    };
+    LargeDocument utf16Original(LargeFileEncoding::Utf16Le, utf16Reader);
+    Expect(utf16Original.Initialize({{0, 8, 4}}, error), "UTF-16 LE original piece initializes");
+    Expect(utf16Original.LineCount() == 2U &&
+           utf16Original.Replace(1, 1, L"X", 1, 1, afterStart, afterEnd, error),
+        "UTF-16 LE original content remains editable");
+    Expect(utf16Original.ReadRange(0, utf16Original.CharacterCount(), text, error),
+        "Edited UTF-16 original content is readable");
+    ExpectText(text, L"AX\r\nB", "UTF-16 original and inserted pieces compose correctly");
+
+    const std::string boundarySearchSource = "hello world";
+    auto boundarySearchReader = [&boundarySearchSource](std::uint64_t offset, std::size_t length,
+        std::vector<std::uint8_t>& bytes) {
+        if (offset > boundarySearchSource.size() || length > boundarySearchSource.size() - static_cast<std::size_t>(offset)) return false;
+        bytes.assign(boundarySearchSource.begin() + static_cast<std::size_t>(offset),
+            boundarySearchSource.begin() + static_cast<std::size_t>(offset) + length);
+        return true;
+    };
+    LargeDocument boundarySearch(LargeFileEncoding::Utf8, boundarySearchReader);
+    Expect(boundarySearch.Initialize({{0, 5, 5}, {5, 1, 1}, {6, 5, 5}}, error),
+        "Search boundary source initializes as multiple pieces");
+    Expect(boundarySearch.Find(L"o w", 0, true, false, true, match, error) && match.start == 4U,
+        "Forward search crosses original-piece boundaries");
+    Expect(boundarySearch.Find(L"WORLD", boundarySearch.CharacterCount(), false, true, false, match, error) &&
+           match.start == 6U,
+        "Backward whole-word case-insensitive search crosses pieces");
+    error.clear();
+    Expect(!boundarySearch.Find(L"absent", 0, true, false, true, match, error, [] { return true; }) &&
+           !error.empty(),
+        "Streaming search observes cancellation between source pieces");
+
+    boundarySearch.SetUndoByteLimit(1U);
+    Expect(boundarySearch.Replace(0, 0, L"evicted", 0, 0, afterStart, afterEnd, error),
+        "Edit succeeds with a tiny undo budget");
+    Expect(!boundarySearch.CanUndo() && boundarySearch.UndoBytes() <= 1U,
+        "Undo records are evicted to the configured memory limit");
+
+    bool replaceCancelled = false;
+    Expect(boundarySearch.ReplaceAll(L"l", L"L", true, false, replaceCancelled,
+        [] { return true; }, error) == 0U && replaceCancelled,
+        "Replace All cancellation leaves the immutable generation uncommitted");
+
+    constexpr std::uint64_t syntheticOffset = 5ULL * 1024ULL * 1024ULL * 1024ULL;
+    auto syntheticReader = [syntheticOffset](std::uint64_t offset, std::size_t length, std::vector<std::uint8_t>& bytes) {
+        if (offset != syntheticOffset || length != 4U) return false;
+        bytes = {'A', 0, 'B', 0};
+        return true;
+    };
+    LargeDocument syntheticLarge(LargeFileEncoding::Utf16Le, syntheticReader);
+    Expect(syntheticLarge.Initialize({{syntheticOffset, 4, 2, 0, L'A', L'B', true}}, error),
+        "Original pieces support synthetic byte offsets beyond 4 GiB");
+    Expect(syntheticLarge.ReadRange(0, 2, text, error), "Synthetic >4 GiB original range is readable");
+    ExpectText(text, L"AB", "Synthetic >4 GiB source coordinates preserve text");
+
+    LargeDocument overflowing(LargeFileEncoding::Utf8, boundarySearchReader);
+    error.clear();
+    Expect(!overflowing.Initialize({{(std::numeric_limits<std::uint64_t>::max)() - 1U, 4U, 4U}}, error) &&
+           !error.empty(),
+        "Original-piece byte ranges reject overflow near UINT64_MAX");
 }
 
 void TestSpellWordExpansion()

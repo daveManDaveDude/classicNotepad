@@ -5,6 +5,7 @@ import ctypes
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -14,6 +15,25 @@ from classic_notepad_driver import ClassicNotepadDriver
 
 TARGET_SIZE = 734_003_200  # 700 MiB exactly
 LINE_SIZE = 128
+
+
+class RetryingTemporaryDirectory(tempfile.TemporaryDirectory):
+    """Wait briefly for Windows to release large mapped sections on process exit."""
+
+    def cleanup(self) -> None:
+        if self._finalizer.detach():
+            last_error = None
+            for _ in range(100):
+                try:
+                    shutil.rmtree(self.name)
+                    return
+                except FileNotFoundError:
+                    return
+                except PermissionError as error:
+                    last_error = error
+                    time.sleep(0.05)
+            if last_error is not None:
+                raise last_error
 
 
 def write_fixture(path: Path) -> None:
@@ -40,6 +60,31 @@ def sha256(path: Path) -> str:
     with path.open("rb", buffering=1024 * 1024) as source:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(block)
+    return digest.hexdigest()
+
+
+def expected_output_sha256(source_path: Path, middle_source_offset: int, *, normal_save: bool) -> str:
+    """Hash the independently constructed expected output without staging it in memory."""
+    digest = hashlib.sha256()
+    digest.update(b"[DATE-TEST][BEGIN-EDIT]")
+    with source_path.open("rb", buffering=1024 * 1024) as source:
+        first_line = source.read(LINE_SIZE)
+        if not first_line.startswith(b"BEGIN-700MB-LARGE-FILE"):
+            raise AssertionError("fixture beginning changed while constructing expected output")
+        digest.update(first_line.replace(b"BEGIN-700MB-LARGE-FILE", b"START-700MB-LARGE-FILE", 1))
+        remaining = middle_source_offset - LINE_SIZE
+        while remaining:
+            block = source.read(min(1024 * 1024, remaining))
+            if not block:
+                raise AssertionError("middle edit offset exceeded fixture length")
+            digest.update(block)
+            remaining -= len(block)
+        digest.update(b"[MIDDLE-EDIT]\r\n")
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    digest.update(b"[END-EDIT]")
+    if normal_save:
+        digest.update(b"[NORMAL-SAVE]")
     return digest.hexdigest()
 
 
@@ -89,6 +134,23 @@ def wait_for_index(app: ClassicNotepadDriver, timeout_seconds: float, peak: dict
         time.sleep(0.05)
 
 
+def wait_for_operation(app: ClassicNotepadDriver, timeout_seconds: float, peak: dict) -> dict:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        state = app.command("getLargeFileState")["largeFile"]
+        working_set, private_bytes = memory_bytes(app._process.pid)
+        peak["workingSet"] = max(peak["workingSet"], working_set)
+        peak["privateBytes"] = max(peak["privateBytes"], private_bytes)
+        if not state["operationInProgress"]:
+            if not state["operationCompleted"] or not state["operationSucceeded"]:
+                raise AssertionError(f"large-file operation failed: {state}")
+            return state
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"large-file operation did not complete: {state}")
+        # Every poll is a UI-thread responsiveness assertion while worker work runs.
+        time.sleep(0.01)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify Windows Release editable mapped large-document mode with a real 700 MiB file.")
     parser.add_argument("--binary", required=True, type=Path)
@@ -106,7 +168,7 @@ def main() -> int:
     os.environ["CLASSIC_NOTEPAD_AUTOMATION_VISIBLE"] = "1"
     root = binary.parents[2] / "automation-large-file-tests"
     root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=root) as temp_root:
+    with RetryingTemporaryDirectory(dir=root) as temp_root:
         temporary = Path(temp_root)
         source = temporary / "classic-notepad-700MiB-source.txt"
         saved = temporary / "classic-notepad-700MiB-saved.txt"
@@ -136,10 +198,29 @@ def main() -> int:
             if "END-700MB-LARGE-FILE" not in app.command("getLargeFileLine", line=last_content_line)["text"]:
                 raise AssertionError("end content was not available")
 
+            # Real child-window input probes at the beginning, middle and end.
+            # The probes are undone so the independently hashed deterministic
+            # edit plan below stays straightforward.
+            probe_lines = (("beginningUiEditMilliseconds", 1),
+                           ("middleUiEditMilliseconds", max(2, state["totalLines"] // 2)),
+                           ("endUiEditMilliseconds", last_content_line))
+            for measurement_name, line_number in probe_lines:
+                app.command("goToLine", line=line_number)
+                click, measurements[measurement_name.replace("Edit", "Click")] = timed(
+                    app, "sendLargeFileClick", x=52, y=8)
+                clicked_at = click["largeFile"]["caret"]
+                _, measurements[measurement_name] = timed(app, "sendLargeFileText", text="[UI-PROBE]")
+                if app.command("getLargeFileRange", start=clicked_at, length=10)["text"] != "[UI-PROBE]":
+                    raise AssertionError(f"actual window input failed near line {line_number}")
+                app.command("sendLargeFileKey", key=0x5A, control=True)  # Ctrl+Z
+                if app.command("getLargeFileRange", start=clicked_at, length=10)["text"] == "[UI-PROBE]":
+                    raise AssertionError(f"actual-input undo failed near line {line_number}")
+
             _, measurements["beginningEditMilliseconds"] = timed(app, "setSelection", start=0, end=0)
             _, measurements["typingMilliseconds"] = timed(app, "typeText", text="[BEGIN-EDIT]")
             state = app.command("getLargeFileState")["largeFile"]
             middle = state["characterCount"] // 2
+            middle_source_offset = middle - len("[BEGIN-EDIT]")
             app.command("setSelection", start=middle, end=middle)
             _, measurements["middleEditMilliseconds"] = timed(app, "insertText", text="[MIDDLE-EDIT]\r\n")
             state = app.command("getLargeFileState")["largeFile"]
@@ -158,6 +239,15 @@ def main() -> int:
             # deterministic Time/Date-equivalent marker.
             app.command("replace", text="BEGIN-700MB-LARGE-FILE", replacement="START-700MB-LARGE-FILE",
                         matchCase=True, wholeWord=False, searchDown=True)
+
+            replace_all_started = time.perf_counter()
+            app.command("startLargeFileReplaceAll", text="END-700MB-LARGE-FILE",
+                        replacement="FIN-700MB-LARGE-FILE", matchCase=True, wholeWord=False)
+            replace_all = wait_for_operation(app, args.operation_timeout_seconds, peak)
+            measurements["replaceAllMilliseconds"] = round((time.perf_counter() - replace_all_started) * 1000)
+            if replace_all["operationResultCount"] != 1:
+                raise AssertionError(f"Replace All count was {replace_all['operationResultCount']}, expected 1")
+            app.command("undo")  # Replace All is one transaction.
             app.command("setSelection", start=0, end=0)
             app.command("insertText", text="[DATE-TEST]")
 
@@ -179,6 +269,9 @@ def main() -> int:
             if not saved.exists() or saved.stat().st_size < TARGET_SIZE:
                 raise AssertionError("streaming Save As did not create the expected large output")
             saved_hash = sha256(saved)
+            expected_saved_hash = expected_output_sha256(source, middle_source_offset, normal_save=False)
+            if saved_hash != expected_saved_hash:
+                raise AssertionError(f"Save As hash {saved_hash} did not match expected {expected_saved_hash}")
             if "[DATE-TEST][BEGIN-EDIT]" not in app.command("getLargeFileRange", start=0, length=128)["text"]:
                 raise AssertionError("saved beginning edits were not available after rebase")
             if "[END-EDIT]" not in app.command("getLargeFileRange", start=saved_state["characterCount"] - 64, length=64)["text"]:
@@ -195,19 +288,25 @@ def main() -> int:
             _, measurements["normalSaveMilliseconds"] = timed(app, "save")
             normal_state = wait_for_index(app, args.index_timeout_seconds, peak)
             normal_hash = sha256(saved)
+            expected_normal_hash = expected_output_sha256(source, middle_source_offset, normal_save=True)
+            if normal_hash != expected_normal_hash:
+                raise AssertionError(f"normal Save hash {normal_hash} did not match expected {expected_normal_hash}")
             if "[NORMAL-SAVE]" not in app.command("getLargeFileRange", start=normal_state["characterCount"] - 64, length=64)["text"]:
                 raise AssertionError("normal Save output did not contain the final edit")
 
             final = app.command("getLargeFileState")["largeFile"]
             measurements.update({
                 "firstUsableMilliseconds": final["firstUsableMilliseconds"],
+                "firstViewportPaintMilliseconds": final["firstViewportPaintMilliseconds"],
                 "fullIndexMilliseconds": final["fullIndexMilliseconds"],
                 "peakWorkingSetBytes": peak["workingSet"],
                 "peakPrivateBytes": peak["privateBytes"],
                 "finalPieceCount": final["pieceCount"],
                 "finalOutputSize": saved.stat().st_size,
                 "savedOutputHash": saved_hash,
+                "expectedSavedOutputHash": expected_saved_hash,
                 "normalOutputHash": normal_hash,
+                "expectedNormalOutputHash": expected_normal_hash,
                 "sourceHash": source_hash,
                 "sourceUnchanged": sha256(source) == source_hash,
             })

@@ -503,6 +503,34 @@ std::string BuildSelectionObject(const GtkNotepadApp::AutomationSelection& selec
     return output.str();
 }
 
+std::string BuildLargeFileStateObject(const GtkLargeFileView::State& state)
+{
+    std::ostringstream output;
+    output << "{"
+           << "\"active\":" << (state.active ? "true" : "false")
+           << ",\"editable\":" << (state.editable ? "true" : "false")
+           << ",\"indexingComplete\":" << (state.indexingComplete ? "true" : "false")
+           << ",\"encodingValid\":" << (state.encodingValid ? "true" : "false")
+           << ",\"modified\":" << (state.modified ? "true" : "false")
+           << ",\"fileSize\":" << state.fileSize
+           << ",\"indexedBytes\":" << state.indexedBytes
+           << ",\"characterCount\":" << state.characterCount
+           << ",\"lineCount\":" << state.lineCount
+           << ",\"maximumLineColumns\":" << state.maximumLineColumns
+           << ",\"selectionStart\":" << state.selectionStart
+           << ",\"selectionEnd\":" << state.selectionEnd
+           << ",\"caretPosition\":" << state.caretPosition
+           << ",\"caretLine\":" << state.caretLine
+           << ",\"caretColumn\":" << state.caretColumn
+           << ",\"topLine\":" << state.topLine
+           << ",\"pieceCount\":" << state.pieceCount
+           << ",\"insertedBufferBytes\":" << state.insertedBufferBytes
+           << ",\"firstUsableMilliseconds\":" << state.firstUsableMilliseconds
+           << ",\"fullIndexMilliseconds\":" << state.fullIndexMilliseconds
+           << "}";
+    return output.str();
+}
+
 std::string BuildMarginsObject(const GtkNotepadApp::AutomationPageMargins& margins)
 {
     std::ostringstream output;
@@ -773,6 +801,27 @@ std::string HandleCommand(GtkNotepadApp& app, std::wstring& testClipboard, const
     if (name == L"getStatusText") {
         ResponseWriter response(id, true);
         response.AddString("statusText", app.GetStatusText());
+        return response.Finish();
+    }
+
+    if (name == L"getLargeFileState") {
+        ResponseWriter response(id, true);
+        response.AddRaw("largeFile", BuildLargeFileStateObject(app.GetLargeFileState()));
+        return response.Finish();
+    }
+
+    if (name == L"getLargeFileTextRange") {
+        const auto start = GetNumber(request, "start");
+        const auto length = GetNumber(request, "length");
+        if (!start.has_value() || !length.has_value() || *start < 0 || *length < 0) {
+            return BuildErrorResponse(id, L"A non-negative start and length are required.");
+        }
+        std::wstring text;
+        if (!app.GetLargeFileTextRange(static_cast<std::uint64_t>(*start), static_cast<std::uint64_t>(*length), text, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        ResponseWriter response(id, true);
+        response.AddString("text", text);
         return response.Finish();
     }
 

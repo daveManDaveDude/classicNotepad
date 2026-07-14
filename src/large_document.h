@@ -23,6 +23,15 @@ struct LargeDocumentOriginalPiece {
     std::uint64_t byteOffset = 0;
     std::uint64_t byteLength = 0;
     std::uint64_t characterLength = 0; // UTF-16 code units (the Win32 coordinate system).
+    std::uint64_t logicalLineBreaks = 0;
+    wchar_t firstCharacter = 0;
+    wchar_t lastCharacter = 0;
+    bool summaryKnown = false;
+};
+
+struct LargeDocumentLineColumn {
+    std::uint64_t line = 0;
+    std::uint64_t column = 0;
 };
 
 struct LargeDocumentMatch {
@@ -38,6 +47,8 @@ class LargeDocument {
 public:
     static constexpr std::uint64_t kDefaultUndoByteLimit = 64ULL * 1024ULL * 1024ULL;
 
+    struct TextSummary;
+
     LargeDocument(LargeFileEncoding encoding, LargeDocumentByteReader reader);
     ~LargeDocument();
 
@@ -47,13 +58,35 @@ public:
     bool Initialize(
         const std::vector<LargeDocumentOriginalPiece>& originalPieces,
         std::wstring& errorMessage);
+    bool AppendOriginalPieces(
+        const std::vector<LargeDocumentOriginalPiece>& originalPieces,
+        std::wstring& errorMessage);
     void Clear();
 
     std::uint64_t CharacterCount() const;
+    std::uint64_t LineCount() const;
     std::uint64_t PieceCount() const;
     std::uint64_t InsertedBufferBytes() const;
     bool IsModified() const;
     std::uint64_t Generation() const;
+    std::uint64_t SavedState() const;
+    void MarkSaved();
+
+    bool IsCharacterBoundary(std::uint64_t position, std::wstring& errorMessage) const;
+    bool PositionToLineColumn(
+        std::uint64_t position,
+        LargeDocumentLineColumn& coordinate,
+        std::wstring& errorMessage) const;
+    bool LineStart(
+        std::uint64_t zeroBasedLine,
+        std::uint64_t& position,
+        std::wstring& errorMessage) const;
+    bool LineRange(
+        std::uint64_t zeroBasedLine,
+        std::uint64_t& start,
+        std::uint64_t& contentEnd,
+        std::uint64_t& nextLineStart,
+        std::wstring& errorMessage) const;
 
     // Reads no more than maxCharacters.  This is intentionally bounded and
     // never materializes the full document.
@@ -88,7 +121,9 @@ public:
         bool wholeWord,
         bool forward,
         LargeDocumentMatch& match,
-        std::wstring& errorMessage) const;
+        std::wstring& errorMessage,
+        const std::function<bool()>& shouldCancel = {},
+        const std::function<void(std::uint64_t)>& onProgress = {}) const;
     std::uint64_t ReplaceAll(
         const std::wstring& needle,
         const std::wstring& replacement,
@@ -96,7 +131,8 @@ public:
         bool wholeWord,
         bool& cancelled,
         const std::function<bool()>& shouldCancel,
-        std::wstring& errorMessage);
+        std::wstring& errorMessage,
+        const std::function<void(std::uint64_t)>& onProgress = {});
 
     // Visits text in fixed-size chunks.  The callback returning false stops
     // streaming without treating it as a document error.
@@ -104,6 +140,7 @@ public:
         const std::function<bool(const std::wstring&)>& visitor,
         const std::function<bool()>& shouldCancel,
         std::wstring& errorMessage) const;
+    std::unique_ptr<LargeDocument> Clone() const;
 
 private:
     struct Piece;
@@ -113,6 +150,7 @@ private:
     using NodePtr = std::unique_ptr<Node>;
 
     static std::uint64_t CharacterLength(const NodePtr& node);
+    static TextSummary SummaryOf(const NodePtr& node);
     static std::uint64_t PieceLength(const Piece& piece);
     static void Update(Node* node);
     static NodePtr Merge(NodePtr left, NodePtr right);
@@ -122,6 +160,7 @@ private:
     NodePtr BuildTree(std::vector<Piece> pieces);
     static void CollectPieces(NodePtr root, std::vector<Piece>& pieces);
     static void CountNodes(const NodePtr& node, std::uint64_t& count);
+    static NodePtr CloneNode(const NodePtr& node);
     bool Locate(std::uint64_t position, const Node*& node, std::uint64_t& offset) const;
     bool ReadPiece(
         const Piece& piece,
@@ -141,6 +180,13 @@ private:
         std::wstring& text,
         std::wstring& errorMessage) const;
     bool ValidateRange(std::uint64_t start, std::uint64_t end, std::wstring& errorMessage) const;
+    bool SummarizePrefix(std::uint64_t length, TextSummary& summary, std::wstring& errorMessage) const;
+    bool SummarizePiece(
+        const Piece& piece,
+        std::uint64_t start,
+        std::uint64_t length,
+        TextSummary& summary,
+        std::wstring& errorMessage) const;
     static bool IsWordCharacter(wchar_t character);
     bool MatchWholeWord(std::uint64_t start, std::uint64_t length, std::wstring& errorMessage) const;
     static bool Equals(const std::wstring& left, const std::wstring& right, bool matchCase);
@@ -155,8 +201,11 @@ private:
     std::uint64_t undoBytes_ = 0;
     std::uint64_t undoByteLimit_ = kDefaultUndoByteLimit;
     std::uint64_t generation_ = 1;
-    bool modified_ = false;
+    std::uint64_t stateId_ = 1;
+    std::uint64_t savedStateId_ = 1;
+    std::uint64_t nextStateId_ = 2;
     std::uint64_t randomState_ = 0x9E3779B97F4A7C15ULL;
+    std::uint64_t sourceHighWater_ = 0;
 };
 
 } // namespace classic_notepad

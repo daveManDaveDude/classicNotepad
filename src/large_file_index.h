@@ -43,6 +43,7 @@ public:
     std::uint64_t LfCount() const;
     std::uint64_t CrCount() const;
     std::uint64_t CharacterCount() const;
+    std::uint64_t MaximumLineColumns() const;
 
 private:
     bool FeedUtf8Byte(std::uint8_t byte);
@@ -70,6 +71,8 @@ private:
     std::uint64_t lfCount_ = 0;
     std::uint64_t crCount_ = 0;
     std::uint64_t characterCount_ = 0;
+    std::uint64_t currentLineColumns_ = 0;
+    std::uint64_t maximumLineColumns_ = 0;
 
     int utf8Remaining_ = 0;
     std::uint32_t utf8CodePoint_ = 0;
