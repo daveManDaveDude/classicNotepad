@@ -5,6 +5,7 @@
 #include "app_version.h"
 #include "mac_appearance.h"
 #include "mac_automation.h"
+#include "mac_large_file_view.h"
 #include "mac_spelling.h"
 #include "text_metadata.h"
 
@@ -235,15 +236,18 @@ static CGFloat PointsFromThousandths(int thousandths)
     return static_cast<CGFloat>((static_cast<double>(thousandths) * 72.0) / 1000.0);
 }
 
-@interface ClassicNotepadMacDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, NSTextViewDelegate, NSMenuItemValidation>
+@interface ClassicNotepadMacDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate, NSTextViewDelegate, NSMenuItemValidation, MacLargeFileViewDelegate>
 @property(nonatomic, strong) NSWindow* window;
 @property(nonatomic, strong) NSTextView* textView;
+@property(nonatomic, strong) NSScrollView* scrollView;
+@property(nonatomic, assign) MacLargeFileView* largeFileView;
 @property(nonatomic, strong) NSTextField* statusField;
 - (instancetype)initWithInitialPath:(const std::wstring&)initialPath automationMode:(BOOL)automationMode automationVisible:(BOOL)automationVisible;
 - (void)createMenus;
 - (void)createWindow;
 - (void)openInitialPath;
 - (BOOL)loadPath:(const std::wstring&)path;
+- (BOOL)largeFileMode;
 - (void)updateWindowTitle;
 - (void)newDocument:(id)sender;
 - (void)openDocument:(id)sender;
@@ -278,6 +282,7 @@ static CGFloat PointsFromThousandths(int thousandths)
 - (std::wstring)fontDescription;
 - (classic_notepad::macos::MacAutomationPageMargins)pageMargins;
 - (void)setPageMarginsForAutomation:(const classic_notepad::macos::MacAutomationPageMargins&)margins;
+- (bool)goToLineNumber:(long long)lineNumber errorMessage:(std::wstring&)errorMessage;
 - (void)syncPageMarginsFromPrintInfo;
 - (void)syncPrintInfoFromPageMargins;
 - (classic_notepad::macos::MacSpellingConfiguration)spellingConfiguration;
@@ -291,6 +296,9 @@ static CGFloat PointsFromThousandths(int thousandths)
     bool _wordWrap;
     bool _statusBarVisible;
     std::wstring _findText;
+    bool _findMatchCase;
+    bool _findWholeWord;
+    bool _findForward;
     std::wstring _fontDescription;
     classic_notepad::macos::MacAutomationPageMargins _pageMargins;
     NSPrintInfo* _printInfo;
@@ -310,6 +318,9 @@ static CGFloat PointsFromThousandths(int thousandths)
         _wordWrap = false;
         _statusBarVisible = true;
         _fontDescription = L"Menlo 13";
+        _findMatchCase = false;
+        _findWholeWord = false;
+        _findForward = true;
         _printInfo = [[NSPrintInfo sharedPrintInfo] copy];
         [self syncPageMarginsFromPrintInfo];
         _appearanceTheme = classic_notepad::macos::AppearanceThemeFromEnvironment();
@@ -366,6 +377,9 @@ static CGFloat PointsFromThousandths(int thousandths)
 - (void)textDidChange:(NSNotification*)notification
 {
     (void)notification;
+    if ([self largeFileMode]) {
+        return;
+    }
     _document.SetModified(true);
     [self updateWindowTitle];
     [self updateStatusText];
@@ -494,6 +508,9 @@ static CGFloat PointsFromThousandths(int thousandths)
         return !_automationMode;
     }
     if (action == @selector(undo:)) {
+        if ([self largeFileMode]) {
+            return YES;
+        }
         return [[self.textView undoManager] canUndo];
     }
     if (action == @selector(redo:)) {
@@ -531,18 +548,18 @@ static CGFloat PointsFromThousandths(int thousandths)
     NSView* contentView = [self.window contentView];
     const CGFloat statusHeight = 24.0;
     NSRect contentBounds = [contentView bounds];
-    NSScrollView* scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(
+    self.scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(
         0,
         statusHeight,
         contentBounds.size.width,
         contentBounds.size.height - statusHeight)];
-    [scrollView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-    [scrollView setBorderType:NSNoBorder];
-    [scrollView setHasVerticalScroller:YES];
-    [scrollView setHasHorizontalScroller:YES];
-    [scrollView setAutohidesScrollers:NO];
+    [self.scrollView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+    [self.scrollView setBorderType:NSNoBorder];
+    [self.scrollView setHasVerticalScroller:YES];
+    [self.scrollView setHasHorizontalScroller:YES];
+    [self.scrollView setAutohidesScrollers:NO];
 
-    NSSize contentSize = [scrollView contentSize];
+    NSSize contentSize = [self.scrollView contentSize];
     self.textView = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, contentSize.width, contentSize.height)];
     [self.textView setDelegate:self];
     [self.textView setMinSize:NSMakeSize(0.0, contentSize.height)];
@@ -562,8 +579,8 @@ static CGFloat PointsFromThousandths(int thousandths)
     _spellingConfiguration = classic_notepad::macos::ConfigureTextViewSpelling(self.textView);
     _appearanceConfiguration = classic_notepad::macos::ApplyWindowAppearance(self.window, _appearanceTheme);
 
-    [scrollView setDocumentView:self.textView];
-    [contentView addSubview:scrollView];
+    [self.scrollView setDocumentView:self.textView];
+    [contentView addSubview:self.scrollView];
 
     self.statusField = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, contentBounds.size.width, statusHeight)];
     [self.statusField setAutoresizingMask:NSViewWidthSizable | NSViewMaxYMargin];
@@ -601,6 +618,39 @@ static CGFloat PointsFromThousandths(int thousandths)
 
 - (BOOL)loadPath:(const std::wstring&)path
 {
+    std::uint64_t largeSize = 0;
+    std::wstring sizeError;
+    if ([MacLargeFileView shouldUseForPath:path size:largeSize error:sizeError]) {
+        MacLargeFileView* view = [[MacLargeFileView alloc] initWithFrame:NSMakeRect(0, 0,
+            self.scrollView.contentSize.width, self.scrollView.contentSize.height)];
+        [view setChangeDelegate:self];
+        std::wstring largeError;
+        if (![view openPath:path error:largeError]) {
+            [view release];
+            ShowError(self.window, NSStringFromWide(largeError));
+            return NO;
+        }
+        if (self.largeFileView != nil) {
+            MacLargeFileView* previousView = self.largeFileView;
+            self.largeFileView = nil;
+            [previousView closeDocument];
+            [previousView release];
+        }
+        self.largeFileView = view;
+        [self.scrollView setDocumentView:view];
+        _document.OpenReadOnlyLargeFile(path,
+            [view largeEncoding] == classic_notepad::LargeFileEncoding::Utf16Le
+                ? classic_notepad::TextEncoding::Utf16LeBom
+                : classic_notepad::TextEncoding::Utf8NoBom);
+        [self updateWindowTitle];
+        [self updateStatusText];
+        [self.window makeFirstResponder:view];
+        [view setNeedsDisplay:YES];
+        [view display];
+        [view markFirstViewportPresented];
+        return YES;
+    }
+
     std::wstring editorText;
     std::wstring errorMessage;
     if (!_document.Load(path, editorText, errorMessage)) {
@@ -608,12 +658,40 @@ static CGFloat PointsFromThousandths(int thousandths)
         return NO;
     }
 
+    if (self.largeFileView != nil) {
+        MacLargeFileView* previousView = self.largeFileView;
+        self.largeFileView = nil;
+        [previousView closeDocument];
+        [previousView release];
+        [self.scrollView setDocumentView:self.textView];
+    }
     [self setEditorText:editorText markModified:NO];
     return YES;
 }
 
+- (BOOL)largeFileMode
+{
+    return self.largeFileView != nil;
+}
+
+- (void)largeFileViewDidChange:(MacLargeFileView*)view
+{
+    (void)view;
+    [self updateWindowTitle];
+    [self updateStatusText];
+}
+
 - (void)updateWindowTitle
 {
+    if ([self largeFileMode]) {
+        std::filesystem::path path([self.largeFileView documentPath]);
+        std::wstring title = [self.largeFileView isModified] ? L"*" : L"";
+        title += path.filename().wstring();
+        title += L" - Classic Notepad";
+        [self.window setTitle:NSStringFromWide(title)];
+        [self.window setDocumentEdited:[self.largeFileView isModified]];
+        return;
+    }
     [self.window setTitle:WindowTitle(_document)];
     [self.window setDocumentEdited:_document.IsModified()];
 }
@@ -724,6 +802,15 @@ static CGFloat PointsFromThousandths(int thousandths)
 
 - (BOOL)save
 {
+    if ([self largeFileMode]) {
+        std::wstring errorMessage;
+        if (![self.largeFileView saveToPath:[self.largeFileView documentPath] error:errorMessage]) {
+            ShowError(self.window, NSStringFromWide(errorMessage));
+            return NO;
+        }
+        [self updateWindowTitle];
+        return YES;
+    }
     if (!_document.HasPath()) {
         return [self saveAs];
     }
@@ -742,14 +829,20 @@ static CGFloat PointsFromThousandths(int thousandths)
 {
     NSSavePanel* panel = [NSSavePanel savePanel];
     [panel setCanCreateDirectories:YES];
-    [panel setNameFieldStringValue:NSStringFromWide(_document.DisplayName())];
+    [panel setNameFieldStringValue:NSStringFromWide([self largeFileMode]
+        ? std::filesystem::path([self.largeFileView documentPath]).filename().wstring()
+        : _document.DisplayName())];
 
     if ([panel runModal] != NSModalResponseOK) {
         return NO;
     }
 
     std::wstring errorMessage;
-    if (!_document.SaveAs(PathFromUrl([panel URL]), EditorTextFromTextView(self.textView), errorMessage)) {
+    const std::wstring destination = PathFromUrl([panel URL]);
+    const BOOL saved = [self largeFileMode]
+        ? [self.largeFileView saveToPath:destination error:errorMessage]
+        : _document.SaveAs(destination, EditorTextFromTextView(self.textView), errorMessage);
+    if (!saved) {
         ShowError(self.window, NSStringFromWide(errorMessage));
         return NO;
     }
@@ -760,6 +853,13 @@ static CGFloat PointsFromThousandths(int thousandths)
 
 - (BOOL)saveAsPath:(const std::wstring&)path errorMessage:(std::wstring&)errorMessage
 {
+    if ([self largeFileMode]) {
+        if (![self.largeFileView saveToPath:path error:errorMessage]) return NO;
+        _document.OpenReadOnlyLargeFile(path,
+            [self.largeFileView largeEncoding] == classic_notepad::LargeFileEncoding::Utf16Le
+                ? classic_notepad::TextEncoding::Utf16LeBom : classic_notepad::TextEncoding::Utf8NoBom);
+        [self updateWindowTitle]; [self updateStatusText]; return YES;
+    }
     if (!_document.SaveAs(path, EditorTextFromTextView(self.textView), errorMessage)) {
         return NO;
     }
@@ -771,7 +871,7 @@ static CGFloat PointsFromThousandths(int thousandths)
 
 - (BOOL)confirmContinueAfterDirtyDocument
 {
-    if (!_document.IsModified()) {
+    if ([self largeFileMode] ? ![self.largeFileView isModified] : !_document.IsModified()) {
         return YES;
     }
 
@@ -821,6 +921,13 @@ static CGFloat PointsFromThousandths(int thousandths)
 
 - (void)resetUntitledDocument
 {
+    if (self.largeFileView != nil) {
+        MacLargeFileView* previousView = self.largeFileView;
+        self.largeFileView = nil;
+        [previousView closeDocument];
+        [previousView release];
+        [self.scrollView setDocumentView:self.textView];
+    }
     _document.ResetUntitled();
     [self setEditorText:L"" markModified:NO];
 }
@@ -837,12 +944,21 @@ static CGFloat PointsFromThousandths(int thousandths)
 - (void)insertTimeDate:(id)sender
 {
     (void)sender;
+    if ([self largeFileMode]) {
+        std::wstring error;
+        [self.largeFileView replaceSelectionWithWideText:[self buildTimeDateText] error:error];
+        return;
+    }
     [self insertTextAtSelection:[self buildTimeDateText]];
 }
 
 - (void)undo:(id)sender
 {
     (void)sender;
+    if ([self largeFileMode]) {
+        [self.largeFileView undo:nil];
+        return;
+    }
     NSUndoManager* undoManager = [self.textView undoManager];
     if ([undoManager canUndo]) {
         [undoManager undo];
@@ -873,26 +989,61 @@ static CGFloat PointsFromThousandths(int thousandths)
 - (void)findText:(id)sender
 {
     (void)sender;
+    if ([self largeFileMode]) {
+        NSAlert* alert = [[NSAlert alloc] init];
+        [alert setMessageText:@"Find"];
+        NSView* accessory=[[NSView alloc] initWithFrame:NSMakeRect(0,0,300,82)];
+        NSTextField* input = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 56, 300, 24)];
+        NSButton* match=[[NSButton alloc] initWithFrame:NSMakeRect(0,28,120,22)];[match setButtonType:NSButtonTypeSwitch];[match setTitle:@"Match case"];[match setState:_findMatchCase?NSControlStateValueOn:NSControlStateValueOff];
+        NSButton* whole=[[NSButton alloc] initWithFrame:NSMakeRect(130,28,120,22)];[whole setButtonType:NSButtonTypeSwitch];[whole setTitle:@"Whole word"];[whole setState:_findWholeWord?NSControlStateValueOn:NSControlStateValueOff];
+        NSPopUpButton* direction=[[NSPopUpButton alloc] initWithFrame:NSMakeRect(0,0,120,24) pullsDown:NO];[direction addItemsWithTitles:@[@"Forward",@"Backward"]];[direction selectItemAtIndex:_findForward?0:1];
+        [accessory addSubview:input];[accessory addSubview:match];[accessory addSubview:whole];[accessory addSubview:direction];
+        [alert setAccessoryView:accessory]; [alert addButtonWithTitle:@"Find Next"]; [alert addButtonWithTitle:@"Cancel"];
+        if ([alert runModal] == NSAlertFirstButtonReturn) {
+            _findText = WideFromNSString(input.stringValue);_findMatchCase=match.state==NSControlStateValueOn;_findWholeWord=whole.state==NSControlStateValueOn;_findForward=direction.indexOfSelectedItem==0;std::wstring error;
+            if (![self.largeFileView findText:_findText matchCase:_findMatchCase wholeWord:_findWholeWord forward:_findForward error:error] && !error.empty()) ShowError(self.window, NSStringFromWide(error));
+        }
+        [self.window makeFirstResponder:self.largeFileView];
+        return;
+    }
     [self performFinderAction:NSTextFinderActionShowFindInterface];
 }
 
 - (void)findNextText:(id)sender
 {
     (void)sender;
+    if ([self largeFileMode]) { std::wstring error; if (!_findText.empty()) [self.largeFileView findText:_findText matchCase:_findMatchCase wholeWord:_findWholeWord forward:_findForward error:error]; return; }
     [self performFinderAction:NSTextFinderActionNextMatch];
 }
 
 - (void)replaceText:(id)sender
 {
     (void)sender;
+    if ([self largeFileMode]) {
+        NSAlert* alert=[[NSAlert alloc] init];[alert setMessageText:@"Replace"];
+        NSView* accessory=[[NSView alloc] initWithFrame:NSMakeRect(0,0,320,108)];
+        NSTextField* find=[[NSTextField alloc] initWithFrame:NSMakeRect(0,82,320,24)];
+        NSTextField* replacement=[[NSTextField alloc] initWithFrame:NSMakeRect(0,52,320,24)];
+        NSButton* match=[[NSButton alloc] initWithFrame:NSMakeRect(0,24,120,22)];[match setButtonType:NSButtonTypeSwitch];[match setTitle:@"Match case"];
+        NSButton* whole=[[NSButton alloc] initWithFrame:NSMakeRect(130,24,120,22)];[whole setButtonType:NSButtonTypeSwitch];[whole setTitle:@"Whole word"];
+        [find setPlaceholderString:@"Find"];[replacement setPlaceholderString:@"Replace with"];
+        [accessory addSubview:find];[accessory addSubview:replacement];[accessory addSubview:match];[accessory addSubview:whole];[alert setAccessoryView:accessory];
+        [alert addButtonWithTitle:@"Replace"];[alert addButtonWithTitle:@"Replace All"];[alert addButtonWithTitle:@"Cancel"];
+        const NSModalResponse response=[alert runModal];std::wstring error;
+        const std::wstring needle=WideFromNSString(find.stringValue), value=WideFromNSString(replacement.stringValue);
+        const BOOL matchCase=match.state==NSControlStateValueOn,wholeWord=whole.state==NSControlStateValueOn;
+        if(response==NSAlertFirstButtonReturn){if([self.largeFileView findText:needle matchCase:matchCase wholeWord:wholeWord forward:YES error:error])[self.largeFileView replaceSelectionWithWideText:value error:error];}
+        else if(response==NSAlertSecondButtonReturn)[self.largeFileView replaceAllText:needle replacement:value matchCase:matchCase wholeWord:wholeWord error:error];
+        if(!error.empty())ShowError(self.window,NSStringFromWide(error));
+        [self.window makeFirstResponder:self.largeFileView];return;
+    }
     [self performFinderAction:NSTextFinderActionShowReplaceInterface];
 }
 
 - (void)goToLine:(id)sender
 {
     (void)sender;
-    const std::wstring text = [self getText];
-    const std::size_t lineCount = CountLines(text);
+    const std::size_t lineCount = [self largeFileMode] ? static_cast<std::size_t>([self.largeFileView lineCount]) : CountLines([self getText]);
 
     NSAlert* alert = [[NSAlert alloc] init];
     [alert setMessageText:@"Go To Line"];
@@ -910,12 +1061,12 @@ static CGFloat PointsFromThousandths(int thousandths)
         return;
     }
 
-    const int lineNumber = [input intValue];
+    const long long lineNumber = [[input stringValue] longLongValue];
     std::wstring errorMessage;
     if (![self goToLineNumber:lineNumber errorMessage:errorMessage]) {
         ShowError(self.window, NSStringFromWide(errorMessage));
     }
-    [self.window makeFirstResponder:self.textView];
+    [self.window makeFirstResponder:[self largeFileMode] ? (NSResponder*)self.largeFileView : (NSResponder*)self.textView];
 }
 
 - (void)toggleWordWrap:(id)sender
@@ -965,6 +1116,10 @@ static CGFloat PointsFromThousandths(int thousandths)
 
 - (std::wstring)getText
 {
+    if ([self largeFileMode]) {
+        std::wstring error;
+        return [self.largeFileView boundedTextFrom:0 length:std::min<std::uint64_t>([self.largeFileView characterCount], 1024U * 1024U) error:error];
+    }
     return EditorTextFromTextView(self.textView);
 }
 
@@ -975,6 +1130,7 @@ static CGFloat PointsFromThousandths(int thousandths)
 
 - (void)insertTextAtSelection:(const std::wstring&)text
 {
+    if ([self largeFileMode]) { std::wstring error; [self.largeFileView replaceSelectionWithWideText:text error:error]; return; }
     [self.textView insertText:NSStringFromWide(text) replacementRange:[self.textView selectedRange]];
     _document.SetModified(true);
     [self updateWindowTitle];
@@ -983,12 +1139,14 @@ static CGFloat PointsFromThousandths(int thousandths)
 
 - (classic_notepad::macos::MacAutomationSelection)getSelectionForAutomation
 {
+    if ([self largeFileMode]) return {static_cast<std::size_t>([self.largeFileView selectionStart]), static_cast<std::size_t>([self.largeFileView selectionEnd])};
     const NSRange range = [self.textView selectedRange];
     return {static_cast<std::size_t>(range.location), static_cast<std::size_t>(range.location + range.length)};
 }
 
 - (void)setSelectionStart:(std::size_t)start end:(std::size_t)end
 {
+    if ([self largeFileMode]) { std::wstring error; [self.largeFileView setSelectionStart:start end:end error:error]; return; }
     const std::wstring text = [self getText];
     start = std::min(start, text.size());
     end = std::min(end, text.size());
@@ -1002,6 +1160,7 @@ static CGFloat PointsFromThousandths(int thousandths)
 
 - (void)deleteSelectionForAutomation
 {
+    if ([self largeFileMode]) { std::wstring error; [self.largeFileView replaceSelectionWithWideText:L"" error:error]; return; }
     [self.textView insertText:@"" replacementRange:[self.textView selectedRange]];
     _document.SetModified(true);
     [self updateWindowTitle];
@@ -1010,6 +1169,7 @@ static CGFloat PointsFromThousandths(int thousandths)
 
 - (void)deleteForwardForAutomation
 {
+    if ([self largeFileMode]) { [self.largeFileView deleteForward:nil]; return; }
     NSRange range = [self.textView selectedRange];
     const std::wstring text = [self getText];
     if (range.length == 0 && range.location < text.size()) {
@@ -1036,6 +1196,7 @@ static CGFloat PointsFromThousandths(int thousandths)
     if (_findText.empty()) {
         return false;
     }
+    if ([self largeFileMode]) { std::wstring error; return [self.largeFileView findText:_findText matchCase:matchCase wholeWord:wholeWord forward:searchDown error:error]; }
 
     const std::wstring source = [self getText];
     const std::wstring haystack = matchCase ? source : LowercaseCopy(source);
@@ -1091,6 +1252,7 @@ static CGFloat PointsFromThousandths(int thousandths)
     if (needle.empty()) {
         return 0;
     }
+    if ([self largeFileMode]) { std::wstring error; return static_cast<std::size_t>([self.largeFileView replaceAllText:needle replacement:replacement matchCase:matchCase wholeWord:wholeWord error:error]); }
 
     const std::wstring source = [self getText];
     const std::wstring haystack = matchCase ? source : LowercaseCopy(source);
@@ -1124,8 +1286,14 @@ static CGFloat PointsFromThousandths(int thousandths)
     return count;
 }
 
-- (bool)goToLineNumber:(int)lineNumber errorMessage:(std::wstring&)errorMessage
+- (bool)goToLineNumber:(long long)lineNumber errorMessage:(std::wstring&)errorMessage
 {
+    if ([self largeFileMode]) {
+        if (lineNumber < 1 || static_cast<std::uint64_t>(lineNumber) > [self.largeFileView lineCount]) {
+            errorMessage = L"Line number is outside the indexed document."; return false;
+        }
+        return [self.largeFileView goToLine:static_cast<std::uint64_t>(lineNumber) error:errorMessage];
+    }
     const std::wstring text = [self getText];
     const std::size_t lineCount = CountLines(text);
     if (lineNumber < 1 || static_cast<std::size_t>(lineNumber) > lineCount) {
@@ -1158,6 +1326,11 @@ static CGFloat PointsFromThousandths(int thousandths)
 - (void)setWordWrap:(bool)enabled
 {
     _wordWrap = enabled;
+    if ([self largeFileMode]) {
+        [self.largeFileView setWordWrapEnabled:enabled];
+        [self.scrollView setHasHorizontalScroller:!enabled];
+        [[NSApp mainMenu] update]; return;
+    }
     NSTextContainer* container = [self.textView textContainer];
     if (enabled) {
         [self.textView setHorizontallyResizable:NO];
@@ -1183,7 +1356,7 @@ static CGFloat PointsFromThousandths(int thousandths)
     }
 
     [self.statusField setHidden:!visible];
-    NSScrollView* scrollView = [self.textView enclosingScrollView];
+    NSScrollView* scrollView = self.scrollView;
     NSRect contentBounds = [[self.window contentView] bounds];
     const CGFloat statusHeight = visible ? 24.0 : 0.0;
     [scrollView setFrame:NSMakeRect(0, statusHeight, contentBounds.size.width, contentBounds.size.height - statusHeight)];
@@ -1199,11 +1372,21 @@ static CGFloat PointsFromThousandths(int thousandths)
     }
     _fontDescription = font;
     [self.textView setFont:[NSFont userFixedPitchFontOfSize:13.0]];
+    if ([self largeFileMode]) [self.largeFileView setEditorFont:[NSFont userFixedPitchFontOfSize:13.0]];
     return true;
 }
 
 - (std::wstring)buildStatusText
 {
+    if ([self largeFileMode]) {
+        std::wstring status = L"Ln " + std::to_wstring([self.largeFileView caretLine] + 1) +
+            L", Col " + std::to_wstring([self.largeFileView caretColumn] + 1) + L"  " +
+            std::to_wstring([self.largeFileView characterCount]) + L" characters  ";
+        status += [self.largeFileView isIndexingComplete] ? L"Indexed  " :
+            (L"Indexing " + std::to_wstring(([self.largeFileView indexedBytes] * 100) / std::max<std::uint64_t>(1, [self.largeFileView fileSize])) + L"%  ");
+        status += [self.largeFileView largeEncoding] == classic_notepad::LargeFileEncoding::Utf16Le ? L"UTF-16 LE" : L"UTF-8";
+        return status;
+    }
     const std::wstring text = [self getText];
     const classic_notepad::macos::MacAutomationSelection selection = [self getSelectionForAutomation];
     std::size_t line = 1;
@@ -1430,8 +1613,8 @@ public:
         return [delegate_ getSelectionForAutomation];
     }
     void SetSelection(std::size_t start, std::size_t end) override { [delegate_ setSelectionStart:start end:end]; }
-    void SelectAll() override { [delegate_.textView selectAll:nil]; }
-    void Undo() override { [[delegate_.textView undoManager] undo]; }
+    void SelectAll() override { if([delegate_ largeFileMode])[delegate_.largeFileView selectAll:nil];else[delegate_.textView selectAll:nil]; }
+    void Undo() override { if([delegate_ largeFileMode])[delegate_.largeFileView undo:nil];else[[delegate_.textView undoManager] undo]; }
     void DeleteSelection() override { [delegate_ deleteSelectionForAutomation]; }
     void DeleteForward() override { [delegate_ deleteForwardForAutomation]; }
     bool Find(const std::wstring& text, bool matchCase, bool wholeWord, bool searchDown) override
@@ -1455,7 +1638,7 @@ public:
     {
         return [delegate_ replaceAllText:text replacement:replacement matchCase:matchCase wholeWord:wholeWord];
     }
-    bool GoToLine(int lineNumber, std::wstring& errorMessage) override
+    bool GoToLine(long long lineNumber, std::wstring& errorMessage) override
     {
         return [delegate_ goToLineNumber:lineNumber errorMessage:errorMessage];
     }
@@ -1511,6 +1694,27 @@ public:
             [[NSSpellChecker sharedSpellChecker] learnWord:NSStringFromWide(word)];
         }
         return true;
+    }
+    classic_notepad::macos::MacAutomationLargeFileState GetLargeFileState() const override
+    {
+        classic_notepad::macos::MacAutomationLargeFileState state;
+        MacLargeFileView* view=delegate_.largeFileView;
+        if(view==nil)return state;
+        state.active=true;state.editable=[view isEncodingValid];state.indexingComplete=[view isIndexingComplete];
+        state.encodingValid=[view isEncodingValid];state.modified=[view isModified];state.fileSize=[view fileSize];
+        state.indexedBytes=[view indexedBytes];state.characterCount=[view characterCount];state.lineCount=[view lineCount];
+        state.maximumLineColumns=[view maximumLineColumns];state.caret=[view caretPosition];
+        state.selectionStart=[view selectionStart];state.selectionEnd=[view selectionEnd];state.topLine=[view topVisibleLine];
+        state.pieceCount=[view pieceCount];state.insertedBufferBytes=[view insertedBufferBytes];
+        state.firstUsableMilliseconds=[view firstUsableMilliseconds];state.firstViewportPaintMilliseconds=[view firstViewportPaintMilliseconds];
+        state.fullIndexMilliseconds=[view fullIndexMilliseconds];return state;
+    }
+    bool GetLargeFileRange(std::uint64_t start,std::uint64_t length,std::wstring& text,std::wstring& errorMessage) const override
+    {
+        if(delegate_.largeFileView==nil){errorMessage=L"Large-file mode is not active.";return false;}
+        constexpr std::uint64_t limit=1024U*1024U;
+        if(length>limit){errorMessage=L"Automation large-file ranges are limited to 1 Mi UTF-16 units.";return false;}
+        text=[delegate_.largeFileView boundedTextFrom:start length:length error:errorMessage];return errorMessage.empty();
     }
 
 private:
@@ -1747,7 +1951,7 @@ public:
         }
         return count;
     }
-    bool GoToLine(int lineNumber, std::wstring& errorMessage) override
+    bool GoToLine(long long lineNumber, std::wstring& errorMessage) override
     {
         const std::size_t lineCount = CountLines(text_);
         if (lineNumber < 1 || static_cast<std::size_t>(lineNumber) > lineCount) {
@@ -1755,7 +1959,7 @@ public:
             return false;
         }
         std::size_t position = 0;
-        for (int line = 1; line < lineNumber && position < text_.size(); ++position) {
+        for (long long line = 1; line < lineNumber && position < text_.size(); ++position) {
             if (text_[position] == L'\n') {
                 ++line;
             }

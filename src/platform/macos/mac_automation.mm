@@ -544,6 +544,34 @@ std::string BuildSelectionObject(const MacAutomationSelection& selection)
     return output.str();
 }
 
+std::string BuildLargeFileObject(const MacAutomationLargeFileState& state)
+{
+    std::ostringstream output;
+    output << "{"
+           << "\"active\":" << (state.active ? "true" : "false")
+           << ",\"editable\":" << (state.editable ? "true" : "false")
+           << ",\"readOnly\":" << (state.active && !state.editable ? "true" : "false")
+           << ",\"indexingComplete\":" << (state.indexingComplete ? "true" : "false")
+           << ",\"encodingValid\":" << (state.encodingValid ? "true" : "false")
+           << ",\"modified\":" << (state.modified ? "true" : "false")
+           << ",\"fileSize\":" << state.fileSize
+           << ",\"indexedBytes\":" << state.indexedBytes
+           << ",\"characterCount\":" << state.characterCount
+           << ",\"totalLines\":" << state.lineCount
+           << ",\"maximumLineColumns\":" << state.maximumLineColumns
+           << ",\"caret\":" << state.caret
+           << ",\"selectionStart\":" << state.selectionStart
+           << ",\"selectionEnd\":" << state.selectionEnd
+           << ",\"topLine\":" << state.topLine
+           << ",\"pieceCount\":" << state.pieceCount
+           << ",\"insertedBufferBytes\":" << state.insertedBufferBytes
+           << ",\"firstUsableMilliseconds\":" << state.firstUsableMilliseconds
+           << ",\"firstViewportPaintMilliseconds\":" << state.firstViewportPaintMilliseconds
+           << ",\"fullIndexMilliseconds\":" << state.fullIndexMilliseconds
+           << "}";
+    return output.str();
+}
+
 std::string BuildMarginsObject(const MacAutomationPageMargins& margins)
 {
     std::ostringstream output;
@@ -605,6 +633,11 @@ std::wstring SelectedText(MacAutomationHost& host)
     if (selection.end <= selection.start) {
         return {};
     }
+    if(host.GetLargeFileState().active) {
+        std::wstring text,error;
+        if(!host.GetLargeFileRange(selection.start,selection.end-selection.start,text,error))return{};
+        return text;
+    }
     const std::wstring text = host.GetText();
     const std::size_t start = std::min(selection.start, text.size());
     const std::size_t end = std::min(selection.end, text.size());
@@ -626,6 +659,20 @@ std::string HandleCommand(MacAutomationHost& host, std::wstring& testClipboard, 
         ResponseWriter response(id, true);
         response.AddRaw("capabilities", BuildCapabilitiesObject(host));
         return response.Finish();
+    }
+    if (name == L"getLargeFileState") {
+        ResponseWriter response(id, true);
+        response.AddRaw("largeFile", BuildLargeFileObject(host.GetLargeFileState()));
+        return response.Finish();
+    }
+    if (name == L"getLargeFileRange" || name == L"getLargeFileTextRange") {
+        long long start=0,length=0;
+        if(!RequireNumber(request,"start",start,errorMessage)||!RequireNumber(request,"length",length,errorMessage)||start<0||length<0)
+            return BuildErrorResponse(id,L"Large-file range values must be non-negative.");
+        std::wstring text;
+        if(!host.GetLargeFileRange(static_cast<std::uint64_t>(start),static_cast<std::uint64_t>(length),text,errorMessage))
+            return BuildErrorResponse(id,errorMessage);
+        ResponseWriter response(id,true);response.AddString("text",text);return response.Finish();
     }
     if (name == L"getAppearance") {
         ResponseWriter response(id, true);
@@ -797,7 +844,7 @@ std::string HandleCommand(MacAutomationHost& host, std::wstring& testClipboard, 
     }
     if (name == L"goToLine") {
         long long lineNumber = 0;
-        if (!RequireNumber(request, "line", lineNumber, errorMessage) || !host.GoToLine(static_cast<int>(lineNumber), errorMessage)) {
+        if (!RequireNumber(request, "line", lineNumber, errorMessage) || !host.GoToLine(lineNumber, errorMessage)) {
             return BuildErrorResponse(id, errorMessage);
         }
         ResponseWriter response(id, true);

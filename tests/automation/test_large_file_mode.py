@@ -10,6 +10,94 @@ from classic_notepad_driver import ClassicNotepadDriver
 
 
 class LargeFileModeTests(unittest.TestCase):
+    @unittest.skipUnless(automation_platform() == "macos", "macOS AppKit large-file mode")
+    def test_macos_large_file_mode_diagnostics_edit_save_as_and_reopen(self):
+        size = (48 * 1024 * 1024) + 4096
+        line = b"macos-large-file-test".ljust(126, b".") + b"\r\n"
+
+        with tempfile.TemporaryDirectory() as temp_root:
+            root = Path(temp_root)
+            source_dir = root / "source"
+            destination_dir = root / "selected output \u00fcnicode"
+            source_dir.mkdir()
+            destination_dir.mkdir()
+            source = source_dir / "mac-large-source.txt"
+            destination = destination_dir / "mac saved copy.txt"
+            with source.open("wb") as output:
+                remaining = size
+                block = line * 8192
+                while remaining >= len(block):
+                    output.write(block)
+                    remaining -= len(block)
+                while remaining >= len(line):
+                    output.write(line)
+                    remaining -= len(line)
+                output.write(b"Z" * remaining)
+            self.assertEqual(source.stat().st_size, size)
+
+            def sha256(path: Path) -> str:
+                digest = hashlib.sha256()
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                        digest.update(chunk)
+                return digest.hexdigest()
+
+            source_hash = sha256(source)
+            previous_visible = os.environ.get("CLASSIC_NOTEPAD_AUTOMATION_VISIBLE")
+            os.environ["CLASSIC_NOTEPAD_AUTOMATION_VISIBLE"] = "1"
+            try:
+                with ClassicNotepadDriver(automation_binary(), automation_platform(), str(source), timeout=45.0) as app:
+                    state = app.command("getLargeFileState")["largeFile"]
+                    self.assertTrue(state["active"])
+                    self.assertTrue(state["editable"])
+                    self.assertEqual(state["fileSize"], size)
+                    self.assertGreater(state["indexedBytes"], 0)
+                    self.assertGreater(state["pieceCount"], 0)
+                    self.assertLessEqual(state["firstUsableMilliseconds"], 2000)
+                    self.assertIn("macos-large", app.command(
+                        "getLargeFileRange", start=0, length=64
+                    )["text"])
+
+                    app.command("setSelection", start=5, end=5)
+                    app.command("insertText", text="[MAC-EDIT]")
+                    self.assertTrue(app.command("getLargeFileState")["largeFile"]["modified"])
+                    app.command("undo")
+                    self.assertFalse(app.command("getLargeFileState")["largeFile"]["modified"])
+                    app.command("setSelection", start=5, end=5)
+                    app.command("insertText", text="[MAC-EDIT]")
+
+                    # Save As is deliberately issued without waiting for the
+                    # index worker, exercising the foreground completion path.
+                    app.command("saveAs", path=str(destination))
+                    saved_state = app.command("getLargeFileState")["largeFile"]
+                    self.assertTrue(saved_state["indexingComplete"])
+                    self.assertFalse(saved_state["modified"])
+                    self.assertEqual(app.command("getTitle")["title"], "mac saved copy.txt - Classic Notepad")
+                    self.assertEqual(sha256(source), source_hash)
+
+                    expected = hashlib.sha256()
+                    with source.open("rb") as stream:
+                        expected.update(stream.read(5))
+                        expected.update(b"[MAC-EDIT]")
+                        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                            expected.update(chunk)
+                    self.assertEqual(sha256(destination), expected.hexdigest())
+
+                    app.command("openFile", path=str(destination))
+                    reopened = app.command("getLargeFileState")["largeFile"]
+                    self.assertTrue(reopened["active"])
+                    app.command("setSelection", start=0, end=0)
+                    app.command("insertText", text="N")
+                    app.command("save")
+                    self.assertTrue(app.command("getLargeFileRange", start=0, length=16)["text"].startswith("Nmacos"))
+                    self.assertEqual(sha256(source), source_hash)
+                    self.assertEqual(list(destination_dir.glob("*.classic-notepad-save-*")), [])
+            finally:
+                if previous_visible is None:
+                    os.environ.pop("CLASSIC_NOTEPAD_AUTOMATION_VISIBLE", None)
+                else:
+                    os.environ["CLASSIC_NOTEPAD_AUTOMATION_VISIBLE"] = previous_visible
+
     @unittest.skipUnless(automation_platform() == "linux", "Linux GTK large-file mode")
     def test_linux_large_file_mode_opens_edits_undoes_and_stream_saves(self):
         line = b"linux-large-file-test".ljust(126, b".") + b"\r\n"

@@ -4,6 +4,7 @@
 #include "spelling.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -44,6 +45,28 @@ struct MacAutomationAppearance {
     std::wstring effectiveAppearance;
 };
 
+struct MacAutomationLargeFileState {
+    bool active = false;
+    bool editable = false;
+    bool indexingComplete = false;
+    bool encodingValid = true;
+    bool modified = false;
+    std::uint64_t fileSize = 0;
+    std::uint64_t indexedBytes = 0;
+    std::uint64_t characterCount = 0;
+    std::uint64_t lineCount = 1;
+    std::uint64_t maximumLineColumns = 0;
+    std::uint64_t caret = 0;
+    std::uint64_t selectionStart = 0;
+    std::uint64_t selectionEnd = 0;
+    std::uint64_t topLine = 0;
+    std::uint64_t pieceCount = 0;
+    std::uint64_t insertedBufferBytes = 0;
+    std::uint64_t firstUsableMilliseconds = 0;
+    std::uint64_t firstViewportPaintMilliseconds = 0;
+    std::uint64_t fullIndexMilliseconds = 0;
+};
+
 class MacAutomationHost {
 public:
     virtual ~MacAutomationHost() = default;
@@ -75,7 +98,7 @@ public:
         bool wholeWord,
         bool searchDown) = 0;
     virtual std::size_t ReplaceAll(const std::wstring& text, const std::wstring& replacement, bool matchCase, bool wholeWord) = 0;
-    virtual bool GoToLine(int lineNumber, std::wstring& errorMessage) = 0;
+    virtual bool GoToLine(long long lineNumber, std::wstring& errorMessage) = 0;
     virtual void InsertTimeDate() = 0;
     virtual void SetWordWrap(bool enabled) = 0;
     virtual bool GetWordWrap() const = 0;
@@ -94,6 +117,12 @@ public:
     virtual std::vector<std::wstring> SuggestSpelling(const std::wstring& word, std::size_t limit) const = 0;
     virtual bool IgnoreSpelling(const std::wstring& word, std::wstring& errorMessage) = 0;
     virtual bool AddSpelling(const std::wstring& word, bool dryRun, std::wstring& errorMessage) = 0;
+    virtual MacAutomationLargeFileState GetLargeFileState() const { return {}; }
+    virtual bool GetLargeFileRange(std::uint64_t start, std::uint64_t length,
+        std::wstring& text, std::wstring& errorMessage) const
+    {
+        (void)start; (void)length; text.clear(); errorMessage = L"Large-file mode is not active."; return false;
+    }
 };
 
 class MacAutomationController {

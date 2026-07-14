@@ -277,6 +277,8 @@ if(APPLE)
         src/platform/macos/Info.plist.in
         src/platform/macos/mac_app.h
         src/platform/macos/mac_app.mm
+        src/platform/macos/mac_large_file_view.h
+        src/platform/macos/mac_large_file_view.mm
         src/platform/macos/mac_automation.h
         src/platform/macos/mac_automation.mm
         src/platform/macos/mac_main.mm

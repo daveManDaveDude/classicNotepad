@@ -143,3 +143,11 @@ else
 fi
 
 cmake --build "$repo_root/$build_dir" --config "$configuration" --parallel "$parallel"
+
+# Clang's linker-created ad-hoc signature covers only the executable. Seal the
+# completed bundle after CMake has copied Info.plist and resources so strict
+# bundle verification succeeds for local Debug and Release builds.
+app_bundle="$repo_root/$build_dir/ClassicNotepadMac.app"
+if [[ -d "$app_bundle" ]]; then
+    codesign --force --deep --sign - "$app_bundle"
+fi

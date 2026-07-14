@@ -106,6 +106,14 @@ class ClassicNotepadDriver:
         except subprocess.TimeoutExpired:
             self._process.kill()
             self._process.wait(timeout=self.timeout)
+        for stream in (self._process.stdout, self._process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        self._stdout_thread.join(timeout=1.0)
+        self._stderr_thread.join(timeout=1.0)
 
     @property
     def stderr_text(self) -> str:
