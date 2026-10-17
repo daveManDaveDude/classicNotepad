@@ -9,52 +9,113 @@
 
 bool Document::Load(const std::wstring& path, std::wstring& editorText, std::wstring& errorMessage)
 {
+    StagedLoad staged;
+    if (!PrepareLoad(path, staged, errorMessage)) {
+        return false;
+    }
+    editorText = std::move(staged.editorText);
+    CommitLoad(std::move(staged));
+    return true;
+}
+
+bool Document::PrepareLoad(
+    const std::wstring& path,
+    StagedLoad& staged,
+    std::wstring& errorMessage) const
+{
+    return PrepareLoadImpl(path, staged, errorMessage, 0U);
+}
+
+#if defined(_WIN32) && !defined(CLASSIC_NOTEPAD_PORTABLE_CORE_SMOKE)
+bool Document::PrepareLoadWithAnsiCodePage(
+    const std::wstring& path,
+    StagedLoad& staged,
+    std::wstring& errorMessage,
+    std::uint32_t ansiCodePage) const
+{
+    return PrepareLoadImpl(path, staged, errorMessage, ansiCodePage);
+}
+#endif
+
+bool Document::PrepareLoadImpl(
+    const std::wstring& path,
+    StagedLoad& staged,
+    std::wstring& errorMessage,
+    std::uint32_t ansiCodePage) const
+{
+    staged = {};
     std::vector<std::uint8_t> bytes;
     if (!classic_notepad::ReadFileBytes(path, bytes, errorMessage)) {
         return false;
     }
 
     classic_notepad::DecodeTextResult decoded;
-    if (!classic_notepad::DecodeTextBytes(bytes, decoded, errorMessage)) {
+    bool decodedSuccessfully = false;
+    if (ansiCodePage == 0U) {
+        decodedSuccessfully = classic_notepad::DecodeTextBytes(bytes, decoded, errorMessage);
+    } else {
+#if defined(_WIN32) && !defined(CLASSIC_NOTEPAD_PORTABLE_CORE_SMOKE)
+        decodedSuccessfully = classic_notepad::DecodeTextBytesWithAnsiCodePage(
+            bytes, decoded, errorMessage, ansiCodePage);
+#endif
+    }
+    if (!decodedSuccessfully) {
+        return false;
+    }
+
+    if (decoded.text.find(L'\0') != std::wstring::npos) {
+        errorMessage = L"The file contains an embedded NUL character that the editor control cannot represent.";
         return false;
     }
 
     const classic_notepad::LineEndingAnalysis lineEndings = classic_notepad::AnalyzeLineEndings(decoded.text);
-
-    path_ = path;
-    encoding_ = decoded.encoding;
-    lineEnding_ = lineEndings.style;
+    staged.path = path;
+    staged.encoding = decoded.encoding;
+    staged.lineEnding = lineEndings.style;
     // The edit control normalizes all line breaks, so mixed files save using the dominant style.
-    saveLineEnding_ = lineEndings.dominantStyle;
+    staged.saveLineEnding = lineEndings.dominantStyle;
     // Reuse the decoded allocation. Large files previously required a second
     // full UTF-16 copy here, causing severe paging before the editor was shown.
     classic_notepad::NormalizeLineEndingsForEditorInPlace(decoded.text);
-    editorText = std::move(decoded.text);
-    modified_ = false;
+    staged.editorText = std::move(decoded.text);
+    errorMessage.clear();
     return true;
+}
+
+void Document::CommitLoad(StagedLoad&& staged)
+{
+    path_ = std::move(staged.path);
+    encoding_ = staged.encoding;
+    lineEnding_ = staged.lineEnding;
+    saveLineEnding_ = staged.saveLineEnding;
+    modified_ = false;
 }
 
 bool Document::Save(const std::wstring& editorText, std::wstring& errorMessage)
 {
+    lastSaveDiagnostics_ = {};
     if (path_.empty()) {
         errorMessage = L"No file path has been selected.";
         return false;
     }
 
     std::vector<std::uint8_t> bytes;
-    const LineEndingStyle targetLineEnding =
-        lineEnding_ == LineEndingStyle::Mixed ? saveLineEnding_ : lineEnding_;
-    const std::wstring diskText = classic_notepad::ConvertLineEndingsFromEditor(editorText, targetLineEnding);
+    const std::wstring diskText = classic_notepad::ConvertLineEndingsFromEditor(editorText, saveLineEnding_);
     if (!classic_notepad::EncodeTextBytes(diskText, encoding_, bytes, errorMessage)) {
         return false;
     }
 
-    if (!classic_notepad::WriteFileBytesAtomically(path_, bytes, errorMessage)) {
+    if (!classic_notepad::WriteFileBytesAtomically(path_, bytes, errorMessage, &lastSaveDiagnostics_)) {
         return false;
     }
 
     modified_ = false;
     return true;
+}
+
+const classic_notepad::SaveDiagnostics& Document::LastSaveDiagnostics() const
+{
+    return lastSaveDiagnostics_;
 }
 
 bool Document::SaveAs(const std::wstring& path, const std::wstring& editorText, std::wstring& errorMessage)
@@ -74,11 +135,44 @@ bool Document::SaveAs(const std::wstring& path, const std::wstring& editorText, 
 
 void Document::OpenReadOnlyLargeFile(const std::wstring& path, TextEncoding encoding)
 {
-    path_ = path;
-    encoding_ = encoding;
-    lineEnding_ = LineEndingStyle::Crlf;
-    saveLineEnding_ = LineEndingStyle::Crlf;
+    StagedLargeLoad staged;
+    PrepareReadOnlyLargeFile(path, encoding, staged);
+    CommitReadOnlyLargeFile(std::move(staged));
+}
+
+void Document::PrepareReadOnlyLargeFile(
+    const std::wstring& path,
+    TextEncoding encoding,
+    StagedLargeLoad& staged) const
+{
+    PrepareReadOnlyLargeFile(path, encoding, LineEndingStyle::Crlf, LineEndingStyle::Crlf, staged);
+}
+
+void Document::PrepareReadOnlyLargeFile(
+    const std::wstring& path,
+    TextEncoding encoding,
+    LineEndingStyle lineEnding,
+    LineEndingStyle saveLineEnding,
+    StagedLargeLoad& staged) const
+{
+    staged.path = path;
+    staged.encoding = encoding;
+    staged.lineEnding = lineEnding;
+    staged.saveLineEnding = saveLineEnding;
+}
+
+void Document::CommitReadOnlyLargeFile(StagedLargeLoad&& staged) noexcept
+{
+    path_ = std::move(staged.path);
+    encoding_ = staged.encoding;
+    lineEnding_ = staged.lineEnding;
+    saveLineEnding_ = staged.saveLineEnding;
     modified_ = false;
+}
+
+void Document::AdoptLargeFileSaveAs(std::wstring path) noexcept
+{
+    path_ = std::move(path);
 }
 
 void Document::ResetUntitled()

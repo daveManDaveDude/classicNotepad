@@ -5,7 +5,9 @@
 
 Classic Notepad is a single-document native desktop recreation of classic Windows Notepad, with Win32, GTK4 Linux, and AppKit macOS targets in the same repository. It keeps the plain local editor feel: one window, one text document, native desktop dialogs, no tabs, no cloud features, no telemetry, and no editor extras that would pull it away from the classic experience.
 
-Current version: `1.2.2`.
+Current version: [`1.3.1`](VERSION).
+
+The feature list describes implemented product behavior; it is not a blanket statement that every platform, Windows version, or visible-app path has completed qualification. The current Windows evidence and remaining qualification gaps are tracked in [Windows reliability status](docs/WINDOWS_RELIABILITY_STATUS.md).
 
 The project is built with C++17, native platform UI layers, and CMake. It is intended to be opened, built, tested, and debugged from Visual Studio Code or the platform build scripts.
 
@@ -13,11 +15,11 @@ The project is built with C++17, native platform UI layers, and CMake. It is int
 
 | Platform | App | Status |
 | --- | --- | --- |
-| Windows | `ClassicNotepad.exe` | Full native Win32 target with automated parity coverage. |
-| Linux | `ClassicNotepadGtk` | Native GTK4 target with automated parity coverage and optional `libspelling` British English spell checking. |
-| macOS | `ClassicNotepadMac.app` | Native AppKit target with automated parity coverage, AppKit spelling/appearance integration, and universal Release build support. |
+| Windows | `ClassicNotepad.exe` | Native Win32 target with platform automation; current Release evidence covers Windows 11 build 26200 / VS2026 x64. The supported-Windows matrix and full visible-app qualification remain open. |
+| Linux | `ClassicNotepadGtk` | GTK4 implementation with platform-specific automation and optional `libspelling` British English spell checking. This Windows qualification record does not qualify Linux runtime behavior. |
+| macOS | `ClassicNotepadMac.app` | AppKit implementation with platform-specific automation, AppKit spelling/appearance integration, and universal Release build support. This Windows qualification record does not qualify macOS runtime behavior. |
 
-## Finished Feature Set
+## Feature Surface
 
 - Native Win32 desktop app with a classic menu bar and multiline `EDIT` control.
 - Single-document workflow with the title format `Untitled - Classic Notepad`.
@@ -33,7 +35,7 @@ The project is built with C++17, native platform UI layers, and CMake. It is int
 - Right-click editor context menu with edit commands and spelling actions.
 - Find and Replace use the standard Windows modeless dialogs.
 - Go To uses a small native dialog with range validation.
-- Word Wrap recreates the editor while preserving text, selection, modified state, and scroll position where practical.
+- Format > Word Wrap is available in both the native and mapped editor and can be opened with `Alt+O`, then `W`. Toggling native EDIT word wrap recreates that control and clears its native Undo history; text, selection, and modified state are preserved, while its vertical scroll position can reset during recreation. Mapped-editor wrap changes preserve its document and Undo history.
 - Font selection uses the standard Windows font dialog.
 - Status bar shows line, column, character count, detected line endings, and detected encoding.
 - Page Setup stores margins and printer settings for the current app session.
@@ -46,11 +48,17 @@ The project is built with C++17, native platform UI layers, and CMake. It is int
 - Spell check context actions include suggestions, Ignore Once, and Add to Dictionary.
 - Keyboard accelerators: `Ctrl+N`, `Ctrl+O`, `Ctrl+S`, `Ctrl+Shift+S`, `Ctrl+F`, `F3`, `Ctrl+H`, `Ctrl+G`, `Ctrl+A`, `F5`, `Ctrl+Z`, `Ctrl+X`, `Ctrl+C`, `Ctrl+V`, and `Del`.
 - Focused console tests for encoding, line-ending, document round-trip, metadata, new-file, and spelling text utility behavior.
-- Shared JSON-lines automation suite for Windows, Linux, and macOS feature parity.
+- Shared JSON-lines automation runner with platform-specific suites; passing a platform run does not establish full visible-app or cross-platform parity.
 
-## Linux GTK Parity Target
+## Current Windows Qualification
 
-The Linux target builds as `ClassicNotepadGtk` on Ubuntu/WSL with GTK4. It now covers the same automated feature groups as the Windows binary:
+The latest review-reconciled Windows Release evidence set passed on Windows 11 build 26200 with Visual Studio 2026 x64. It passed the Release build, all 11 registered CTest targets, and the selected Ordinary automation suite. The same binary also passed the manifest-defined Stress, Failure, and Full suites. See [the evidence summary and open gates](docs/WINDOWS_RELIABILITY_STATUS.md).
+
+The Phase C real operating-system clipboard smoke and the broader supported-Windows/visible-app matrix remain open. The native paste measurements use a controlled provider through the production `WM_PASTE` handler and do not substitute for the real clipboard test.
+
+## Linux GTK Target
+
+The Linux target builds as `ClassicNotepadGtk` on Ubuntu/WSL with GTK4. Its platform-specific automation covers shared feature areas; run the Linux build and automation commands below to gather Linux runtime evidence. The Windows qualification record above does not qualify Linux behavior.
 
 Files of 48 MiB or larger use a Linux-specific virtualized GTK drawing surface backed by the shared mapped-source piece tree. The first viewport is indexed synchronously, complete indexing continues in the background, and visible rows are decoded on demand. Large-file typing, selection, undo, bounded clipboard access, search, Replace All, atomic streaming Save As, status diagnostics, and reopening are routed through the edited tree instead of `GtkTextBuffer`.
 
@@ -148,10 +156,10 @@ lipo -archs build-macos-universal/ClassicNotepadMac.app/Contents/MacOS/ClassicNo
 - The Win32 edit control normalizes line endings while editing.
 - Normal Save writes the line-ending style detected when the file was opened.
 - Mixed line endings are tracked as mixed and saved using the dominant detected style.
-- Windows files at or above 48 MiB open in a dedicated editable large-document control. It keeps the immutable source in a 64-bit mapping and overlays edits with a balanced randomized piece tree. Every subtree aggregates UTF-16 code units, logical line breaks, and CR/LF boundary state, so the edited tree—not the original scanner index—is authoritative for coordinates and rendering. The scanner publishes 64 KiB line-boundary source pieces in 8 MiB mapping batches; UTF-8 pieces also build sparse decoding checkpoints. Ordinary files continue to use the multiline Win32 `EDIT` control.
-- Large-document mode supports UTF-8 (with or without BOM), ASCII, and UTF-16 LE with BOM. Invalid UTF-8 or legacy ANSI content is reported rather than decoded lossily. Mouse/keyboard editing, selection, bounded clipboard operations, multi-level undo, asynchronous find/Replace All, 64-bit Go To, Time/Date, visible-region word wrap and spelling, Save, and Save As operate without loading the full document into a `std::wstring`. Save streams an immutable generation to a unique sibling temporary file, flushes it, atomically replaces the destination, and rebases the successful saved generation onto a new mapping.
+- On Windows, source files at or above 48 MiB are routed to the editable large-document control; ordinary files continue to use the multiline Win32 `EDIT` control. The mapped control keeps the immutable source in a 64-bit mapping and overlays edits with a balanced randomized piece tree. Subtree summaries track UTF-16 units, logical line breaks, and CR/LF boundary state for edited-document coordinates and rendering. The scanner publishes bounded source pieces and UTF-8 decoding checkpoints.
+- The Windows large-document implementation handles UTF-8 (with or without BOM), ASCII, and UTF-16 LE with BOM; invalid UTF-8 and legacy ANSI input are reported rather than decoded lossily. Its tested command surface includes editing, selection, bounded clipboard operations, undo, asynchronous find/Replace All, 64-bit Go To, Time/Date, visible-region wrap/spelling, Save, and Save As without materializing the full document in a `std::wstring`. Save streams a generation to a sibling temporary file and rebases after a successful replacement. See the status page for evidence and qualification limits.
 - Inserted text is stored in append-only chunks of at most 64 Ki UTF-16 code units. Undo retains edit descriptions and changed text up to a configurable 64 MiB default; oldest records are evicted when the limit is exceeded. A successful save/rebase discards unreachable inserted chunks and establishes a new saved-generation marker. Clipboard materialization is capped at 16 Mi UTF-16 code units and reports a visible error above that bound. Wrapped layout and spelling retain only the visible viewport plus a small margin. Printing remains explicitly unavailable for mapped large documents because the existing print path is bounded to the normal editor control.
-- Save now uses an atomic temp-file replace flow to reduce data-loss risk on interruptions.
+- The Windows save paths use temporary-file replacement; the portable fallback has not been qualified for the same failure and atomicity guarantees. See [the reliability status](docs/WINDOWS_RELIABILITY_STATUS.md) and the historical plan's retained portable-save note.
 
 ## Spell Checking
 
@@ -232,7 +240,10 @@ Useful VS Code tasks are already defined in `.vscode/tasks.json`:
 - **build macos debug**: builds `ClassicNotepadMac.app`, `TextConversionTests`, and `MacSpellingCompileTests` in Debug.
 - **build macos release**: builds the macOS target in Release under `build-macos-release`.
 - **package macos universal**: builds, signs, verifies, tests, and zips the universal macOS app.
-- **test debug**: builds Debug and then runs CTest.
+- **test ordinary**: builds Debug, runs CTest, and then runs the Ordinary automation suite.
+- **test extended**: builds Debug, runs CTest, and then runs the full automation suite.
+- **test stress** / **test failure**: run the corresponding manifest-defined automation suite after the Debug build.
+- **verify windows release ordinary**: performs a version-preserving Windows Release build and Ordinary automation run in a dedicated cache.
 - **test macos debug**: builds macOS Debug and then runs CTest.
 - **clean**: removes generated build output.
 
@@ -255,6 +266,24 @@ Run tests after building:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1 -Configuration Debug
 ```
+
+On Windows, `test.ps1` runs CTest and the Ordinary automation suite by default. Select another explicit suite when needed:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1 -Configuration Debug -Suite Stress
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1 -Configuration Debug -Suite Failure
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1 -Configuration Debug -Suite Full
+```
+
+The checked-in suite manifest lists test IDs and requires Ordinary, Stress, and Failure to be a disjoint partition of Full. Current discovery contains 39 Ordinary, 45 Stress, and 36 Failure tests (120 total). Direct calls to `run_automation_tests.py` default to Full; `--list` validates the manifest and reports selected IDs without launching the app.
+
+Run the Windows Release verification gate with Visual Studio 2026, 2022, or 2019 C++ x64 tools, CMake/CTest, and Python 3 available:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-windows-release.ps1 -Suite Ordinary
+```
+
+The gate builds Release, runs all registered CTest targets, and then runs the selected automation suite. Use `-Suite Stress`, `-Suite Failure`, or `-Suite Full` for the other manifest selections. It uses `build\windows-release-verification` and reuses it only when the CMake source/build paths, x64 platform, advertised and installed Visual Studio generator, and matching instance are compatible; unsafe reparse-point trees and incompatible caches are refused and retained. The gate records tool, source/binary, suite, step, manifest, and VERSION identities under `build\windows-release-verification-evidence`. If a child unexpectedly changes `VERSION`, the gate restores the original bytes and reports failure. The legacy `build.ps1 -Configuration Release` behavior is unchanged. The separate 700 MiB large-file performance command below is not part of the ordinary, stress, failure, or Full automation suites.
 
 Run the repeatable Windows Release large-file acceptance test after a Release build. It creates and deletes a 700 MiB temporary UTF-8 CRLF fixture, verifies first usable display, background indexing, beginning/end access, source integrity, and working-set telemetry:
 
@@ -441,14 +470,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test.ps1 -Configur
 python .\tests\automation\run_automation_tests.py --binary .\build\Debug\ClassicNotepad.exe --platform windows
 ```
 
-CTest should report these passing test targets on Windows:
+The current Windows Release evidence reports all 11 registered CTest targets passing:
 
 ```text
 TextConversionTests
+DocumentTransitionCoordinatorTests
+LargeTextWidthSummaryTests
+LargeTextSummaryTests
+InsertedTextValidationTests
+WindowsAnsiEncodingTests
+WindowsMappedSourceTests
+WindowsTextBoundaryTests
+WindowsSpellingOccurrenceTests
+WindowsMenuTextTests
 TextConversionPortableSmokeTests
 ```
 
-The expected Linux parity verification pass is:
+The exact retained Windows Release record, same-binary automation results, and their hashes are listed in [Windows reliability status](docs/WINDOWS_RELIABILITY_STATUS.md). Other Windows versions/builds and the wider visible-app, DPI, input, and lifetime matrix remain unqualified.
+
+Linux GTK build and automation commands are:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-ubuntu.ps1 -Distro Ubuntu-24.04

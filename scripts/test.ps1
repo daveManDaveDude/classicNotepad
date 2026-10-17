@@ -1,6 +1,8 @@
 param(
     [ValidateSet("Debug", "Release", "RelWithDebInfo", "MinSizeRel")]
-    [string]$Configuration = "Debug"
+    [string]$Configuration = "Debug",
+    [ValidateSet("Ordinary", "Stress", "Failure", "Full")]
+    [string]$Suite = "Ordinary"
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,9 +17,7 @@ function Invoke-NativeCommand {
     )
 
     & $FilePath @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "Command failed with exit code $LASTEXITCODE`: $FilePath $($Arguments -join ' ')"
-    }
+    $script:LastNativeExitCode = $LASTEXITCODE
 }
 
 function Get-CTestPath {
@@ -75,4 +75,36 @@ Write-Host "Repository: $RepoRoot"
 Write-Host "Build type: $Configuration"
 Write-Host "Using CTest: $ctest"
 
+$script:LastNativeExitCode = 0
 Invoke-NativeCommand $ctest @("--test-dir", $BuildDir, "-C", $Configuration, "--output-on-failure")
+$ctestExitCode = $script:LastNativeExitCode
+if ($ctestExitCode -ne 0) {
+    exit $ctestExitCode
+}
+
+$binary = Join-Path $BuildDir "$Configuration\ClassicNotepad.exe"
+if (!(Test-Path -LiteralPath $binary)) {
+    $binary = Join-Path $BuildDir "ClassicNotepad.exe"
+}
+if (!(Test-Path -LiteralPath $binary)) {
+    throw "The $Configuration ClassicNotepad.exe was not found under $BuildDir. Build first with .\scripts\build.ps1."
+}
+
+$pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+if (!$pythonCommand) {
+    throw "Python was not found on PATH; install Python 3 to run the Windows automation suite."
+}
+
+$runner = Join-Path $RepoRoot "tests\automation\run_automation_tests.py"
+Write-Host "Automation suite: $Suite"
+$script:LastNativeExitCode = 0
+Invoke-NativeCommand $pythonCommand.Source @(
+    $runner,
+    "--binary", $binary,
+    "--platform", "windows",
+    "--suite", $Suite
+)
+$automationExitCode = $script:LastNativeExitCode
+if ($automationExitCode -ne 0) {
+    exit $automationExitCode
+}

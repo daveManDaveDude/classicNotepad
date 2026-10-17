@@ -31,7 +31,8 @@
                 "-File",
                 "${workspaceFolder}\\scripts\\build.ps1",
                 "-Configuration",
-                "Release"
+                "Release",
+                "-SkipVersionIncrement"
             ],
             "group": "build",
             "problemMatcher": "$msCompile"
@@ -69,7 +70,7 @@
             "problemMatcher": []
         },
         {
-            "label": "test debug",
+            "label": "test ordinary",
             "type": "shell",
             "command": "powershell",
             "args": [
@@ -79,9 +80,80 @@
                 "-File",
                 "${workspaceFolder}\\scripts\\test.ps1",
                 "-Configuration",
-                "Debug"
+                "Debug",
+                "-Suite",
+                "Ordinary"
             ],
             "dependsOn": "build debug",
+            "problemMatcher": []
+        },
+        {
+            "label": "test extended",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}\\scripts\\test.ps1",
+                "-Configuration",
+                "Debug",
+                "-Suite",
+                "Full"
+            ],
+            "dependsOn": "build debug",
+            "problemMatcher": []
+        },
+        {
+            "label": "test stress",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}\\scripts\\test.ps1",
+                "-Configuration",
+                "Debug",
+                "-Suite",
+                "Stress"
+            ],
+            "dependsOn": "build debug",
+            "problemMatcher": []
+        },
+        {
+            "label": "test failure",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}\\scripts\\test.ps1",
+                "-Configuration",
+                "Debug",
+                "-Suite",
+                "Failure"
+            ],
+            "dependsOn": "build debug",
+            "problemMatcher": []
+        },
+        {
+            "label": "verify windows release ordinary",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}\\scripts\\verify-windows-release.ps1",
+                "-Suite",
+                "Ordinary"
+            ],
             "problemMatcher": []
         },
         {

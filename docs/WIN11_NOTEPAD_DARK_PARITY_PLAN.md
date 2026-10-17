@@ -1,5 +1,7 @@
 # Win11 Notepad Dark Parity Plan
 
+> **Historical design plan:** this document preserves the requested comparison goals and implementation notes from its planning snapshot. It is not current platform qualification evidence. See the root [README](../README.md) for the present feature surface and [Windows reliability status](WINDOWS_RELIABILITY_STATUS.md) for later evidence and open gates.
+
 ## Purpose
 
 Bring Classic Notepad closer to the Windows 11 Notepad dark-mode appearance shown in the comparison screenshot.

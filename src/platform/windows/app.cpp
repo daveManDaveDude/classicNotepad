@@ -2,10 +2,13 @@
 
 #include "app_version.h"
 #include "automation.h"
+#include "../../editor_text_semantics.h"
 #include "encoding.h"
 #include "line_endings.h"
 #include "resource.h"
 #include "spell_text_utils.h"
+#include "windows_menu_text.h"
+#include "../../text_search_semantics.h"
 #include "text_metadata.h"
 
 #include <cderr.h>
@@ -13,13 +16,21 @@
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <objbase.h>
+#include <windowsx.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdint>
 #include <cwchar>
 #include <cwctype>
+#include <cstring>
+#include <functional>
 #include <limits>
+#include <new>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -34,18 +45,23 @@ constexpr wchar_t kFindReplaceMessageName[] = L"commdlg_FindReplace";
 constexpr DWORD kFindOptionFlags = FR_DOWN | FR_MATCHCASE | FR_WHOLEWORD;
 constexpr int kTabWidthSpaces = 8;
 constexpr UINT_PTR kSpellCheckTimerId = 1;
+constexpr UINT_PTR kEditorWidthIndexTimerId = 2;
+constexpr UINT_PTR kAutomationContextMenuDismissTimerId = 3;
+constexpr UINT_PTR kStatusCharacterCountTimerId = 4;
 constexpr UINT kSpellCheckDelayMs = 300;
+constexpr UINT kEditorWidthIndexDelayMs = 10;
+constexpr std::size_t kEditorWidthIndexBatchLineLimit = 96U;
+constexpr std::size_t kEditorWidthIndexBatchTextUnitLimit = 64U * 1024U;
+constexpr std::size_t kEditorWidthIndexLocalLineLimit = 96U;
+constexpr std::size_t kEditorWidthIndexLocalTextUnitLimit = 64U * 1024U;
 constexpr UINT kSpellMenuSuggestionBase = 50000;
-constexpr UINT kSpellMenuSuggestionMax = 50004;
 constexpr UINT kSpellMenuNoSuggestions = 50005;
 constexpr UINT kSpellMenuIgnoreOnce = 50006;
 constexpr UINT kSpellMenuAddToDictionary = 50007;
-constexpr int kSpellCheckVisibleLineMargin = 3;
 constexpr std::size_t kMaxVisibleSpellCheckChars = 96U * 1024U;
-constexpr int kFullDocumentWidthScanCharLimit = 256 * 1024;
 constexpr int kExactLineWidthMeasureCharLimit = 4096;
 constexpr int kMaxEditorLineFetchChars = 0xFFFE;
-constexpr int kExactStatusCharacterCountLimit = 256 * 1024;
+constexpr int kStatusCharacterCountBatchUnitLimit = 64 * 1024;
 constexpr int kDefaultEditorFontPointSize = 11;
 constexpr wchar_t kDefaultEditorFontFace[] = L"Consolas";
 constexpr COLORREF kDarkEditorBackground = RGB(32, 32, 32);
@@ -89,6 +105,232 @@ constexpr int kStatusBarSeparatorInset = 7;
 constexpr int kStatusBarMinHeight = 32;
 constexpr std::array<int, kStatusBarPartCount - 1> kStatusBarPartRightPercents{ 18, 40, 62 };
 
+std::wstring FormatSpellHRESULT(HRESULT hresult)
+{
+    wchar_t buffer[16]{};
+    swprintf_s(buffer, L"0x%08lX", static_cast<unsigned long>(hresult));
+    return buffer;
+}
+
+classic_notepad::TransitionSaveObservation MakeTransitionSaveObservation(const LargeFileViewInfo& info)
+{
+    return {
+        info.operationInProgress,
+        info.operationCompleted,
+        info.operationName == L"Save",
+        info.operationToken,
+        info.operationSucceeded,
+        info.modified,
+    };
+}
+
+bool IsValidSpellReplacement(const std::wstring& replacement)
+{
+    if (replacement.empty()) return false;
+    for (std::size_t index = 0U; index < replacement.size(); ++index) {
+        const std::uint32_t unit = static_cast<std::uint32_t>(replacement[index]);
+        if (unit <= 0x001FU || (unit >= 0x007FU && unit <= 0x009FU)) return false;
+        if (unit >= 0xD800U && unit <= 0xDBFFU) {
+            if (index + 1U >= replacement.size()) return false;
+            const std::uint32_t next = static_cast<std::uint32_t>(replacement[index + 1U]);
+            if (next < 0xDC00U || next > 0xDFFFU) return false;
+            ++index;
+        } else if (unit >= 0xDC00U && unit <= 0xDFFFU) {
+            return false;
+        }
+    }
+    return true;
+}
+
+class ScopedLocalBufferLock {
+public:
+    explicit ScopedLocalBufferLock(HLOCAL memory) noexcept
+        : memory_(memory), value_(memory == nullptr ? nullptr : static_cast<wchar_t*>(LocalLock(memory)))
+    {
+    }
+    ~ScopedLocalBufferLock()
+    {
+        if (memory_ != nullptr && value_ != nullptr) LocalUnlock(memory_);
+    }
+    ScopedLocalBufferLock(const ScopedLocalBufferLock&) = delete;
+    ScopedLocalBufferLock& operator=(const ScopedLocalBufferLock&) = delete;
+    wchar_t* Get() const noexcept { return value_; }
+
+private:
+    HLOCAL memory_ = nullptr;
+    wchar_t* value_ = nullptr;
+};
+
+bool TryGetNativeCollapsedDeleteRange(
+    HWND editor,
+    DWORD caret,
+    bool backspace,
+    classic_notepad::TextUnitRange& range)
+{
+    if (editor == nullptr || !IsWindow(editor)) return false;
+    const int textLength = std::max(0, GetWindowTextLengthW(editor));
+    if (caret > static_cast<DWORD>(textLength)) return false;
+    const HLOCAL buffer = reinterpret_cast<HLOCAL>(SendMessageW(editor, EM_GETHANDLE, 0, 0));
+    ScopedLocalBufferLock lockedBuffer(buffer);
+    if (lockedBuffer.Get() == nullptr) return false;
+    return classic_notepad::CollapsedDeleteRange(
+        std::wstring_view(lockedBuffer.Get(), static_cast<std::size_t>(textLength)),
+        caret, backspace, range);
+}
+
+bool TryGetNativeOvertypeRange(
+    HWND editor,
+    DWORD caret,
+    classic_notepad::TextUnitRange& range)
+{
+    if (editor == nullptr || !IsWindow(editor)) return false;
+    const int textLength = std::max(0, GetWindowTextLengthW(editor));
+    if (caret >= static_cast<DWORD>(textLength)) return false;
+    const HLOCAL buffer = reinterpret_cast<HLOCAL>(SendMessageW(editor, EM_GETHANDLE, 0, 0));
+    ScopedLocalBufferLock lockedBuffer(buffer);
+    if (lockedBuffer.Get() == nullptr) return false;
+    const std::wstring_view text(lockedBuffer.Get(), static_cast<std::size_t>(textLength));
+    range = {caret, caret};
+    if (text[caret] == L'\r' || text[caret] == L'\n') return true;
+    if (classic_notepad::IsLowSurrogateUnit(text[caret]) && caret > 0U &&
+        classic_notepad::IsHighSurrogateUnit(text[caret - 1U])) {
+        range = {caret - 1U, caret + 1U};
+        return true;
+    }
+    range.end = classic_notepad::NextScalarBoundary(text, caret);
+    if (range.end <= caret) return false;
+    return true;
+}
+
+class ScopedWindow {
+public:
+    explicit ScopedWindow(HWND window = nullptr) noexcept : window_(window) {}
+    ~ScopedWindow()
+    {
+        if (window_ != nullptr && IsWindow(window_)) DestroyWindow(window_);
+    }
+    ScopedWindow(const ScopedWindow&) = delete;
+    ScopedWindow& operator=(const ScopedWindow&) = delete;
+    HWND Get() const noexcept { return window_; }
+    HWND Release() noexcept
+    {
+        HWND window = window_;
+        window_ = nullptr;
+        return window;
+    }
+
+private:
+    HWND window_;
+};
+
+class ScopedBoolRestore {
+public:
+    ScopedBoolRestore(bool& value, bool replacement) noexcept : value_(value), previous_(value)
+    {
+        value_ = replacement;
+    }
+    ~ScopedBoolRestore() { value_ = previous_; }
+    ScopedBoolRestore(const ScopedBoolRestore&) = delete;
+    ScopedBoolRestore& operator=(const ScopedBoolRestore&) = delete;
+
+private:
+    bool& value_;
+    bool previous_;
+};
+
+template <typename TValue>
+class ScopedValueRestore {
+public:
+    ScopedValueRestore(TValue& value, TValue replacement) noexcept
+        : value_(value), previous_(value)
+    {
+        value_ = replacement;
+    }
+    ~ScopedValueRestore() { value_ = previous_; }
+    ScopedValueRestore(const ScopedValueRestore&) = delete;
+    ScopedValueRestore& operator=(const ScopedValueRestore&) = delete;
+
+private:
+    TValue& value_;
+    TValue previous_;
+};
+
+bool IsInjectedPostAdoptionAllocationFailure(bool automationMode) noexcept
+{
+    if (!automationMode) return false;
+    wchar_t stage[64]{};
+    const DWORD length = GetEnvironmentVariableW(
+        L"CLASSIC_NOTEPAD_TEST_ALLOCATION_FAILURE", stage, static_cast<DWORD>(std::size(stage)));
+    return length > 0U && length < std::size(stage) && wcscmp(stage, L"after-adoption") == 0;
+}
+
+bool IsInjectedMappedMetadataAllocationFailure(bool automationMode) noexcept
+{
+    if (!automationMode) return false;
+    wchar_t stage[64]{};
+    const DWORD length = GetEnvironmentVariableW(
+        L"CLASSIC_NOTEPAD_TEST_ALLOCATION_FAILURE", stage, static_cast<DWORD>(std::size(stage)));
+    if (length == 0U || length >= std::size(stage)) return false;
+    if (wcscmp(stage, L"mapped-adoption") == 0) return true;
+    if (wcscmp(stage, L"mapped-adoption-after-first") == 0) {
+        static unsigned int candidateCount = 0;
+        return ++candidateCount > 1U;
+    }
+    return false;
+}
+
+void SetAllocationFailureMessage(std::wstring& errorMessage) noexcept
+{
+    try {
+        errorMessage.assign(L"The operation could not be completed because memory allocation failed.");
+    } catch (...) {
+        errorMessage.clear();
+    }
+}
+
+void InjectMappedPresentationAllocationFailure(bool automationMode)
+{
+    if (!automationMode) return;
+    wchar_t stage[64]{};
+    const DWORD length = GetEnvironmentVariableW(
+        L"CLASSIC_NOTEPAD_TEST_ALLOCATION_FAILURE", stage, static_cast<DWORD>(std::size(stage)));
+    if (length == 0U || length >= std::size(stage)) return;
+    const bool badAlloc = wcscmp(stage, L"mapped-presentation-bad-alloc") == 0;
+    const bool lengthError = wcscmp(stage, L"mapped-presentation-length-error") == 0;
+    if (!badAlloc && !lengthError) return;
+    static unsigned int publicationCount = 0;
+    if (++publicationCount == 1U) return;
+    if (badAlloc) throw std::bad_alloc();
+    throw std::length_error("injected mapped presentation allocation failure");
+}
+
+void ReportAdoptedDocumentPresentationFailure(HWND mainWindow, bool automationMode) noexcept
+{
+    // Use a literal and native reporting: constructing the themed dialog can
+    // itself allocate while recovering from an allocation failure.
+    constexpr wchar_t message[] =
+        L"The document was opened successfully, but its title or status display could not be refreshed because memory is unavailable.";
+    OutputDebugStringW(message);
+    if (!automationMode) MessageBoxW(mainWindow, message, L"Classic Notepad", MB_OK | MB_ICONWARNING);
+}
+
+int MappedCallbackAllocationFailureForTesting(bool automationMode) noexcept
+{
+    if (!automationMode) return 0;
+    wchar_t stage[64]{};
+    const DWORD length = GetEnvironmentVariableW(
+        L"CLASSIC_NOTEPAD_TEST_ALLOCATION_FAILURE", stage, static_cast<DWORD>(std::size(stage)));
+    if (length == 0U || length >= std::size(stage)) return 0;
+    int failure = 0;
+    if (wcscmp(stage, L"mapped-focus-bad-alloc") == 0) failure = 1;
+    else if (wcscmp(stage, L"mapped-focus-length-error") == 0) failure = 2;
+    else if (wcscmp(stage, L"mapped-paint-bad-alloc") == 0) failure = 3;
+    else if (wcscmp(stage, L"mapped-paint-length-error") == 0) failure = 4;
+    if (failure == 0) return 0;
+    static unsigned int publicationCount = 0;
+    return ++publicationCount == 1U ? 0 : failure;
+}
+
 bool IsPlainInsertKeyPress()
 {
     return (GetKeyState(VK_CONTROL) & 0x8000) == 0 &&
@@ -101,10 +343,23 @@ bool IsOvertypeCharacter(WPARAM character)
     return character >= 0x20 && character != 0x7F;
 }
 
+bool IsHighSurrogateUnit(wchar_t value)
+{
+    const std::uint32_t unit = static_cast<std::uint32_t>(value);
+    return unit >= 0xD800U && unit <= 0xDBFFU;
+}
+
+bool IsLowSurrogateUnit(wchar_t value)
+{
+    const std::uint32_t unit = static_cast<std::uint32_t>(value);
+    return unit >= 0xDC00U && unit <= 0xDFFFU;
+}
+
 struct GoToDialogState {
     std::uint64_t currentLine = 1;
     std::uint64_t maxLine = 1;
     std::uint64_t selectedLine = 1;
+    std::wstring* automationInitialValue = nullptr;
 };
 
 struct AboutDialogState {
@@ -169,11 +424,6 @@ int CALLBACK EnumFontFamilyMatchProc(const LOGFONTW* logFont, const TEXTMETRICW*
     return 1;
 }
 
-bool IsWordCharacter(wchar_t character)
-{
-    return std::iswalnum(static_cast<wint_t>(character)) != 0 || character == L'_';
-}
-
 int SaturatingTextWidthEstimate(int characterCount, int averageCharacterWidth)
 {
     if (characterCount <= 0 || averageCharacterWidth <= 0) {
@@ -227,15 +477,6 @@ POINT PointFromEditorCharPosition(HWND editor, DWORD charIndex)
     return point;
 }
 
-bool HasWordBoundaryAt(const std::wstring& text, std::size_t position)
-{
-    if (position == 0U || position >= text.size()) {
-        return true;
-    }
-
-    return !IsWordCharacter(text[position - 1U]) || !IsWordCharacter(text[position]);
-}
-
 bool TextMatchesAt(
     const std::wstring& text,
     std::size_t position,
@@ -243,27 +484,7 @@ bool TextMatchesAt(
     bool matchCase,
     bool wholeWord)
 {
-    if (needle.empty() || position + needle.size() > text.size()) {
-        return false;
-    }
-
-    const int length = static_cast<int>(needle.size());
-    const int comparison = CompareStringOrdinal(
-        text.c_str() + position,
-        length,
-        needle.c_str(),
-        length,
-        matchCase ? FALSE : TRUE);
-
-    if (comparison != CSTR_EQUAL) {
-        return false;
-    }
-
-    if (!wholeWord) {
-        return true;
-    }
-
-    return HasWordBoundaryAt(text, position) && HasWordBoundaryAt(text, position + needle.size());
+    return classic_notepad::SearchTextMatchesAt(text, position, needle, matchCase, wholeWord);
 }
 
 void CopyToFixedBuffer(std::array<wchar_t, 512>& buffer, const std::wstring& text)
@@ -272,17 +493,64 @@ void CopyToFixedBuffer(std::array<wchar_t, 512>& buffer, const std::wstring& tex
     wcsncpy_s(buffer.data(), buffer.size(), text.c_str(), _TRUNCATE);
 }
 
+struct ClipboardApi {
+    void* context = nullptr;
+    BOOL (*open)(void*, HWND) = nullptr;
+    void (*close)(void*) = nullptr;
+    BOOL (*isFormatAvailable)(void*, UINT) = nullptr;
+    HGLOBAL (*getData)(void*, UINT) = nullptr;
+    bool (*getSize)(void*, HGLOBAL, SIZE_T*) = nullptr;
+    const void* (*lock)(void*, HGLOBAL) = nullptr;
+    void (*unlock)(void*, HGLOBAL) = nullptr;
+    int (*convertAnsi)(void*, UINT, DWORD, LPCCH, int, LPWSTR, int) = nullptr;
+    void (*beforeTextAllocation)(void*) = nullptr;
+};
+
+BOOL NativeClipboardOpen(void*, HWND owner) { return OpenClipboard(owner); }
+void NativeClipboardClose(void*) { CloseClipboard(); }
+BOOL NativeClipboardIsFormatAvailable(void*, UINT format) { return IsClipboardFormatAvailable(format); }
+HGLOBAL NativeClipboardGetData(void*, UINT format) { return static_cast<HGLOBAL>(GetClipboardData(format)); }
+bool NativeClipboardGetSize(void*, HGLOBAL memory, SIZE_T* size)
+{
+    *size = GlobalSize(memory);
+    return true;
+}
+const void* NativeClipboardLock(void*, HGLOBAL memory) { return GlobalLock(memory); }
+void NativeClipboardUnlock(void*, HGLOBAL memory) { GlobalUnlock(memory); }
+int NativeClipboardConvertAnsi(void*, UINT codePage, DWORD flags, LPCCH source, int sourceLength, LPWSTR target, int targetLength)
+{
+    return MultiByteToWideChar(codePage, flags, source, sourceLength, target, targetLength);
+}
+void NativeClipboardBeforeTextAllocation(void*) {}
+
+const ClipboardApi& GetNativeClipboardApi()
+{
+    static const ClipboardApi api{
+        nullptr,
+        NativeClipboardOpen,
+        NativeClipboardClose,
+        NativeClipboardIsFormatAvailable,
+        NativeClipboardGetData,
+        NativeClipboardGetSize,
+        NativeClipboardLock,
+        NativeClipboardUnlock,
+        NativeClipboardConvertAnsi,
+        NativeClipboardBeforeTextAllocation,
+    };
+    return api;
+}
+
 class ClipboardOpenScope {
 public:
-    explicit ClipboardOpenScope(HWND owner)
-        : opened_(OpenClipboard(owner) != FALSE)
+    ClipboardOpenScope(const ClipboardApi& api, HWND owner)
+        : api_(api), opened_(api_.open(api_.context, owner) != FALSE)
     {
     }
 
     ~ClipboardOpenScope()
     {
         if (opened_) {
-            CloseClipboard();
+            api_.close(api_.context);
         }
     }
 
@@ -295,73 +563,438 @@ public:
     }
 
 private:
+    const ClipboardApi& api_;
     bool opened_ = false;
 };
 
-bool ReadUnicodeClipboardText(std::wstring& text)
+enum class PasteOutcome {
+    NoText,
+    Empty,
+    AcquisitionFailure,
+    InvalidData,
+    CapacityRejected,
+    AllocationFailure,
+    NativeFailure,
+    NativePartial,
+    Succeeded,
+};
+
+struct ClipboardTextReadResult {
+    PasteOutcome outcome = PasteOutcome::NoText;
+    std::wstring text;
+};
+
+const wchar_t* PasteOutcomeName(PasteOutcome outcome) noexcept
 {
-    HGLOBAL memory = static_cast<HGLOBAL>(GetClipboardData(CF_UNICODETEXT));
-    if (memory == nullptr) {
-        return false;
+    switch (outcome) {
+    case PasteOutcome::NoText: return L"no-text";
+    case PasteOutcome::Empty: return L"empty";
+    case PasteOutcome::AcquisitionFailure: return L"acquisition-failure";
+    case PasteOutcome::InvalidData: return L"invalid-data";
+    case PasteOutcome::CapacityRejected: return L"capacity-rejected";
+    case PasteOutcome::AllocationFailure: return L"allocation-failure";
+    case PasteOutcome::NativeFailure: return L"native-failure";
+    case PasteOutcome::NativePartial: return L"native-partial";
+    case PasteOutcome::Succeeded: return L"success";
     }
-
-    const wchar_t* clipboardText = static_cast<const wchar_t*>(GlobalLock(memory));
-    if (clipboardText == nullptr) {
-        return false;
-    }
-
-    text.assign(clipboardText);
-    GlobalUnlock(memory);
-    return true;
+    return L"native-failure";
 }
 
-bool ReadAnsiClipboardText(std::wstring& text)
+class GlobalMemoryLockScope {
+public:
+    GlobalMemoryLockScope(const ClipboardApi& api, HGLOBAL memory) noexcept
+        : api_(api), memory_(memory), pointer_(memory == nullptr ? nullptr : api_.lock(api_.context, memory))
+    {
+    }
+
+    ~GlobalMemoryLockScope()
+    {
+        if (pointer_ != nullptr) api_.unlock(api_.context, memory_);
+    }
+
+    GlobalMemoryLockScope(const GlobalMemoryLockScope&) = delete;
+    GlobalMemoryLockScope& operator=(const GlobalMemoryLockScope&) = delete;
+
+    const void* Get() const noexcept { return pointer_; }
+
+private:
+    const ClipboardApi& api_;
+    HGLOBAL memory_ = nullptr;
+    const void* pointer_ = nullptr;
+};
+
+PasteOutcome ReadUnicodeClipboardText(const ClipboardApi& api, std::wstring& text)
 {
-    HGLOBAL memory = static_cast<HGLOBAL>(GetClipboardData(CF_TEXT));
+    HGLOBAL memory = api.getData(api.context, CF_UNICODETEXT);
     if (memory == nullptr) {
-        return false;
+        return PasteOutcome::AcquisitionFailure;
     }
 
-    const char* clipboardText = static_cast<const char*>(GlobalLock(memory));
-    if (clipboardText == nullptr) {
-        return false;
+    SIZE_T byteCount = 0U;
+    if (!api.getSize(api.context, memory, &byteCount)) {
+        return PasteOutcome::AcquisitionFailure;
+    }
+    if (byteCount < sizeof(wchar_t) || byteCount % sizeof(wchar_t) != 0U) {
+        return PasteOutcome::InvalidData;
     }
 
-    const int wideLength = MultiByteToWideChar(CP_ACP, 0, clipboardText, -1, nullptr, 0);
+    GlobalMemoryLockScope lock(api, memory);
+    if (lock.Get() == nullptr) {
+        return PasteOutcome::AcquisitionFailure;
+    }
+
+    const auto* clipboardText = static_cast<const wchar_t*>(lock.Get());
+    const std::size_t unitCount = static_cast<std::size_t>(byteCount / sizeof(wchar_t));
+    std::size_t textLength = 0U;
+    while (textLength < unitCount && clipboardText[textLength] != L'\0') ++textLength;
+    if (textLength == unitCount) {
+        return PasteOutcome::InvalidData;
+    }
+    if (textLength == 0U) {
+        return PasteOutcome::Empty;
+    }
+
+    for (std::size_t index = 0U; index < textLength; ++index) {
+        const wchar_t unit = clipboardText[index];
+        if (unit >= 0xD800 && unit <= 0xDBFF) {
+            if (index + 1U >= textLength || clipboardText[index + 1U] < 0xDC00 || clipboardText[index + 1U] > 0xDFFF) {
+                return PasteOutcome::InvalidData;
+            }
+            ++index;
+        } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
+            return PasteOutcome::InvalidData;
+        }
+    }
+
+    if (api.beforeTextAllocation != nullptr) api.beforeTextAllocation(api.context);
+    text.assign(clipboardText, textLength);
+    return PasteOutcome::Succeeded;
+}
+
+PasteOutcome ReadAnsiClipboardText(const ClipboardApi& api, std::wstring& text)
+{
+    HGLOBAL memory = api.getData(api.context, CF_TEXT);
+    if (memory == nullptr) {
+        return PasteOutcome::AcquisitionFailure;
+    }
+
+    SIZE_T byteCount = 0U;
+    if (!api.getSize(api.context, memory, &byteCount)) {
+        return PasteOutcome::AcquisitionFailure;
+    }
+    if (byteCount == 0U) {
+        return PasteOutcome::InvalidData;
+    }
+
+    GlobalMemoryLockScope lock(api, memory);
+    if (lock.Get() == nullptr) {
+        return PasteOutcome::AcquisitionFailure;
+    }
+
+    const auto* clipboardText = static_cast<const char*>(lock.Get());
+    const auto* terminator = static_cast<const char*>(std::memchr(clipboardText, '\0', static_cast<std::size_t>(byteCount)));
+    if (terminator == nullptr) {
+        return PasteOutcome::InvalidData;
+    }
+
+    const std::size_t byteLength = static_cast<std::size_t>(terminator - clipboardText);
+    if (byteLength == 0U) {
+        return PasteOutcome::Empty;
+    }
+    if (byteLength > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return PasteOutcome::CapacityRejected;
+    }
+
+    const int sourceLength = static_cast<int>(byteLength);
+    const int wideLength = api.convertAnsi(api.context, CP_ACP, MB_ERR_INVALID_CHARS, clipboardText, sourceLength, nullptr, 0);
     if (wideLength <= 0) {
-        GlobalUnlock(memory);
-        return false;
+        return PasteOutcome::InvalidData;
     }
 
+    if (api.beforeTextAllocation != nullptr) api.beforeTextAllocation(api.context);
     std::wstring converted(static_cast<std::size_t>(wideLength), L'\0');
-    if (MultiByteToWideChar(CP_ACP, 0, clipboardText, -1, converted.data(), wideLength) == 0) {
-        GlobalUnlock(memory);
-        return false;
+    if (api.convertAnsi(
+            api.context, CP_ACP, MB_ERR_INVALID_CHARS, clipboardText, sourceLength, converted.data(), wideLength) != wideLength) {
+        return PasteOutcome::InvalidData;
     }
 
-    if (!converted.empty() && converted.back() == L'\0') {
-        converted.pop_back();
-    }
-    text = converted;
+    text.swap(converted);
+    return text.empty() ? PasteOutcome::Empty : PasteOutcome::Succeeded;
+}
 
+ClipboardTextReadResult TryReadClipboardText(HWND owner, const ClipboardApi& api = GetNativeClipboardApi())
+{
+    ClipboardOpenScope clipboard(api, owner);
+    if (!clipboard.IsOpen()) {
+        return { PasteOutcome::AcquisitionFailure, {} };
+    }
+
+    const bool hasUnicodeText = api.isFormatAvailable(api.context, CF_UNICODETEXT) != FALSE;
+    const bool hasAnsiText = api.isFormatAvailable(api.context, CF_TEXT) != FALSE;
+    if (!hasUnicodeText && !hasAnsiText) {
+        return { PasteOutcome::NoText, {} };
+    }
+
+    ClipboardTextReadResult result;
+    try {
+        result.outcome = hasUnicodeText
+            ? ReadUnicodeClipboardText(api, result.text)
+            : ReadAnsiClipboardText(api, result.text);
+    } catch (const std::bad_alloc&) {
+        result.text.clear();
+        result.outcome = PasteOutcome::AllocationFailure;
+    } catch (const std::length_error&) {
+        result.text.clear();
+        result.outcome = PasteOutcome::AllocationFailure;
+    }
+    return result;
+}
+
+class ScopedGlobalMemory {
+public:
+    ScopedGlobalMemory() = default;
+    explicit ScopedGlobalMemory(HGLOBAL memory) : memory_(memory) {}
+    ~ScopedGlobalMemory() { if (memory_ != nullptr) GlobalFree(memory_); }
+    ScopedGlobalMemory(const ScopedGlobalMemory&) = delete;
+    ScopedGlobalMemory& operator=(const ScopedGlobalMemory&) = delete;
+    ScopedGlobalMemory(ScopedGlobalMemory&& other) noexcept : memory_(other.memory_) { other.memory_ = nullptr; }
+    ScopedGlobalMemory& operator=(ScopedGlobalMemory&& other) noexcept
+    {
+        if (this != &other) {
+            if (memory_ != nullptr) GlobalFree(memory_);
+            memory_ = other.memory_;
+            other.memory_ = nullptr;
+        }
+        return *this;
+    }
+    HGLOBAL Get() const noexcept { return memory_; }
+
+private:
+    HGLOBAL memory_ = nullptr;
+};
+
+bool CreateSyntheticClipboardBlock(const void* bytes, SIZE_T byteCount, ScopedGlobalMemory& result)
+{
+    const SIZE_T allocationSize = std::max<SIZE_T>(byteCount, 1U);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, allocationSize);
+    if (memory == nullptr) return false;
+    ScopedGlobalMemory owned(memory);
+    void* destination = GlobalLock(memory);
+    if (destination == nullptr) return false;
+    if (byteCount != 0U) std::memcpy(destination, bytes, static_cast<std::size_t>(byteCount));
     GlobalUnlock(memory);
+    result = std::move(owned);
     return true;
 }
 
-bool TryReadClipboardText(HWND owner, std::wstring& text)
-{
-    text.clear();
+struct SyntheticClipboardContext {
+    std::wstring faultStage;
+    HGLOBAL unicodeMemory = nullptr;
+    HGLOBAL ansiMemory = nullptr;
+    SIZE_T unicodeLogicalSize = 0U;
+    SIZE_T ansiLogicalSize = 0U;
+    bool hasUnicodeText = true;
+    bool hasAnsiText = true;
+    ClassicNotepadApp::AutomationClipboardDiagnostics diagnostics;
+};
 
-    ClipboardOpenScope clipboard(owner);
-    if (!clipboard.IsOpen()) {
-        return false;
+class SyntheticClipboardFixture {
+public:
+    SyntheticClipboardFixture(const std::wstring& text, const std::wstring& faultStage)
+    {
+        context_.faultStage = faultStage;
+        if (faultStage == L"no-text") {
+            context_.hasUnicodeText = false;
+            context_.hasAnsiText = false;
+            return;
+        }
+
+        std::wstring unicodeText = text;
+        std::vector<unsigned char> unicodeBytes;
+        if (faultStage == L"unicode-unterminated") {
+            unicodeBytes.resize(unicodeText.size() * sizeof(wchar_t));
+            if (!unicodeBytes.empty()) std::memcpy(unicodeBytes.data(), unicodeText.data(), unicodeBytes.size());
+        } else if (faultStage == L"unicode-padding") {
+            unicodeBytes.resize((unicodeText.size() + 3U) * sizeof(wchar_t));
+            if (!unicodeText.empty()) std::memcpy(unicodeBytes.data(), unicodeText.data(), unicodeText.size() * sizeof(wchar_t));
+            const wchar_t padding[] = { L'\0', L'X', L'Y' };
+            std::memcpy(unicodeBytes.data() + unicodeText.size() * sizeof(wchar_t), padding, sizeof(padding));
+        } else {
+            if (faultStage == L"invalid") unicodeText.assign(1U, static_cast<wchar_t>(0xD800));
+            unicodeBytes.resize((unicodeText.size() + 1U) * sizeof(wchar_t));
+            if (!unicodeText.empty()) std::memcpy(unicodeBytes.data(), unicodeText.data(), unicodeText.size() * sizeof(wchar_t));
+            std::memset(unicodeBytes.data() + unicodeText.size() * sizeof(wchar_t), 0, sizeof(wchar_t));
+        }
+
+        if (faultStage == L"ansi" || faultStage == L"conversion") {
+            context_.hasUnicodeText = false;
+        }
+        if (context_.hasUnicodeText) {
+            const SIZE_T physicalSize = static_cast<SIZE_T>(std::max<std::size_t>(unicodeBytes.size(), sizeof(wchar_t)));
+            unicodeBytes.resize(static_cast<std::size_t>(physicalSize), 0U);
+            if (!CreateSyntheticClipboardBlock(unicodeBytes.data(), physicalSize, unicodeMemory_)) {
+                throw std::bad_alloc();
+            }
+            context_.unicodeMemory = unicodeMemory_.Get();
+            context_.unicodeLogicalSize = faultStage == L"unicode-odd-size"
+                ? static_cast<SIZE_T>(3U)
+                : static_cast<SIZE_T>(unicodeBytes.size());
+        }
+
+        if (context_.hasAnsiText) {
+            std::vector<char> ansiBytes;
+            const int sourceLength = text.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)())
+                ? -1
+                : static_cast<int>(text.size());
+            if (sourceLength < 0) throw std::length_error("synthetic ANSI clipboard payload is too large");
+            int byteLength = 0;
+            if (sourceLength != 0) {
+                byteLength = WideCharToMultiByte(CP_ACP, 0, text.data(), sourceLength, nullptr, 0, nullptr, nullptr);
+                if (byteLength <= 0) throw std::bad_alloc();
+            }
+            ansiBytes.resize(static_cast<std::size_t>(byteLength) + 1U, '\0');
+            if (byteLength != 0 && WideCharToMultiByte(
+                    CP_ACP, 0, text.data(), sourceLength, ansiBytes.data(), byteLength, nullptr, nullptr) != byteLength) {
+                throw std::bad_alloc();
+            }
+            if (!CreateSyntheticClipboardBlock(ansiBytes.data(), static_cast<SIZE_T>(ansiBytes.size()), ansiMemory_)) {
+                throw std::bad_alloc();
+            }
+            context_.ansiMemory = ansiMemory_.Get();
+            context_.ansiLogicalSize = static_cast<SIZE_T>(ansiBytes.size());
+        }
     }
 
-    if (IsClipboardFormatAvailable(CF_UNICODETEXT) && ReadUnicodeClipboardText(text)) {
+    ClipboardApi Api()
+    {
+        return ClipboardApi{
+            &context_, Open, Close, IsFormatAvailable, GetData, GetSize, Lock, Unlock, ConvertAnsi, BeforeTextAllocation };
+    }
+
+    ClassicNotepadApp::AutomationClipboardDiagnostics Diagnostics() const { return context_.diagnostics; }
+
+private:
+    static SyntheticClipboardContext& Context(void* value) { return *static_cast<SyntheticClipboardContext*>(value); }
+    static BOOL Open(void* value, HWND)
+    {
+        SyntheticClipboardContext& context = Context(value);
+        ++context.diagnostics.openCalls;
+        return context.faultStage == L"open" ? FALSE : TRUE;
+    }
+    static void Close(void* value) { ++Context(value).diagnostics.closeCalls; }
+    static BOOL IsFormatAvailable(void* value, UINT format)
+    {
+        SyntheticClipboardContext& context = Context(value);
+        if (format == CF_UNICODETEXT) {
+            ++context.diagnostics.unicodeAvailabilityChecks;
+            return context.hasUnicodeText ? TRUE : FALSE;
+        }
+        if (format == CF_TEXT) {
+            ++context.diagnostics.ansiAvailabilityChecks;
+            return context.hasAnsiText ? TRUE : FALSE;
+        }
+        return FALSE;
+    }
+    static HGLOBAL GetData(void* value, UINT format)
+    {
+        SyntheticClipboardContext& context = Context(value);
+        if (format == CF_UNICODETEXT) {
+            ++context.diagnostics.unicodeGetDataCalls;
+            return context.faultStage == L"get" ? nullptr : context.unicodeMemory;
+        }
+        if (format == CF_TEXT) {
+            ++context.diagnostics.ansiGetDataCalls;
+            return context.ansiMemory;
+        }
+        return nullptr;
+    }
+    static bool GetSize(void* value, HGLOBAL memory, SIZE_T* size)
+    {
+        SyntheticClipboardContext& context = Context(value);
+        ++context.diagnostics.sizeCalls;
+        if (context.faultStage == L"size") return false;
+        if (memory == context.unicodeMemory) *size = context.unicodeLogicalSize;
+        else if (memory == context.ansiMemory) *size = context.ansiLogicalSize;
+        else return false;
         return true;
     }
+    static const void* Lock(void* value, HGLOBAL memory)
+    {
+        SyntheticClipboardContext& context = Context(value);
+        ++context.diagnostics.lockCalls;
+        if (context.faultStage == L"lock") return nullptr;
+        return GlobalLock(memory);
+    }
+    static void Unlock(void* value, HGLOBAL memory)
+    {
+        ++Context(value).diagnostics.unlockCalls;
+        GlobalUnlock(memory);
+    }
+    static int ConvertAnsi(void* value, UINT codePage, DWORD flags, LPCCH source, int sourceLength, LPWSTR target, int targetLength)
+    {
+        SyntheticClipboardContext& context = Context(value);
+        ++context.diagnostics.conversionCalls;
+        context.diagnostics.lastAnsiSourceLength = sourceLength;
+        if (context.faultStage == L"conversion") return 0;
+        return MultiByteToWideChar(codePage, flags, source, sourceLength, target, targetLength);
+    }
+    static void BeforeTextAllocation(void* value)
+    {
+        if (Context(value).faultStage == L"clipboard-allocation") throw std::bad_alloc();
+    }
 
-    return IsClipboardFormatAvailable(CF_TEXT) && ReadAnsiClipboardText(text);
+    SyntheticClipboardContext context_;
+    ScopedGlobalMemory unicodeMemory_;
+    ScopedGlobalMemory ansiMemory_;
+};
+
+bool GetNormalizedPasteLength(const std::wstring& text, std::size_t& normalizedLength) noexcept
+{
+    normalizedLength = text.size();
+    for (std::size_t index = 0U; index < text.size(); ++index) {
+        if (text[index] == L'\r' && index + 1U < text.size() && text[index + 1U] == L'\n') {
+            ++index;
+        } else if (text[index] != L'\r' && text[index] != L'\n') {
+            continue;
+        } else {
+            if (normalizedLength == std::numeric_limits<std::size_t>::max()) return false;
+            ++normalizedLength;
+        }
+    }
+    return true;
+}
+
+std::wstring NormalizeClipboardTextForEditor(const std::wstring& text, std::size_t normalizedLength)
+{
+    std::wstring normalized;
+    normalized.reserve(normalizedLength);
+    for (std::size_t index = 0U; index < text.size(); ++index) {
+        if (text[index] == L'\r') {
+            if (index + 1U < text.size() && text[index + 1U] == L'\n') ++index;
+            normalized.push_back(L'\r');
+            normalized.push_back(L'\n');
+        } else if (text[index] == L'\n') {
+            normalized.push_back(L'\r');
+            normalized.push_back(L'\n');
+        } else {
+            normalized.push_back(text[index]);
+        }
+    }
+    return normalized;
+}
+
+bool IsValidClipboardUtf16(const std::wstring& text) noexcept
+{
+    for (std::size_t index = 0U; index < text.size(); ++index) {
+        const wchar_t unit = text[index];
+        if (unit >= 0xD800 && unit <= 0xDBFF) {
+            if (index + 1U >= text.size() || text[index + 1U] < 0xDC00 || text[index + 1U] > 0xDFFF) return false;
+            ++index;
+        } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::vector<std::wstring> SplitPrintLines(const std::wstring& text)
@@ -649,53 +1282,6 @@ void ApplyDarkTitleBar(HWND window, bool useDarkMode)
         kDwmBorderColor,
         &borderColor,
         sizeof(borderColor));
-}
-
-std::wstring StripMenuMnemonics(const std::wstring& text)
-{
-    std::wstring stripped;
-    stripped.reserve(text.size());
-    for (std::size_t index = 0; index < text.size(); ++index) {
-        if (text[index] == L'&') {
-            if (index + 1U < text.size() && text[index + 1U] == L'&') {
-                stripped.push_back(L'&');
-                ++index;
-            }
-            continue;
-        }
-
-        stripped.push_back(text[index]);
-    }
-
-    return stripped;
-}
-
-wchar_t FindMenuMnemonic(const std::wstring& text)
-{
-    for (std::size_t index = 0; index + 1U < text.size(); ++index) {
-        if (text[index] == L'&' && text[index + 1U] != L'&') {
-            return static_cast<wchar_t>(std::towlower(static_cast<wint_t>(text[index + 1U])));
-        }
-
-        if (text[index] == L'&') {
-            ++index;
-        }
-    }
-
-    return L'\0';
-}
-
-void SplitMenuItemText(const std::wstring& text, std::wstring& label, std::wstring& accelerator)
-{
-    const std::size_t separator = text.find(L'\t');
-    if (separator == std::wstring::npos) {
-        label = StripMenuMnemonics(text);
-        accelerator.clear();
-        return;
-    }
-
-    label = StripMenuMnemonics(text.substr(0, separator));
-    accelerator = StripMenuMnemonics(text.substr(separator + 1U));
 }
 
 int ScalePixelsForWindow(HWND window, int pixels)
@@ -1797,15 +2383,15 @@ HWND ClassicNotepadApp::CreateScrollCorner()
         this);
 }
 
-HWND ClassicNotepadApp::CreateEditor()
+HWND ClassicNotepadApp::CreateEditor(bool initiallyVisible, bool wordWrap)
 {
     const bool useCustomScrollBars = UseCustomScrollBars();
     const DWORD editorStyle =
-        WS_CHILD | WS_VISIBLE |
+        WS_CHILD | (initiallyVisible ? WS_VISIBLE : 0) |
         (useCustomScrollBars ? 0 : WS_VSCROLL) |
-        (wordWrap_ || useCustomScrollBars ? 0 : WS_HSCROLL) |
+        (wordWrap || useCustomScrollBars ? 0 : WS_HSCROLL) |
         ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL |
-        (wordWrap_ ? 0 : ES_AUTOHSCROLL) |
+        (wordWrap ? 0 : ES_AUTOHSCROLL) |
         ES_NOHIDESEL | ES_WANTRETURN;
 
     const DWORD editorExStyle = darkModeEnabled_ ? 0 : WS_EX_CLIENTEDGE;
@@ -1844,11 +2430,100 @@ HWND ClassicNotepadApp::CreateEditor()
         GWLP_WNDPROC,
         reinterpret_cast<LONG_PTR>(ClassicNotepadApp::EditorWindowProc)));
 
-    verticalScrollBarVisible_ = true;
-    horizontalScrollBarVisible_ = !wordWrap_;
-    nativeVerticalScrollBarVisible_ = !useCustomScrollBars;
-    nativeHorizontalScrollBarVisible_ = !useCustomScrollBars && !wordWrap_;
     return editor;
+}
+
+bool ClassicNotepadApp::TrySetEditorText(
+    HWND editor,
+    const std::wstring& text,
+    std::wstring& errorMessage) const
+{
+    try {
+    errorMessage.clear();
+    if (editor == nullptr || !IsWindow(editor)) {
+        errorMessage = L"The editor control is unavailable.";
+        return false;
+    }
+    if (text.find(L'\0') != std::wstring::npos) {
+        errorMessage = L"The text contains an embedded NUL character that the editor control cannot represent.";
+        return false;
+    }
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const std::uint32_t unit = static_cast<std::uint16_t>(text[index]);
+        if (unit >= 0xD800U && unit <= 0xDBFFU) {
+            if (index + 1U >= text.size()) {
+                errorMessage = L"The text contains an unmatched Unicode surrogate.";
+                return false;
+            }
+            const std::uint32_t low = static_cast<std::uint16_t>(text[++index]);
+            if (low < 0xDC00U || low > 0xDFFFU) {
+                errorMessage = L"The text contains an unmatched Unicode surrogate.";
+                return false;
+            }
+        } else if (unit >= 0xDC00U && unit <= 0xDFFFU) {
+            errorMessage = L"The text contains an unmatched Unicode surrogate.";
+            return false;
+        }
+    }
+    constexpr std::size_t kEditControlLimit = 0x7FFFFFFEU;
+    if (text.size() > kEditControlLimit || text.size() >= static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+        errorMessage = L"The text exceeds the editor control's supported capacity.";
+        return false;
+    }
+
+    if (automationMode_) {
+        wchar_t injectedFailure[32]{};
+        const DWORD failureLength = GetEnvironmentVariableW(
+            L"CLASSIC_NOTEPAD_TEST_EDITOR_ADOPTION_FAILURE",
+            injectedFailure,
+            static_cast<DWORD>(std::size(injectedFailure)));
+        if (failureLength != 0U && failureLength < std::size(injectedFailure)) {
+            if (std::wstring(injectedFailure) == L"partial" && !text.empty()) {
+                const std::wstring partial = text.substr(0U, text.size() / 2U);
+                SetWindowTextW(editor, partial.c_str());
+            }
+            errorMessage = L"The test injected an editor text adoption failure.";
+            return false;
+        }
+    }
+
+    const int expectedLength = static_cast<int>(text.size());
+    // Allocate verification storage before changing the candidate control so an
+    // allocation failure can never occur after the text has been adopted.
+    std::wstring adopted(static_cast<std::size_t>(expectedLength) + 1U, L'\0');
+
+    SendMessageW(editor, EM_SETLIMITTEXT, static_cast<WPARAM>(kEditControlLimit), 0);
+    SetLastError(ERROR_SUCCESS);
+    if (!SetWindowTextW(editor, text.c_str())) {
+        errorMessage = L"The editor control could not accept the complete text.";
+        const DWORD error = GetLastError();
+        if (error != ERROR_SUCCESS) errorMessage += L" (Windows error " + std::to_wstring(error) + L").";
+        return false;
+    }
+
+    if (IsInjectedPostAdoptionAllocationFailure(automationMode_)) throw std::bad_alloc();
+    if (GetWindowTextLengthW(editor) != expectedLength) {
+        errorMessage = L"The editor control accepted only part of the text.";
+        return false;
+    }
+    const int copied = GetWindowTextW(editor, adopted.data(), static_cast<int>(adopted.size()));
+    if (copied != expectedLength) {
+        errorMessage = L"The editor control could not return the complete adopted text.";
+        return false;
+    }
+    adopted.resize(static_cast<std::size_t>(copied));
+    if (adopted != text) {
+        errorMessage = L"The editor control changed the text during adoption.";
+        return false;
+    }
+    return true;
+    } catch (const std::bad_alloc&) {
+        SetAllocationFailureMessage(errorMessage);
+        return false;
+    } catch (const std::length_error&) {
+        SetAllocationFailureMessage(errorMessage);
+        return false;
+    }
 }
 
 HWND ClassicNotepadApp::CreateStatusBar()
@@ -1940,7 +2615,8 @@ RECT ClassicNotepadApp::GetMenuBarItemRect(int index) const
         menuFont_ != nullptr ? menuFont_ : GetStockObject(DEFAULT_GUI_FONT));
     int x = clientRect.left;
     for (int itemIndex = 0; itemIndex <= index; ++itemIndex) {
-        const std::wstring text = StripMenuMnemonics(GetTopLevelMenuText(itemIndex));
+        const std::wstring text = classic_notepad::windows::StripMenuMnemonics(
+            GetTopLevelMenuText(itemIndex));
         SIZE textSize{};
         if (!text.empty()) {
             GetTextExtentPoint32W(deviceContext, text.c_str(), static_cast<int>(text.size()), &textSize);
@@ -2020,7 +2696,8 @@ void ClassicNotepadApp::PaintMenuBar(HDC deviceContext) const
         RECT textRect = itemRect;
         textRect.left += kMenuHorizontalPadding;
         textRect.right -= kMenuHorizontalPadding;
-        const std::wstring text = StripMenuMnemonics(GetTopLevelMenuText(index));
+        const std::wstring text = classic_notepad::windows::StripMenuMnemonics(
+            GetTopLevelMenuText(index));
         SetTextColor(
             deviceContext,
             !darkModeEnabled_ && (index == activeMenuIndex_ || index == hotMenuIndex_)
@@ -2100,9 +2777,7 @@ void ClassicNotepadApp::ShowMenuPopup(int index, bool fromKeyboard)
     PostMessageW(mainWindow_, WM_NULL, 0, 0);
 
     ClearMenuMode();
-    if (editor_ != nullptr) {
-        SetFocus(editor_);
-    }
+    FocusActiveEditor();
 }
 
 bool ClassicNotepadApp::ActivateMenuBarFromKeyboard()
@@ -2126,7 +2801,7 @@ bool ClassicNotepadApp::ActivateMenuMnemonic(wchar_t mnemonic)
     const wchar_t target = static_cast<wchar_t>(std::towlower(static_cast<wint_t>(mnemonic)));
     const int itemCount = GetTopLevelMenuCount();
     for (int index = 0; index < itemCount; ++index) {
-        if (FindMenuMnemonic(GetTopLevelMenuText(index)) == target) {
+        if (classic_notepad::windows::FindMenuMnemonic(GetTopLevelMenuText(index)) == target) {
             ShowMenuPopup(index, true);
             return true;
         }
@@ -2306,6 +2981,7 @@ void ClassicNotepadApp::UpdateMenuChrome()
 
 void ClassicNotepadApp::UpdateThemeFromSystem()
 {
+    BeginEditorViewportAnchorPreservation();
     const bool newDarkMode = ShouldUseDarkMode(appearanceTheme_);
     if (darkModeEnabled_ != newDarkMode) {
         darkModeEnabled_ = newDarkMode;
@@ -2313,6 +2989,7 @@ void ClassicNotepadApp::UpdateThemeFromSystem()
     }
 
     ApplyThemeToWindows();
+    EndEditorViewportAnchorPreservation();
 }
 
 void ClassicNotepadApp::ApplyThemeToWindows()
@@ -2457,7 +3134,7 @@ LRESULT ClassicNotepadApp::HandleDrawItem(WPARAM controlId, LPARAM lParam) const
 
         std::wstring label;
         std::wstring accelerator;
-        SplitMenuItemText(menuItem->text, label, accelerator);
+        classic_notepad::windows::SplitMenuItemText(menuItem->text, label, accelerator);
 
         RECT labelRect = drawItem->rcItem;
         labelRect.left += checkWidth + padding;
@@ -2595,7 +3272,7 @@ LRESULT ClassicNotepadApp::HandleMeasureItem(WPARAM, LPARAM lParam) const
 
     std::wstring label;
     std::wstring accelerator;
-    SplitMenuItemText(menuItem->text, label, accelerator);
+    classic_notepad::windows::SplitMenuItemText(menuItem->text, label, accelerator);
     const SIZE labelSize = MeasureText(deviceContext, label);
     const SIZE acceleratorSize = MeasureText(deviceContext, accelerator);
 
@@ -2653,7 +3330,9 @@ LRESULT ClassicNotepadApp::HandleNotify(LPARAM lParam) const
 
 void ClassicNotepadApp::ResizeEditor()
 {
+    BeginEditorViewportAnchorPreservation();
     if (IsLargeFileMode()) {
+        AdvanceSpellingLayoutRevision();
         const RECT hostRect = GetEditorHostRect();
         largeFileView_->SetBounds(hostRect);
         if (verticalScrollBar_ != nullptr) {
@@ -2665,14 +3344,19 @@ void ClassicNotepadApp::ResizeEditor()
         if (scrollCorner_ != nullptr) {
             ShowWindow(scrollCorner_, SW_HIDE);
         }
+        EndEditorViewportAnchorPreservation();
+        RefreshSpellCheck(false);
         return;
     }
     if (editor_ == nullptr) {
+        EndEditorViewportAnchorPreservation();
         return;
     }
 
+    AdvanceSpellingLayoutRevision();
     UpdateScrollBars();
     RefreshSpellCheck(false);
+    EndEditorViewportAnchorPreservation();
 }
 
 RECT ClassicNotepadApp::GetEditorHostRect()
@@ -2843,6 +3527,7 @@ void ClassicNotepadApp::UpdateEditorFrameStyle()
         return;
     }
 
+    BeginEditorViewportAnchorPreservation();
     SetWindowLongPtrW(editor_, GWL_EXSTYLE, wantedStyle);
     SetWindowPos(
         editor_,
@@ -2853,6 +3538,7 @@ void ClassicNotepadApp::UpdateEditorFrameStyle()
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
     ResizeEditor();
+    EndEditorViewportAnchorPreservation();
 }
 
 void ClassicNotepadApp::UpdateScrollBars()
@@ -2947,8 +3633,7 @@ void ClassicNotepadApp::UpdateScrollBars()
 
 void ClassicNotepadApp::InvalidateWidestLineCache()
 {
-    cachedWidestLineWidth_ = 0;
-    widestLineCacheDirty_ = true;
+    BeginEditorWidthIndexRebuild();
 }
 
 int ClassicNotepadApp::GetVisibleEditorLineCount(int lineMargin) const
@@ -2963,21 +3648,6 @@ int ClassicNotepadApp::GetVisibleEditorLineCount(int lineMargin) const
     const int lineHeight = GetEditorLineHeight();
     const int visibleLines = std::max(1, (clientHeight + lineHeight - 1) / lineHeight + 1);
     return visibleLines + std::max(0, lineMargin) * 2;
-}
-
-int ClassicNotepadApp::GetLastVisibleEditorLine(int lineMargin) const
-{
-    if (editor_ == nullptr) {
-        return 0;
-    }
-
-    const int lineCount = std::max<int>(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
-    const int firstVisibleLine = std::clamp(
-        static_cast<int>(SendMessageW(editor_, EM_GETFIRSTVISIBLELINE, 0, 0)),
-        0,
-        std::max(0, lineCount - 1));
-    const int startLine = std::max(0, firstVisibleLine - std::max(0, lineMargin));
-    return std::min(lineCount - 1, startLine + GetVisibleEditorLineCount(lineMargin) - 1);
 }
 
 std::wstring ClassicNotepadApp::GetEditorLineText(int line, int lengthLimit) const
@@ -3003,70 +3673,270 @@ std::wstring ClassicNotepadApp::GetEditorLineText(int line, int lengthLimit) con
         static_cast<std::size_t>(std::min<int>(static_cast<int>(copied), bufferLength)));
 }
 
-bool ClassicNotepadApp::GetVisibleEditorText(std::wstring& text, DWORD& rangeStart) const
+bool ClassicNotepadApp::GetVisibleEditorTextWindows(
+    std::vector<classic_notepad::SpellingTextWindow>& windows) const
 {
-    text.clear();
-    rangeStart = 0;
+    windows.clear();
+    if (editor_ == nullptr) return false;
 
-    if (editor_ == nullptr || GetWindowTextLengthW(editor_) <= 0) {
-        return false;
-    }
+    const int textLength = GetWindowTextLengthW(editor_);
+    if (textLength <= 0) return false;
 
+    RECT client{};
+    if (!GetClientRect(editor_, &client) || IsRectEmpty(&client)) return false;
+    const int lineHeight = std::max(1, GetEditorLineHeight());
     const int lineCount = std::max<int>(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
     const int firstVisibleLine = std::clamp(
-        static_cast<int>(SendMessageW(editor_, EM_GETFIRSTVISIBLELINE, 0, 0)),
-        0,
-        std::max(0, lineCount - 1));
-    const int startLine = std::max(0, firstVisibleLine - kSpellCheckVisibleLineMargin);
-    const int endLine = GetLastVisibleEditorLine(kSpellCheckVisibleLineMargin);
+        static_cast<int>(SendMessageW(editor_, EM_GETFIRSTVISIBLELINE, 0, 0)), 0, lineCount - 1);
+    const int visibleRows = std::max(1,
+        (static_cast<int>(client.bottom - client.top) + lineHeight - 1) / lineHeight + 1);
+    const int firstRow = firstVisibleLine;
+    const int lastRow = std::min(lineCount - 1, firstVisibleLine + visibleRows - 1);
+    const int maximumAdvance = std::max(1, GetEditorFontMaximumAdvance());
 
-    const LRESULT startResult = SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(startLine), 0);
-    if (startResult < 0) {
-        return false;
+    struct NativeVisibleSegment {
+        std::uint64_t rowStart = 0;
+        std::uint64_t rowEnd = 0;
+        std::uint64_t visibleStart = 0;
+        std::uint64_t visibleEnd = 0;
+    };
+    std::vector<NativeVisibleSegment> segments;
+    segments.reserve(static_cast<std::size_t>(std::max(0, lastRow - firstRow + 1)));
+
+    const auto positionX = [this](std::uint64_t index) {
+        const POINT point = PointFromEditorCharPosition(editor_, static_cast<DWORD>(index));
+        return static_cast<int>(point.x);
+    };
+    const auto lowerBoundX = [&positionX](std::uint64_t start, std::uint64_t length, int target) {
+        std::uint64_t low = 0;
+        std::uint64_t high = length;
+        while (low < high) {
+            const std::uint64_t middle = low + (high - low) / 2U;
+            if (positionX(start + middle) < target) low = middle + 1U;
+            else high = middle;
+        }
+        return start + low;
+    };
+
+    for (int row = firstRow; row <= lastRow; ++row) {
+        const LRESULT rowStartResult = SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(row), 0);
+        if (rowStartResult < 0) continue;
+        const std::uint64_t rowStart = static_cast<std::uint64_t>(rowStartResult);
+        if (rowStart >= static_cast<std::uint64_t>(textLength)) continue;
+        const LRESULT rowLengthResult = SendMessageW(editor_, EM_LINELENGTH,
+            static_cast<WPARAM>(rowStart), 0);
+        if (rowLengthResult <= 0) continue;
+        const std::uint64_t rowLength = static_cast<std::uint64_t>(rowLengthResult);
+        if (rowLength > static_cast<std::uint64_t>(textLength) - rowStart) continue;
+        const std::uint64_t rowEnd = rowStart + rowLength;
+
+        // Use full-width EM_POSFROMCHAR indices to find the text segment whose
+        // character origins intersect the client. EM_CHARFROMPOS truncates its
+        // returned character index and is not suitable for this extraction.
+        const std::uint64_t visibleStart = lowerBoundX(
+            rowStart, rowLength, static_cast<int>(client.left) - maximumAdvance);
+        const std::uint64_t visibleEnd = lowerBoundX(
+            rowStart, rowLength, static_cast<int>(client.right) + 1);
+        if (visibleStart >= visibleEnd || visibleStart >= rowEnd) continue;
+        segments.push_back({rowStart, rowEnd, visibleStart, std::min(visibleEnd, rowEnd)});
     }
+    if (segments.empty()) return false;
 
-    rangeStart = static_cast<DWORD>(startResult);
-    DWORD expectedPosition = rangeStart;
-    text.reserve(std::min<std::size_t>(kMaxVisibleSpellCheckChars, 4096U));
+    const HLOCAL textHandle = reinterpret_cast<HLOCAL>(SendMessageW(editor_, EM_GETHANDLE, 0, 0));
+    if (textHandle == nullptr) return false;
+    const auto unlockLocalText = [textHandle](const wchar_t*) { LocalUnlock(textHandle); };
+    std::unique_ptr<const wchar_t, decltype(unlockLocalText)> lockedText(
+        static_cast<const wchar_t*>(LocalLock(textHandle)), unlockLocalText);
+    if (!lockedText) return false;
 
-    for (int line = startLine; line <= endLine && text.size() < kMaxVisibleSpellCheckChars; ++line) {
-        const LRESULT lineStartResult = SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(line), 0);
-        if (lineStartResult < 0) {
-            continue;
+    const classic_notepad::SpellingRevision revision = CurrentSpellingRevision();
+    std::size_t remainingUnits = kMaxVisibleSpellCheckChars;
+    windows.reserve(segments.size());
+    for (const NativeVisibleSegment& segment : segments) {
+        std::uint64_t start = segment.visibleStart;
+        std::uint64_t end = segment.visibleEnd;
+        if (start > 0U && start < static_cast<std::uint64_t>(textLength) &&
+            IsHighSurrogateUnit(lockedText.get()[start - 1U]) &&
+            IsLowSurrogateUnit(lockedText.get()[start])) {
+            --start;
+        }
+        if (end > 0U && end < static_cast<std::uint64_t>(textLength) &&
+            IsHighSurrogateUnit(lockedText.get()[end - 1U]) &&
+            IsLowSurrogateUnit(lockedText.get()[end])) {
+            ++end;
         }
 
-        const DWORD lineStart = static_cast<DWORD>(lineStartResult);
-        if (lineStart > expectedPosition) {
-            const DWORD gapLength = lineStart - expectedPosition;
-            const std::size_t remaining = kMaxVisibleSpellCheckChars - text.size();
-            const std::size_t copiedGap = std::min<std::size_t>(gapLength, remaining);
-            text.append(copiedGap, L'\n');
-            expectedPosition += static_cast<DWORD>(copiedGap);
-            if (copiedGap < gapLength) {
-                break;
+        const std::uint64_t available = end - start;
+        if (available == 0U || remainingUnits == 0U) continue;
+        if (available > remainingUnits) {
+            end = start + remainingUnits;
+            if (end > 0U && end < static_cast<std::uint64_t>(textLength) &&
+                IsHighSurrogateUnit(lockedText.get()[end - 1U]) &&
+                IsLowSurrogateUnit(lockedText.get()[end])) {
+                --end;
             }
-        } else if (lineStart < expectedPosition) {
-            continue;
+            if (end <= start) continue;
         }
+        const std::size_t copiedUnits = static_cast<std::size_t>(end - start);
+        if (copiedUnits == 0U) continue;
 
-        const int lineLength = static_cast<int>(SendMessageW(editor_, EM_LINELENGTH, static_cast<WPARAM>(lineStart), 0));
-        const std::size_t remaining = kMaxVisibleSpellCheckChars - text.size();
-        const int copyLength = static_cast<int>(std::min<std::size_t>(
-            std::max(0, lineLength),
-            std::min<std::size_t>(remaining, static_cast<std::size_t>(kMaxEditorLineFetchChars))));
-        if (copyLength <= 0) {
-            continue;
+        classic_notepad::SpellingTextWindow window;
+        window.revision = revision;
+        window.absoluteStart = start;
+        window.text.assign(lockedText.get() + start, copiedUnits);
+        // A native EDIT display row can split an unbroken word. Check the
+        // adjacent document units, rather than the display-row bounds, so a
+        // wrapped row boundary does not make a clipped word fragment eligible.
+        const bool leftBoundaryContinuesWord = start > 0U &&
+            classic_notepad::IsSpellingWordContinuationUnit(lockedText.get()[start - 1U]);
+        const bool rightBoundaryContinuesWord = end < static_cast<std::uint64_t>(textLength) &&
+            classic_notepad::IsSpellingWordContinuationUnit(lockedText.get()[end]);
+        classic_notepad::SetSpellingEligibleBounds(
+            window, leftBoundaryContinuesWord, rightBoundaryContinuesWord);
+        if (!classic_notepad::IsUtf16ScalarBoundary(window.text, window.eligibleStart) ||
+            !classic_notepad::IsUtf16ScalarBoundary(window.text, window.eligibleEnd)) {
+            windows.clear();
+            return false;
         }
+        remainingUnits -= copiedUnits;
+        windows.push_back(std::move(window));
+    }
+    return !windows.empty();
+}
 
-        const std::wstring lineText = GetEditorLineText(line, copyLength);
-        text += lineText;
-        expectedPosition += static_cast<DWORD>(lineText.size());
-        if (lineText.size() < static_cast<std::size_t>(lineLength)) {
-            break;
+bool ClassicNotepadApp::ResolveEditorSpellingContextTarget(
+    POINT clientPoint,
+    bool keyboardInvocation,
+    classic_notepad::SpellingContextTarget& target) const
+{
+    target = {};
+    if (editor_ == nullptr || !spellCheckAvailable_) return false;
+    const classic_notepad::SpellingRevision revision = CurrentSpellingRevision();
+    if (!classic_notepad::SpellingBatchIsCurrent(spellingBatch_, revision)) return false;
+
+    std::vector<classic_notepad::SpellingTextWindow> windows;
+    if (!GetVisibleEditorTextWindows(windows)) return false;
+    if (keyboardInvocation) {
+        DWORD selectionStart = 0U;
+        DWORD selectionEnd = 0U;
+        GetSelectionRange(selectionStart, selectionEnd);
+        std::uint64_t caretPosition = selectionEnd;
+        if (selectionStart != selectionEnd) {
+            POINT caretPoint{};
+            if (!GetCaretPos(&caretPoint)) return false;
+            const POINT startPoint = PointFromEditorCharPosition(editor_, selectionStart);
+            const POINT endPoint = PointFromEditorCharPosition(editor_, selectionEnd);
+            const bool atStart = caretPoint.x == startPoint.x && caretPoint.y == startPoint.y;
+            const bool atEnd = caretPoint.x == endPoint.x && caretPoint.y == endPoint.y;
+            if (atStart == atEnd) return false;
+            caretPosition = atStart ? selectionStart : selectionEnd;
         }
+        return classic_notepad::ResolveSpellingContextTarget(
+            windows, revision, caretPosition, true, target);
     }
 
-    return !text.empty();
+    RECT client{};
+    if (!GetClientRect(editor_, &client) || !PtInRect(&client, clientPoint)) return false;
+    const int textLength = GetWindowTextLengthW(editor_);
+    const int lineCount = std::max<int>(1,
+        static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
+    const int firstVisibleLine = std::clamp(
+        static_cast<int>(SendMessageW(editor_, EM_GETFIRSTVISIBLELINE, 0, 0)), 0, lineCount - 1);
+    const int lineHeight = std::max(1, GetEditorLineHeight());
+    const int visibleRows = std::max(1,
+        (static_cast<int>(client.bottom - client.top) + lineHeight - 1) / lineHeight + 1);
+    const int lastVisibleLine = std::min(lineCount - 1, firstVisibleLine + visibleRows);
+    bool foundPosition = false;
+    std::uint64_t characterPosition = 0U;
+    for (int displayLine = firstVisibleLine; displayLine <= lastVisibleLine; ++displayLine) {
+        const LRESULT rowStartResult = SendMessageW(
+            editor_, EM_LINEINDEX, static_cast<WPARAM>(displayLine), 0);
+        if (rowStartResult < 0) continue;
+        const std::uint64_t rowStart = static_cast<std::uint64_t>(rowStartResult);
+        if (rowStart >= static_cast<std::uint64_t>(textLength)) continue;
+        const LRESULT rowLengthResult = SendMessageW(
+            editor_, EM_LINELENGTH, static_cast<WPARAM>(rowStart), 0);
+        if (rowLengthResult <= 0) continue;
+        const std::uint64_t rowLength = static_cast<std::uint64_t>(rowLengthResult);
+        if (rowLength > static_cast<std::uint64_t>(textLength) - rowStart) continue;
+        const std::uint64_t rowEnd = rowStart + rowLength;
+        const POINT rowOrigin = PointFromEditorCharPosition(editor_, static_cast<DWORD>(rowStart));
+        if (clientPoint.y < rowOrigin.y ||
+            clientPoint.y >= rowOrigin.y + lineHeight) continue;
+
+        for (const classic_notepad::SpellingTextWindow& window : windows) {
+            if (!classic_notepad::SpellingRevisionMatches(window.revision, revision) ||
+                window.text.size() > (std::numeric_limits<std::uint64_t>::max)() - window.absoluteStart) {
+                return false;
+            }
+            const std::uint64_t windowEnd = window.absoluteStart +
+                static_cast<std::uint64_t>(window.text.size());
+            std::uint64_t index = (std::max)(rowStart, window.absoluteStart);
+            const std::uint64_t segmentEnd = (std::min)(rowEnd, windowEnd);
+            while (index < segmentEnd) {
+                const std::size_t local = static_cast<std::size_t>(index - window.absoluteStart);
+                if (!classic_notepad::IsUtf16ScalarBoundary(window.text, local)) {
+                    ++index;
+                    continue;
+                }
+                std::uint64_t next = index + 1U;
+                if (next < windowEnd && local + 1U < window.text.size() &&
+                    IsHighSurrogateUnit(window.text[local]) && IsLowSurrogateUnit(window.text[local + 1U])) {
+                    ++next;
+                }
+                if (next > segmentEnd || next > windowEnd) break;
+
+                const POINT startPoint = PointFromEditorCharPosition(editor_, static_cast<DWORD>(index));
+                const POINT endPoint = PointFromEditorCharPosition(editor_, static_cast<DWORD>(next));
+                if (startPoint.y == rowOrigin.y && endPoint.y == rowOrigin.y &&
+                    endPoint.x > startPoint.x && clientPoint.x >= startPoint.x &&
+                    clientPoint.x < endPoint.x) {
+                    if (foundPosition && characterPosition != index) return false;
+                    characterPosition = index;
+                    foundPosition = true;
+                    break;
+                }
+                index = next;
+            }
+        }
+    }
+    return foundPosition && classic_notepad::ResolveSpellingContextTarget(
+        windows, revision, characterPosition, false, target);
+}
+
+classic_notepad::SpellingRevision ClassicNotepadApp::CurrentSpellingRevision() const
+{
+    if (largeFileView_ != nullptr) return largeFileView_->GetSpellingRevision();
+    return {spellingSessionId_, spellingContentRevision_, spellingLayoutRevision_};
+}
+
+void ClassicNotepadApp::ClearSpellingAnnotations()
+{
+    spellingBatch_ = {};
+    if (largeFileView_ != nullptr) largeFileView_->SetSpellingBatch({});
+    if (editor_ != nullptr) InvalidateRect(editor_, nullptr, FALSE);
+}
+
+void ClassicNotepadApp::AdvanceSpellingSession()
+{
+    if (++spellingSessionId_ == 0U) spellingSessionId_ = 1U;
+    spellingContentRevision_ = 1U;
+    spellingLayoutRevision_ = 1U;
+    ClearIgnoredSpellingOccurrences();
+    ClearSpellingAnnotations();
+}
+
+void ClassicNotepadApp::AdvanceSpellingContentRevision()
+{
+    if (++spellingContentRevision_ == 0U) spellingContentRevision_ = 1U;
+    ClearIgnoredSpellingOccurrences();
+    ClearSpellingAnnotations();
+}
+
+void ClassicNotepadApp::AdvanceSpellingLayoutRevision()
+{
+    if (++spellingLayoutRevision_ == 0U) spellingLayoutRevision_ = 1U;
+    ClearSpellingAnnotations();
 }
 
 int ClassicNotepadApp::GetEditorLineHeight() const
@@ -3106,151 +3976,648 @@ int ClassicNotepadApp::MeasureWidestEditorLine() const
         return 0;
     }
 
-    const int textLength = GetWindowTextLengthW(editor_);
-    if (textLength <= 0) {
-        cachedWidestLineWidth_ = 0;
-        widestLineCacheDirty_ = false;
-        return 0;
+    int widestLine = measuredEditorLineWidths_.empty() ? 0 : *measuredEditorLineWidths_.rbegin();
+    if (editorWidthIndexNeedsRebuild_ || editorWidthIndexAllocationFailed_ || editorWidthUnknownLines_ != 0U) {
+        widestLine = std::max(widestLine, GetEditorWidthFallback());
     }
-
-    if (textLength > kFullDocumentWidthScanCharLimit) {
-        return MeasureVisibleEditorLineWidth();
-    }
-
-    if (!widestLineCacheDirty_) {
-        return cachedWidestLineWidth_;
-    }
-
-    cachedWidestLineWidth_ = MeasureFullEditorLineWidth();
+    cachedWidestLineWidth_ = widestLine;
     widestLineCacheDirty_ = false;
-    return cachedWidestLineWidth_;
-}
-
-int ClassicNotepadApp::MeasureFullEditorLineWidth() const
-{
-    if (editor_ == nullptr) {
-        return 0;
-    }
-
-    HDC deviceContext = GetDC(editor_);
-    if (deviceContext == nullptr) {
-        return 0;
-    }
-
-    HGDIOBJ previousFont = nullptr;
-    if (editorFont_ != nullptr) {
-        previousFont = SelectObject(deviceContext, editorFont_);
-    }
-
-    int widestLine = 0;
-    const std::wstring text = GetEditorText();
-    std::wstring expandedLine;
-    std::size_t lineStart = 0;
-    for (std::size_t index = 0; index <= text.size(); ++index) {
-        const bool atEnd = index == text.size();
-        const bool atLineBreak = !atEnd && (text[index] == L'\r' || text[index] == L'\n');
-        if (!atEnd && !atLineBreak) {
-            continue;
-        }
-
-        ExpandTabsForMeasurementRange(text, lineStart, index - lineStart, expandedLine);
-        SIZE textSize{};
-        if (!expandedLine.empty() &&
-            GetTextExtentPoint32W(
-                deviceContext,
-                expandedLine.c_str(),
-                static_cast<int>(std::min<std::size_t>(
-                    expandedLine.size(),
-                    static_cast<std::size_t>(std::numeric_limits<int>::max()))),
-                &textSize)) {
-            widestLine = std::max(widestLine, static_cast<int>(textSize.cx));
-        }
-
-        if (!atEnd && text[index] == L'\r' && index + 1U < text.size() && text[index + 1U] == L'\n') {
-            ++index;
-        }
-        lineStart = index + 1U;
-    }
-
-    if (previousFont != nullptr) {
-        SelectObject(deviceContext, previousFont);
-    }
-    ReleaseDC(editor_, deviceContext);
-
     return widestLine;
 }
 
-int ClassicNotepadApp::MeasureVisibleEditorLineWidth() const
+int ClassicNotepadApp::GetEditorFontMaximumAdvance() const
 {
     if (editor_ == nullptr) {
-        return 0;
+        return 1;
     }
 
     HDC deviceContext = GetDC(editor_);
     if (deviceContext == nullptr) {
-        return 0;
+        return std::max(1, GetEditorHorizontalScrollUnit());
     }
 
-    HGDIOBJ previousFont = nullptr;
-    if (editorFont_ != nullptr) {
-        previousFont = SelectObject(deviceContext, editorFont_);
-    }
-
+    HGDIOBJ previousFont = editorFont_ != nullptr ? SelectObject(deviceContext, editorFont_) : nullptr;
     TEXTMETRICW textMetrics{};
-    const bool measuredMetrics = GetTextMetricsW(deviceContext, &textMetrics) != 0;
-    const int averageCharacterWidth = measuredMetrics
-        ? std::max(1, static_cast<int>(textMetrics.tmAveCharWidth))
-        : 1;
-
-    int widestLine = 0;
-    const int lineCount = std::max<int>(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
-    const int firstVisibleLine = std::clamp(
-        static_cast<int>(SendMessageW(editor_, EM_GETFIRSTVISIBLELINE, 0, 0)),
-        0,
-        std::max(0, lineCount - 1));
-    const int startLine = std::max(0, firstVisibleLine - kSpellCheckVisibleLineMargin);
-    const int endLine = GetLastVisibleEditorLine(kSpellCheckVisibleLineMargin);
-
-    for (int line = startLine; line <= endLine; ++line) {
-        const LRESULT lineStartResult = SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(line), 0);
-        if (lineStartResult < 0) {
-            continue;
-        }
-
-        const int lineLength = static_cast<int>(SendMessageW(
-            editor_,
-            EM_LINELENGTH,
-            static_cast<WPARAM>(lineStartResult),
-            0));
-        if (lineLength <= 0) {
-            continue;
-        }
-
-        if (lineLength > kExactLineWidthMeasureCharLimit) {
-            widestLine = std::max(widestLine, SaturatingTextWidthEstimate(lineLength, averageCharacterWidth));
-            continue;
-        }
-
-        const std::wstring lineText = ExpandTabsForPrinting(GetEditorLineText(line, lineLength));
-        SIZE textSize{};
-        if (!lineText.empty() &&
-            GetTextExtentPoint32W(
-                deviceContext,
-                lineText.c_str(),
-                static_cast<int>(std::min<std::size_t>(
-                    lineText.size(),
-                    static_cast<std::size_t>(std::numeric_limits<int>::max()))),
-                &textSize)) {
-            widestLine = std::max(widestLine, static_cast<int>(textSize.cx));
-        }
-    }
-
+    const bool measured = GetTextMetricsW(deviceContext, &textMetrics) != 0;
     if (previousFont != nullptr) {
         SelectObject(deviceContext, previousFont);
     }
     ReleaseDC(editor_, deviceContext);
+    return measured ? std::max(1, static_cast<int>(textMetrics.tmMaxCharWidth)) : 1;
+}
 
-    return widestLine;
+int ClassicNotepadApp::GetEditorTabInterval() const
+{
+    return SaturatingTextWidthEstimate(kTabWidthSpaces, std::max(1, GetEditorHorizontalScrollUnit()));
+}
+
+int ClassicNotepadApp::ConservativeEditorLineWidth(int lineLength) const
+{
+    if (lineLength <= 0) {
+        return 0;
+    }
+    // A tab may advance to the next eight-average-character stop. Treat every
+    // unit as the larger of that interval and the font's widest glyph advance.
+    return SaturatingTextWidthEstimate(
+        lineLength,
+        std::max(GetEditorFontMaximumAdvance(), GetEditorTabInterval()));
+}
+
+int ClassicNotepadApp::GetEditorWidthFallback() const
+{
+    if (editor_ == nullptr) {
+        return 0;
+    }
+    const int textLength = std::max(0, GetWindowTextLengthW(editor_));
+    return SaturatingTextWidthEstimate(
+        textLength,
+        std::max(GetEditorFontMaximumAdvance(), GetEditorTabInterval()));
+}
+
+int ClassicNotepadApp::MeasureEditorLineWidth(int line, int lineLength, bool& conservative) const
+{
+    conservative = false;
+    if (lineLength <= 0) {
+        return 0;
+    }
+    if (lineLength > kExactLineWidthMeasureCharLimit) {
+        conservative = true;
+        return ConservativeEditorLineWidth(lineLength);
+    }
+
+    const std::wstring text = GetEditorLineText(line, lineLength);
+    if (text.size() != static_cast<std::size_t>(lineLength)) {
+        conservative = true;
+        return ConservativeEditorLineWidth(lineLength);
+    }
+
+    return MeasureEditorTextWidth(text, conservative);
+}
+
+int ClassicNotepadApp::MeasureEditorTextWidth(const std::wstring& text, bool& conservative) const
+{
+    conservative = false;
+    if (text.empty()) {
+        return 0;
+    }
+    HDC deviceContext = GetDC(editor_);
+    if (deviceContext == nullptr) {
+        conservative = true;
+        return ConservativeEditorLineWidth(static_cast<int>(std::min<std::size_t>(
+            text.size(), static_cast<std::size_t>((std::numeric_limits<int>::max)()))));
+    }
+    HGDIOBJ previousFont = editorFont_ != nullptr ? SelectObject(deviceContext, editorFont_) : nullptr;
+    const int tabInterval = std::max(1, GetEditorTabInterval());
+    int width = 0;
+    std::size_t segmentStart = 0;
+    for (std::size_t index = 0; index <= text.size(); ++index) {
+        if (index < text.size() && text[index] != L'\t') {
+            continue;
+        }
+        if (index > segmentStart) {
+            SIZE extent{};
+            const int segmentLength = static_cast<int>(index - segmentStart);
+            if (!GetTextExtentPoint32W(deviceContext, text.data() + segmentStart, segmentLength, &extent)) {
+                conservative = true;
+                width = ConservativeEditorLineWidth(static_cast<int>(std::min<std::size_t>(
+                    text.size(), static_cast<std::size_t>((std::numeric_limits<int>::max)()))));
+                break;
+            }
+            width = (extent.cx > 0 && width > (std::numeric_limits<int>::max)() - extent.cx)
+                ? (std::numeric_limits<int>::max)()
+                : width + std::max(0, static_cast<int>(extent.cx));
+        }
+        if (index == text.size()) {
+            break;
+        }
+        const int remainder = width % tabInterval;
+        const int advance = remainder == 0 ? tabInterval : tabInterval - remainder;
+        width = width > (std::numeric_limits<int>::max)() - advance
+            ? (std::numeric_limits<int>::max)()
+            : width + advance;
+        segmentStart = index + 1U;
+    }
+    if (previousFont != nullptr) {
+        SelectObject(deviceContext, previousFont);
+    }
+    ReleaseDC(editor_, deviceContext);
+    return width;
+}
+
+void ClassicNotepadApp::SetEditorLineWidth(std::size_t line, int width)
+{
+    if (line >= editorLineWidths_.size()) {
+        return;
+    }
+    int& previous = editorLineWidths_[line];
+    if (previous >= 0) {
+        const auto found = measuredEditorLineWidths_.find(previous);
+        if (found != measuredEditorLineWidths_.end()) {
+            measuredEditorLineWidths_.erase(found);
+        }
+    } else if (width >= 0 && editorWidthUnknownLines_ > 0U) {
+        --editorWidthUnknownLines_;
+    }
+    previous = width;
+    if (width >= 0) {
+        measuredEditorLineWidths_.insert(width);
+    }
+    widestLineCacheDirty_ = true;
+}
+
+void ClassicNotepadApp::BeginEditorWidthIndexRebuild()
+{
+    ++editorWidthGeneration_;
+    editorWidthMaximumBatchDiscoveredLines_ = 0;
+    editorWidthMaximumBatchPublishedLines_ = 0;
+    editorWidthMaximumBatchTextUnits_ = 0;
+    editorWidthScanLine_ = 0;
+    editorWidthLogicalLineStart_ = 0;
+    editorWidthLogicalLineStartOffset_ = 0;
+    editorWidthLogicalLineLength_ = 0;
+    editorWidthLogicalLineDisplayLines_ = 0;
+    editorWidthLogicalLineText_.clear();
+    editorWidthLogicalLineTextExact_ = true;
+    editorWidthLogicalLineActive_ = false;
+    editorWidthLogicalLineReady_ = false;
+    editorWidthMaximumEditDisplayLineLength_ = 0;
+    editorWidthUnknownLines_ = 0;
+    editorLineWidths_.clear();
+    measuredEditorLineWidths_.clear();
+    editorWidthIndexNeedsRebuild_ = true;
+    editorWidthIndexAllocationFailed_ = false;
+    cachedWidestLineWidth_ = 0;
+    widestLineCacheDirty_ = true;
+
+    if (editor_ != nullptr && !wordWrap_) {
+        const std::size_t lineCount = static_cast<std::size_t>(std::max<LRESULT>(
+            1,
+            SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
+        try {
+            editorLineWidths_.assign(lineCount, -1);
+            editorWidthUnknownLines_ = lineCount;
+            editorWidthIndexNeedsRebuild_ = false;
+            if (mainWindow_ != nullptr) {
+                SetTimer(mainWindow_, kEditorWidthIndexTimerId, kEditorWidthIndexDelayMs, nullptr);
+            }
+        } catch (const std::bad_alloc&) {
+            editorLineWidths_.clear();
+            editorWidthIndexAllocationFailed_ = true;
+        }
+    }
+}
+
+void ClassicNotepadApp::MeasureEditorWidthBatch()
+{
+    if (editor_ == nullptr || IsLargeFileMode() || wordWrap_ || editorWidthIndexAllocationFailed_) {
+        if (mainWindow_ != nullptr) {
+            KillTimer(mainWindow_, kEditorWidthIndexTimerId);
+        }
+        return;
+    }
+    if (editorWidthIndexNeedsRebuild_) {
+        BeginEditorWidthIndexRebuild();
+    }
+    if (editorWidthUnknownLines_ == 0U) {
+        if (mainWindow_ != nullptr) {
+            KillTimer(mainWindow_, kEditorWidthIndexTimerId);
+        }
+        return;
+    }
+
+    BeginEditorViewportAnchorPreservation();
+    ++editorWidthMeasurementBatches_;
+    editorWidthLastBatchDiscoveredLines_ = 0;
+    editorWidthLastBatchPublishedLines_ = 0;
+    editorWidthLastBatchDiscoveredTextUnits_ = 0;
+    editorWidthLastBatchMeasuredTextUnits_ = 0;
+    std::size_t linesProcessed = 0;
+    std::size_t textUnitsProcessed = 0;
+    const int lineCount = std::max<int>(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
+    if (static_cast<std::size_t>(lineCount) != editorLineWidths_.size()) {
+        InvalidateEditorWidthIndex();
+        UpdateScrollBars();
+        EndEditorViewportAnchorPreservation();
+        return;
+    }
+    auto publishLineWidth = [&](std::size_t line, int width) {
+        SetEditorLineWidth(line, width);
+        ++editorWidthLastBatchPublishedLines_;
+    };
+    auto clearLogicalLine = [&]() {
+        editorWidthLogicalLineActive_ = false;
+        editorWidthLogicalLineReady_ = false;
+        editorWidthLogicalLineLength_ = 0;
+        editorWidthLogicalLineDisplayLines_ = 0;
+        editorWidthLogicalLineText_.clear();
+        editorWidthLogicalLineTextExact_ = true;
+    };
+    auto finishLogicalLine = [&]() -> bool {
+        if (!editorWidthLogicalLineActive_ || !editorWidthLogicalLineReady_ ||
+            editorWidthLogicalLineDisplayLines_ == 0U) {
+            return false;
+        }
+        if (editorWidthLastBatchPublishedLines_ >= kEditorWidthIndexBatchLineLimit) {
+            return false;
+        }
+
+        const int logicalLength = static_cast<int>(std::min<std::uint64_t>(
+            editorWidthLogicalLineLength_, static_cast<std::uint64_t>((std::numeric_limits<int>::max)())));
+        const bool canMeasureExactly = logicalLength <= kExactLineWidthMeasureCharLimit &&
+            editorWidthLogicalLineDisplayLines_ <= kEditorWidthIndexBatchLineLimit &&
+            editorWidthLogicalLineTextExact_ &&
+            editorWidthLogicalLineText_.size() == static_cast<std::size_t>(logicalLength);
+        bool conservative = !canMeasureExactly;
+        int width = 0;
+        if (!canMeasureExactly) {
+            width = ConservativeEditorLineWidth(logicalLength);
+            ++editorWidthConservativeLines_;
+        } else {
+            const std::size_t measuredLength = static_cast<std::size_t>(logicalLength);
+            textUnitsProcessed += measuredLength;
+            editorWidthMeasuredTextUnits_ += measuredLength;
+            editorWidthLastBatchMeasuredTextUnits_ += measuredLength;
+            width = MeasureEditorTextWidth(editorWidthLogicalLineText_, conservative);
+            if (conservative) {
+                width = ConservativeEditorLineWidth(logicalLength);
+                ++editorWidthConservativeLines_;
+            }
+        }
+        publishLineWidth(editorWidthLogicalLineStart_, width);
+        editorWidthMeasuredLines_ += editorWidthLogicalLineDisplayLines_;
+        clearLogicalLine();
+        return true;
+    };
+
+    try {
+        if (editorWidthLogicalLineReady_) {
+            finishLogicalLine();
+        }
+
+        while (editorWidthScanLine_ < editorLineWidths_.size() &&
+            linesProcessed < kEditorWidthIndexBatchLineLimit &&
+            editorWidthLastBatchPublishedLines_ < kEditorWidthIndexBatchLineLimit &&
+            textUnitsProcessed < kEditorWidthIndexBatchTextUnitLimit) {
+            const std::size_t line = editorWidthScanLine_++;
+            ++linesProcessed;
+            if (editorLineWidths_[line] >= 0) {
+                continue;
+            }
+
+            const LRESULT start = SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(line), 0);
+            if (start < 0) {
+                publishLineWidth(line, 0);
+                ++editorWidthMeasuredLines_;
+                continue;
+            }
+            const int lineLength = std::max(0, static_cast<int>(SendMessageW(
+                editor_, EM_LINELENGTH, static_cast<WPARAM>(start), 0)));
+            editorWidthMaximumEditDisplayLineLength_ = std::max(
+                editorWidthMaximumEditDisplayLineLength_, static_cast<std::uint64_t>(lineLength));
+
+            const bool startingLogicalLine = !editorWidthLogicalLineActive_;
+            if (startingLogicalLine) {
+                const std::size_t reservedExactUnits = static_cast<std::size_t>(
+                    kExactLineWidthMeasureCharLimit) * 2U;
+                if (lineLength > 0 &&
+                    textUnitsProcessed + reservedExactUnits > kEditorWidthIndexBatchTextUnitLimit &&
+                    linesProcessed > 1U) {
+                    --editorWidthScanLine_;
+                    --linesProcessed;
+                    break;
+                }
+                editorWidthLogicalLineStart_ = line;
+                editorWidthLogicalLineStartOffset_ = static_cast<std::uint64_t>(start);
+                editorWidthLogicalLineLength_ = 0;
+                editorWidthLogicalLineDisplayLines_ = 0;
+                editorWidthLogicalLineText_.clear();
+                editorWidthLogicalLineTextExact_ = true;
+                editorWidthLogicalLineActive_ = true;
+            }
+            if (line != editorWidthLogicalLineStart_ + editorWidthLogicalLineDisplayLines_ ||
+                static_cast<std::uint64_t>(start) !=
+                    editorWidthLogicalLineStartOffset_ + editorWidthLogicalLineLength_) {
+                InvalidateEditorWidthIndex();
+                UpdateScrollBars();
+                EndEditorViewportAnchorPreservation();
+                return;
+            }
+
+            const std::uint64_t nextLogicalLength = editorWidthLogicalLineLength_ +
+                static_cast<std::uint64_t>(lineLength);
+            const std::size_t nextDisplayLineCount = editorWidthLogicalLineDisplayLines_ + 1U;
+            const bool exactCandidate = editorWidthLogicalLineTextExact_ &&
+                nextLogicalLength <= static_cast<std::uint64_t>(kExactLineWidthMeasureCharLimit) &&
+                nextDisplayLineCount <= kEditorWidthIndexBatchLineLimit;
+            if (exactCandidate && lineLength > 0 &&
+                textUnitsProcessed + static_cast<std::size_t>(lineLength) +
+                    static_cast<std::size_t>(kExactLineWidthMeasureCharLimit) >
+                    kEditorWidthIndexBatchTextUnitLimit) {
+                --editorWidthScanLine_;
+                --linesProcessed;
+                if (startingLogicalLine) {
+                    clearLogicalLine();
+                }
+                break;
+            }
+            if (exactCandidate) {
+                const std::wstring segmentText = GetEditorLineText(static_cast<int>(line), lineLength);
+                textUnitsProcessed += static_cast<std::size_t>(lineLength);
+                editorWidthLastBatchDiscoveredTextUnits_ += static_cast<std::uint64_t>(lineLength);
+                if (segmentText.size() == static_cast<std::size_t>(lineLength)) {
+                    editorWidthLogicalLineText_ += segmentText;
+                } else {
+                    editorWidthLogicalLineTextExact_ = false;
+                    editorWidthLogicalLineText_.clear();
+                }
+            } else {
+                editorWidthLogicalLineTextExact_ = false;
+                editorWidthLogicalLineText_.clear();
+            }
+
+            editorWidthLogicalLineLength_ += static_cast<std::uint64_t>(lineLength);
+            ++editorWidthLogicalLineDisplayLines_;
+            if (line != editorWidthLogicalLineStart_) {
+                // Keep one unknown sentinel at the logical row's first display
+                // line. The document fallback remains conservative as each
+                // continuation is published within this batch's line budget.
+                publishLineWidth(line, 0);
+            }
+            const std::size_t nextLine = line + 1U;
+            const LRESULT nextStart = nextLine < editorLineWidths_.size()
+                ? SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(nextLine), 0)
+                : -1;
+            const std::uint64_t currentEnd = static_cast<std::uint64_t>(start) +
+                static_cast<std::uint64_t>(lineLength);
+            if (nextLine >= editorLineWidths_.size() || nextStart < 0 ||
+                static_cast<std::uint64_t>(nextStart) != currentEnd) {
+                editorWidthLogicalLineReady_ = true;
+                if (!finishLogicalLine()) {
+                    break;
+                }
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        InvalidateEditorWidthIndex();
+        EndEditorViewportAnchorPreservation();
+        return;
+    }
+    editorWidthLastBatchDiscoveredLines_ = linesProcessed;
+    editorWidthMaximumBatchDiscoveredLines_ = std::max(
+        editorWidthMaximumBatchDiscoveredLines_, static_cast<std::uint64_t>(linesProcessed));
+    editorWidthMaximumBatchPublishedLines_ = std::max(
+        editorWidthMaximumBatchPublishedLines_, editorWidthLastBatchPublishedLines_);
+    editorWidthMaximumBatchTextUnits_ = std::max(
+        editorWidthMaximumBatchTextUnits_,
+        editorWidthLastBatchDiscoveredTextUnits_ + editorWidthLastBatchMeasuredTextUnits_);
+
+    if (editorWidthUnknownLines_ == 0U) {
+        if (mainWindow_ != nullptr) {
+            KillTimer(mainWindow_, kEditorWidthIndexTimerId);
+        }
+    } else if (editorWidthScanLine_ >= editorLineWidths_.size()) {
+        if (!editorWidthLogicalLineReady_) {
+            // A text change that bypassed the subclass notification can change
+            // line count. Reject this partial index and rebuild from the live EDIT.
+            InvalidateEditorWidthIndex();
+        } else if (mainWindow_ != nullptr) {
+            // All display rows were discovered, but publication may have used
+            // the final batch slot on a continuation placeholder. The next
+            // batch must publish the logical line's first sentinel.
+            SetTimer(mainWindow_, kEditorWidthIndexTimerId, kEditorWidthIndexDelayMs, nullptr);
+        }
+    }
+
+    widestLineCacheDirty_ = true;
+    UpdateScrollBars();
+    EndEditorViewportAnchorPreservation();
+}
+
+void ClassicNotepadApp::InvalidateEditorWidthIndex()
+{
+    BeginEditorWidthIndexRebuild();
+}
+
+bool ClassicNotepadApp::IsEditorDisplayLineWrapped(int line, int lineCount) const
+{
+    if (editor_ == nullptr || line < 0 || line >= lineCount) {
+        return false;
+    }
+    const LRESULT start = SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(line), 0);
+    if (start < 0) {
+        return false;
+    }
+    const int length = std::max(0, static_cast<int>(SendMessageW(
+        editor_, EM_LINELENGTH, static_cast<WPARAM>(start), 0)));
+    const LRESULT end = start + length;
+    if (line + 1 < lineCount) {
+        const LRESULT nextStart = SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(line + 1), 0);
+        if (nextStart == end) {
+            return true;
+        }
+    }
+    if (line > 0) {
+        const LRESULT previousStart = SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(line - 1), 0);
+        if (previousStart >= 0) {
+            const int previousLength = std::max(0, static_cast<int>(SendMessageW(
+                editor_, EM_LINELENGTH, static_cast<WPARAM>(previousStart), 0)));
+            if (previousStart + previousLength == start) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void ClassicNotepadApp::BeginEditorMutationTracking(UINT message, WPARAM wParam)
+{
+    if (editorWidthIndexMutationActive_) {
+        return;
+    }
+    bool wholeDocument = message == WM_SETTEXT || message == WM_UNDO || message == EM_UNDO;
+    const bool likelyMutation = wholeDocument || message == WM_CHAR || message == WM_CUT || message == WM_CLEAR ||
+        message == WM_PASTE || message == EM_REPLACESEL ||
+        (message == WM_KEYDOWN && (wParam == VK_DELETE || wParam == VK_BACK));
+    if (!likelyMutation) {
+        return;
+    }
+
+    if ((message == WM_CHAR && (wParam == 26U || wParam == 25U)) ||
+        (message == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000) != 0 &&
+            (wParam == VK_DELETE || wParam == VK_BACK))) {
+        wholeDocument = true;
+    }
+
+    DWORD selectionStart = 0;
+    DWORD selectionEnd = 0;
+    GetSelectionRange(selectionStart, selectionEnd);
+    if (selectionEnd < selectionStart) {
+        std::swap(selectionStart, selectionEnd);
+    }
+    int lineCount = std::max<int>(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
+    int startLine = std::clamp(static_cast<int>(SendMessageW(
+        editor_, EM_LINEFROMCHAR, selectionStart, 0)), 0, lineCount - 1);
+    int endLine = std::clamp(static_cast<int>(SendMessageW(
+        editor_, EM_LINEFROMCHAR, selectionEnd, 0)), startLine, lineCount - 1);
+
+    if (selectionStart == selectionEnd && message == WM_CHAR && wParam == 8U && startLine > 0) {
+        --startLine;
+    } else if (selectionStart == selectionEnd && message == WM_KEYDOWN && wParam == VK_DELETE) {
+        const LRESULT lineStart = SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(startLine), 0);
+        const int lineLength = lineStart < 0 ? 0 : static_cast<int>(SendMessageW(
+            editor_, EM_LINELENGTH, static_cast<WPARAM>(lineStart), 0));
+        if (static_cast<int>(selectionStart) >= static_cast<int>(lineStart) + lineLength && startLine + 1 < lineCount) {
+            ++endLine;
+        }
+    }
+
+    if (static_cast<std::size_t>(endLine - startLine + 1) > kEditorWidthIndexLocalLineLimit) {
+        wholeDocument = true;
+    }
+    if (!wholeDocument) {
+        for (int line = startLine; line <= endLine; ++line) {
+            if (IsEditorDisplayLineWrapped(line, lineCount)) {
+                wholeDocument = true;
+                break;
+            }
+        }
+    }
+
+    editorWidthIndexMutationActive_ = true;
+    editorWidthIndexMutationHandled_ = false;
+    editorWidthIndexMutationWholeDocument_ = wholeDocument;
+    editorWidthIndexMutationStartLine_ = startLine;
+    editorWidthIndexMutationEndLine_ = endLine;
+    editorWidthIndexMutationGeneration_ = editorWidthGeneration_;
+}
+
+void ClassicNotepadApp::EndEditorMutationTracking()
+{
+    editorWidthIndexMutationActive_ = false;
+    editorWidthIndexMutationHandled_ = false;
+    editorWidthIndexMutationWholeDocument_ = false;
+}
+
+void ClassicNotepadApp::UpdateEditorWidthIndexForMutation()
+{
+    if (editorWidthIndexMutationHandled_) {
+        return;
+    }
+    editorWidthIndexMutationHandled_ = true;
+    if (wordWrap_) {
+        editorWidthIndexNeedsRebuild_ = true;
+        return;
+    }
+    if (!editorWidthIndexMutationActive_ || editorWidthIndexMutationWholeDocument_ ||
+        editorWidthIndexMutationGeneration_ != editorWidthGeneration_ ||
+        editorWidthIndexNeedsRebuild_ || editorWidthIndexAllocationFailed_) {
+        InvalidateEditorWidthIndex();
+        return;
+    }
+
+    const int lineCount = std::max<int>(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
+    const int startLine = std::clamp(editorWidthIndexMutationStartLine_, 0, lineCount - 1);
+    DWORD selectionStart = 0;
+    DWORD selectionEnd = 0;
+    GetSelectionRange(selectionStart, selectionEnd);
+    const int endLine = std::clamp(static_cast<int>(SendMessageW(
+        editor_, EM_LINEFROMCHAR, static_cast<WPARAM>(std::max(selectionStart, selectionEnd)), 0)), startLine, lineCount - 1);
+    const int oldStartLine = std::clamp(editorWidthIndexMutationStartLine_, 0,
+        std::max(0, static_cast<int>(editorLineWidths_.size()) - 1));
+    const int oldEndLine = std::clamp(editorWidthIndexMutationEndLine_, oldStartLine,
+        std::max(oldStartLine, static_cast<int>(editorLineWidths_.size()) - 1));
+    const std::size_t oldCount = static_cast<std::size_t>(oldEndLine - oldStartLine + 1);
+    const std::size_t newCount = static_cast<std::size_t>(endLine - startLine + 1);
+    if (oldCount > kEditorWidthIndexLocalLineLimit || newCount > kEditorWidthIndexLocalLineLimit ||
+        editorLineWidths_.size() < oldCount + static_cast<std::size_t>(oldStartLine) ||
+        editorLineWidths_.size() - oldCount + newCount != static_cast<std::size_t>(lineCount)) {
+        InvalidateEditorWidthIndex();
+        return;
+    }
+    for (int line = startLine; line <= endLine; ++line) {
+        if (IsEditorDisplayLineWrapped(line, lineCount)) {
+            InvalidateEditorWidthIndex();
+            return;
+        }
+    }
+
+    std::vector<int> replacementWidths;
+    try {
+        replacementWidths.assign(newCount, -1);
+        std::size_t localUnits = 0;
+        for (std::size_t offset = 0; offset < newCount; ++offset) {
+            const int line = startLine + static_cast<int>(offset);
+            const LRESULT lineStart = SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(line), 0);
+            const int lineLength = lineStart < 0 ? 0 : std::max(0, static_cast<int>(SendMessageW(
+                editor_, EM_LINELENGTH, static_cast<WPARAM>(lineStart), 0)));
+            if (lineLength > kExactLineWidthMeasureCharLimit) {
+                bool conservative = false;
+                replacementWidths[offset] = MeasureEditorLineWidth(line, lineLength, conservative);
+                if (conservative) {
+                    ++editorWidthConservativeLines_;
+                }
+                ++editorWidthLocalEditMeasurements_;
+                continue;
+            }
+            if (localUnits + static_cast<std::size_t>(lineLength) > kEditorWidthIndexLocalTextUnitLimit) {
+                replacementWidths[offset] = ConservativeEditorLineWidth(lineLength);
+                ++editorWidthConservativeLines_;
+                ++editorWidthLocalEditMeasurements_;
+                continue;
+            }
+            bool conservative = false;
+            replacementWidths[offset] = MeasureEditorLineWidth(line, lineLength, conservative);
+            ++editorWidthLocalEditMeasurements_;
+            localUnits += static_cast<std::size_t>(lineLength);
+            editorWidthLocalEditTextUnits_ += static_cast<std::uint64_t>(lineLength);
+            if (conservative) {
+                ++editorWidthConservativeLines_;
+            }
+        }
+
+        const std::size_t oldScanLine = editorWidthScanLine_;
+        for (std::size_t offset = 0; offset < oldCount; ++offset) {
+            const int width = editorLineWidths_[static_cast<std::size_t>(oldStartLine) + offset];
+            if (width >= 0) {
+                const auto found = measuredEditorLineWidths_.find(width);
+                if (found != measuredEditorLineWidths_.end()) {
+                    measuredEditorLineWidths_.erase(found);
+                }
+            } else if (editorWidthUnknownLines_ > 0U) {
+                --editorWidthUnknownLines_;
+            }
+        }
+        auto eraseBegin = editorLineWidths_.begin() + oldStartLine;
+        auto eraseEnd = eraseBegin + static_cast<std::ptrdiff_t>(oldCount);
+        eraseBegin = editorLineWidths_.erase(eraseBegin, eraseEnd);
+        editorLineWidths_.insert(eraseBegin, replacementWidths.begin(), replacementWidths.end());
+        for (const int width : replacementWidths) {
+            if (width >= 0) {
+                measuredEditorLineWidths_.insert(width);
+            } else {
+                ++editorWidthUnknownLines_;
+            }
+        }
+        const std::size_t oldStart = static_cast<std::size_t>(oldStartLine);
+        const std::size_t oldEnd = oldStart + oldCount;
+        if (oldScanLine > oldEnd) {
+            editorWidthScanLine_ = oldScanLine - oldCount + newCount;
+        } else if (oldScanLine >= oldStart) {
+            editorWidthScanLine_ = oldStart + newCount;
+        }
+        editorWidthIndexNeedsRebuild_ = false;
+        editorWidthIndexAllocationFailed_ = false;
+        if (editorWidthUnknownLines_ == 0U) {
+            if (mainWindow_ != nullptr) {
+                KillTimer(mainWindow_, kEditorWidthIndexTimerId);
+            }
+        } else if (mainWindow_ != nullptr) {
+            SetTimer(mainWindow_, kEditorWidthIndexTimerId, kEditorWidthIndexDelayMs, nullptr);
+        }
+        widestLineCacheDirty_ = true;
+    } catch (const std::bad_alloc&) {
+        InvalidateEditorWidthIndex();
+    }
 }
 
 bool ClassicNotepadApp::NeedsVerticalScrollBar(int availableHeight) const
@@ -3303,12 +4670,46 @@ void ClassicNotepadApp::SetEditorScrollBarVisibility(bool verticalVisible, bool 
         }
     }
 
-    if (horizontalChanged && !horizontalVisible) {
-        horizontalScrollPosition_ = 0;
-        SendMessageW(editor_, WM_HSCROLL, SB_LEFT, 0);
-    } else if (useCustomScrollBars && horizontalVisible) {
+    if (useCustomScrollBars && horizontalVisible) {
         const ScrollBarMetrics horizontalMetrics = GetCustomScrollBarMetrics(ScrollBarOrientation::Horizontal);
+        const int previousPosition = horizontalScrollPosition_;
         horizontalScrollPosition_ = horizontalMetrics.position;
+        const int delta = horizontalScrollPosition_ - previousPosition;
+        if (delta != 0) {
+            SendMessageW(editor_, EM_LINESCROLL, delta, 0);
+        }
+    } else if (horizontalVisible) {
+        const int unit = std::max(1, GetEditorHorizontalScrollUnit());
+        RECT clientRect{};
+        GetClientRect(editor_, &clientRect);
+        const int viewportUnits = std::max(1, std::max(0,
+            static_cast<int>(clientRect.right - clientRect.left) - 8) / unit);
+        const int contentWidth = MeasureWidestEditorLine();
+        const int contentUnits = contentWidth / unit + ((contentWidth % unit) != 0 ? 1 : 0);
+        const int maximumPosition = std::max(0, contentUnits - viewportUnits);
+        SCROLLINFO scrollInfo{};
+        scrollInfo.cbSize = sizeof(scrollInfo);
+        scrollInfo.fMask = SIF_POS;
+        if (GetScrollInfo(editor_, SB_HORZ, &scrollInfo) && scrollInfo.nPos > maximumPosition) {
+            SendMessageW(editor_, EM_LINESCROLL, maximumPosition - scrollInfo.nPos, 0);
+        }
+    }
+
+    if (horizontalChanged && !horizontalVisible && !wordWrap_) {
+        RECT clientRect{};
+        GetClientRect(editor_, &clientRect);
+        const int viewportWidth = std::max(0, static_cast<int>(clientRect.right - clientRect.left) - 8);
+        if (MeasureWidestEditorLine() <= viewportWidth) {
+            if (useCustomScrollBars) {
+                const int oldPosition = horizontalScrollPosition_;
+                horizontalScrollPosition_ = 0;
+                if (oldPosition != 0) {
+                    SendMessageW(editor_, EM_LINESCROLL, -oldPosition, 0);
+                }
+            } else {
+                SendMessageW(editor_, WM_HSCROLL, SB_LEFT, 0);
+            }
+        }
     }
 
     if (useCustomScrollBars) {
@@ -3387,7 +4788,7 @@ ClassicNotepadApp::ScrollBarMetrics ClassicNotepadApp::GetCustomScrollBarMetrics
     const int clientWidth = std::max(0, static_cast<int>(clientRect.right - clientRect.left));
     const int widestLine = MeasureWidestEditorLine();
     const int viewportWidth = std::max(0, clientWidth - 8);
-    const int rangeUnits = std::max(1, (widestLine + unit - 1) / unit);
+    const int rangeUnits = std::max(1, widestLine / unit + ((widestLine % unit) != 0 ? 1 : 0));
     metrics.minimum = 0;
     metrics.maximum = std::max(0, rangeUnits - 1);
     metrics.page = std::max(1, viewportWidth / unit);
@@ -3425,6 +4826,171 @@ int ClassicNotepadApp::GetEditorHorizontalScrollUnit() const
     }
 
     return std::max(1, static_cast<int>(textMetrics.tmAveCharWidth));
+}
+
+int ClassicNotepadApp::GetHorizontalAnchorPixels() const
+{
+    if (editor_ == nullptr) {
+        return 0;
+    }
+    const int unit = std::max(1, GetEditorHorizontalScrollUnit());
+    int nativeMaximumPixels = -1;
+    const int nativePositionPixels = GetNativeEditorHorizontalPosition(&nativeMaximumPixels);
+    if (nativeMaximumPixels >= 0) {
+        return std::max(0, nativePositionPixels);
+    }
+    if (horizontalScrollPosition_ <= 0) {
+        return 0;
+    }
+    return horizontalScrollPosition_ > (std::numeric_limits<int>::max)() / unit
+        ? (std::numeric_limits<int>::max)()
+        : horizontalScrollPosition_ * unit;
+}
+
+int ClassicNotepadApp::GetNativeEditorHorizontalPosition(int* maximumPosition) const
+{
+    if (maximumPosition != nullptr) {
+        *maximumPosition = -1;
+    }
+    if (editor_ == nullptr) {
+        return 0;
+    }
+
+    SCROLLINFO scrollInfo{};
+    scrollInfo.cbSize = sizeof(scrollInfo);
+    scrollInfo.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    if (!GetScrollInfo(editor_, SB_HORZ, &scrollInfo)) {
+        return horizontalScrollPosition_;
+    }
+
+    const long long rangeMaximum = static_cast<long long>(scrollInfo.nMax) - scrollInfo.nMin -
+        static_cast<long long>(std::max<UINT>(1U, scrollInfo.nPage)) + 1LL;
+    const int boundedMaximum = static_cast<int>(std::clamp(
+        rangeMaximum,
+        0LL,
+        static_cast<long long>((std::numeric_limits<int>::max)())));
+    if (maximumPosition != nullptr &&
+        (scrollInfo.nMax > scrollInfo.nMin || scrollInfo.nPos > 0 || scrollInfo.nPage > 0)) {
+        *maximumPosition = boundedMaximum;
+    }
+    if (scrollInfo.nMax > scrollInfo.nMin || scrollInfo.nPos > 0 || scrollInfo.nPage > 0) {
+        return std::max(0, scrollInfo.nPos);
+    }
+    return horizontalScrollPosition_;
+}
+
+void ClassicNotepadApp::BeginEditorViewportAnchorPreservation()
+{
+    if (editorViewportAnchorDepth_++ != 0U) {
+        return;
+    }
+
+    editorViewportAnchor_ = {};
+    if (editor_ == nullptr || IsLargeFileMode()) {
+        return;
+    }
+
+    const int unit = std::max(1, GetEditorHorizontalScrollUnit());
+    int horizontalMaximumPixels = -1;
+    const int horizontalPositionPixels = GetNativeEditorHorizontalPosition(&horizontalMaximumPixels);
+    const int horizontalPixels = horizontalMaximumPixels >= 0
+        ? std::max(0, horizontalPositionPixels)
+        : GetHorizontalAnchorPixels();
+
+    const int lineCount = std::max(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
+    const int firstVisibleLine = std::clamp(
+        static_cast<int>(SendMessageW(editor_, EM_GETFIRSTVISIBLELINE, 0, 0)),
+        0,
+        lineCount - 1);
+    const LRESULT topLineStart = SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(firstVisibleLine), 0);
+    const int textLength = std::max(0, GetWindowTextLengthW(editor_));
+
+    editorViewportAnchor_.horizontalPixels = horizontalPixels;
+    editorViewportAnchor_.verticalContentPosition = topLineStart < 0
+        ? 0
+        : std::clamp(static_cast<int>(topLineStart), 0, textLength);
+    editorViewportAnchor_.valid = true;
+}
+
+void ClassicNotepadApp::EndEditorViewportAnchorPreservation()
+{
+    if (editorViewportAnchorDepth_ == 0U) {
+        return;
+    }
+    --editorViewportAnchorDepth_;
+    if (editorViewportAnchorDepth_ != 0U) {
+        return;
+    }
+
+    const EditorViewportAnchor anchor = editorViewportAnchor_;
+    editorViewportAnchor_ = {};
+    if (anchor.valid) {
+        RestoreEditorViewportAnchor(anchor);
+    }
+}
+
+void ClassicNotepadApp::RestoreEditorViewportAnchor(const EditorViewportAnchor& anchor)
+{
+    if (editor_ == nullptr || IsLargeFileMode() || !anchor.valid) {
+        return;
+    }
+
+    const int unit = std::max(1, GetEditorHorizontalScrollUnit());
+    const int wantedHorizontalPosition = std::max(0, anchor.horizontalPixels) / unit;
+    int reachableHorizontalMaximumPixels = -1;
+    const int currentHorizontalPositionPixels = GetNativeEditorHorizontalPosition(&reachableHorizontalMaximumPixels);
+    int currentHorizontalPosition = reachableHorizontalMaximumPixels >= 0
+        ? std::max(0, currentHorizontalPositionPixels) / unit
+        : std::max(0, horizontalScrollPosition_);
+    int reachableHorizontalMaximum = reachableHorizontalMaximumPixels >= 0
+        ? reachableHorizontalMaximumPixels / unit
+        : -1;
+    if (reachableHorizontalMaximum < 0 && UseCustomScrollBars()) {
+        const ScrollBarMetrics metrics = GetCustomScrollBarMetrics(ScrollBarOrientation::Horizontal);
+        reachableHorizontalMaximum = std::max(metrics.minimum, metrics.maximum - metrics.page + 1);
+    }
+    if (reachableHorizontalMaximum < 0) {
+        const int contentWidth = MeasureWidestEditorLine();
+        RECT clientRect{};
+        GetClientRect(editor_, &clientRect);
+        const int viewportWidth = std::max(0, static_cast<int>(clientRect.right - clientRect.left) - 8);
+        const int contentUnits = contentWidth / unit + ((contentWidth % unit) != 0 ? 1 : 0);
+        reachableHorizontalMaximum = std::max(0, contentUnits - std::max(1, viewportWidth / unit));
+    }
+    const int targetHorizontalPosition = std::clamp(
+        wantedHorizontalPosition,
+        0,
+        std::max(0, reachableHorizontalMaximum));
+    const int horizontalDelta = targetHorizontalPosition - currentHorizontalPosition;
+    if (horizontalDelta != 0) {
+        SendMessageW(editor_, EM_LINESCROLL, horizontalDelta, 0);
+    }
+
+    int actualHorizontalMaximumPixels = -1;
+    const int actualHorizontalPositionPixels = GetNativeEditorHorizontalPosition(&actualHorizontalMaximumPixels);
+    horizontalScrollPosition_ = actualHorizontalMaximumPixels >= 0
+        ? std::max(0, actualHorizontalPositionPixels) / unit
+        : targetHorizontalPosition;
+
+    const int lineCount = std::max(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
+    const int textLength = std::max(0, GetWindowTextLengthW(editor_));
+    const int anchorCharacter = std::clamp(anchor.verticalContentPosition, 0, textLength);
+    int targetVerticalLine = static_cast<int>(SendMessageW(
+        editor_, EM_LINEFROMCHAR, static_cast<WPARAM>(anchorCharacter), 0));
+    targetVerticalLine = std::clamp(targetVerticalLine, 0, lineCount - 1);
+
+    RECT clientRect{};
+    GetClientRect(editor_, &clientRect);
+    const int pageLines = std::max(1, static_cast<int>(clientRect.bottom - clientRect.top) /
+        std::max(1, GetEditorLineHeight()));
+    const int maximumVerticalPosition = std::max(0, lineCount - pageLines);
+    targetVerticalLine = std::clamp(targetVerticalLine, 0, maximumVerticalPosition);
+    const int currentVerticalLine = std::max(0, static_cast<int>(SendMessageW(
+        editor_, EM_GETFIRSTVISIBLELINE, 0, 0)));
+    const int verticalDelta = targetVerticalLine - currentVerticalLine;
+    if (verticalDelta != 0) {
+        SendMessageW(editor_, EM_LINESCROLL, 0, verticalDelta);
+    }
 }
 
 RECT ClassicNotepadApp::GetCustomScrollBarThumbRect(ScrollBarOrientation orientation) const
@@ -3551,10 +5117,17 @@ void ClassicNotepadApp::ScrollCustomScrollBarToPosition(ScrollBarOrientation ori
     } else {
         horizontalScrollPosition_ = target;
         SendMessageW(editor_, EM_LINESCROLL, delta, 0);
+        int nativeMaximumPixels = -1;
+        const int actualPositionPixels = GetNativeEditorHorizontalPosition(&nativeMaximumPixels);
+        if (nativeMaximumPixels >= 0) {
+            horizontalScrollPosition_ = std::max(0, actualPositionPixels) /
+                std::max(1, GetEditorHorizontalScrollUnit());
+        }
     }
 
     UpdateStatusBar();
     UpdateScrollBars();
+    AdvanceSpellingLayoutRevision();
     RefreshSpellCheck(false);
     InvalidateRect(editor_, nullptr, FALSE);
 }
@@ -3739,10 +5312,10 @@ void ClassicNotepadApp::UpdateMenuState(HMENU menu)
         EnableMenuItem(menu, ID_EDIT_GO_TO, MF_BYCOMMAND | editState);
         EnableMenuItem(menu, ID_EDIT_SELECT_ALL, MF_BYCOMMAND | editState);
         EnableMenuItem(menu, ID_EDIT_TIME_DATE, MF_BYCOMMAND | editState);
-        EnableMenuItem(menu, ID_FORMAT_WORD_WRAP, MF_BYCOMMAND | MF_GRAYED);
+        EnableMenuItem(menu, ID_FORMAT_WORD_WRAP, MF_BYCOMMAND | MF_ENABLED);
         EnableMenuItem(menu, ID_FORMAT_FONT, MF_BYCOMMAND | MF_ENABLED);
         EnableMenuItem(menu, ID_VIEW_STATUS_BAR, MF_BYCOMMAND | MF_ENABLED);
-        CheckMenuItem(menu, ID_FORMAT_WORD_WRAP, MF_BYCOMMAND | MF_UNCHECKED);
+        CheckMenuItem(menu, ID_FORMAT_WORD_WRAP, MF_BYCOMMAND | (wordWrap_ ? MF_CHECKED : MF_UNCHECKED));
         CheckMenuItem(menu, ID_VIEW_STATUS_BAR, MF_BYCOMMAND | (statusBarVisible_ ? MF_CHECKED : MF_UNCHECKED));
         return;
     }
@@ -3789,13 +5362,14 @@ void ClassicNotepadApp::UpdateStatusBar()
             : std::min<std::uint64_t>(100U, static_cast<std::uint64_t>(
                 static_cast<long double>(info.indexedBytes) * 100.0L / static_cast<long double>(info.fileSize)));
         statusBarParts_[0] = info.modified ? L"Large file (modified)" : L"Large file (editable)";
-        statusBarParts_[1] = info.indexingComplete
-            ? L"Indexed " + classic_notepad::FormatNumberWithSeparators(static_cast<std::size_t>(info.indexedLines)) + L" lines"
+        statusBarParts_[1] = info.indexingComplete && info.displayedCharacterCountKnown
+            ? classic_notepad::FormatCharacterCount(static_cast<std::size_t>(info.displayedCharacterCount))
             : L"Indexing " + std::to_wstring(indexPercent) + L"%";
         statusBarParts_[2] = L"Ln " + classic_notepad::FormatNumberWithSeparators(static_cast<std::size_t>(info.caretLine + 1U)) +
             L", Col " + classic_notepad::FormatNumberWithSeparators(static_cast<std::size_t>(info.caretColumn + 1U)) +
             L", Char " + classic_notepad::FormatNumberWithSeparators(static_cast<std::size_t>(info.caret));
-        statusBarParts_[3] = info.encoding == classic_notepad::LargeFileEncoding::Utf16Le ? L"UTF-16 LE" : L"UTF-8";
+        statusBarParts_[3] = classic_notepad::FormatEncoding(document_.Encoding()) + L" | " +
+            classic_notepad::FormatLineEnding(document_.LineEnding());
         UpdateStatusBarPartLayout();
         for (std::size_t index = 0; index < statusBarParts_.size(); ++index) {
             const WPARAM part = static_cast<WPARAM>(index) | SBT_OWNERDRAW | SBT_NOBORDERS;
@@ -3804,33 +5378,25 @@ void ClassicNotepadApp::UpdateStatusBar()
         return;
     }
 
-    DWORD selectionStart = 0;
-    DWORD selectionEnd = 0;
-    GetSelectionRange(selectionStart, selectionEnd);
+    const DWORD activeCaretPosition = GetActiveCaretPosition();
 
-    const DWORD caretPosition = selectionEnd;
-    LRESULT zeroBasedLine = SendMessageW(editor_, EM_LINEFROMCHAR, static_cast<WPARAM>(caretPosition), 0);
-    if (zeroBasedLine < 0) {
-        zeroBasedLine = 0;
-    }
-
-    LRESULT lineStart = SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(zeroBasedLine), 0);
-    if (lineStart < 0) {
-        lineStart = 0;
-    }
-
-    const DWORD lineStartPosition = lineStart > 0 ? static_cast<DWORD>(lineStart) : 0;
-    const int line = static_cast<int>(zeroBasedLine) + 1;
-    const int column = caretPosition >= lineStartPosition
-        ? static_cast<int>(caretPosition - lineStartPosition) + 1
-        : 1;
+    std::uint64_t logicalLine = 0U;
+    std::uint64_t logicalColumn = 0U;
     statusBarParts_[0] = L"Ln ";
-    statusBarParts_[0] += classic_notepad::FormatNumberWithSeparators(
-        static_cast<std::size_t>(std::max(1, line)));
-    statusBarParts_[0] += L", Col ";
-    statusBarParts_[0] += classic_notepad::FormatNumberWithSeparators(
-        static_cast<std::size_t>(std::max(1, column)));
-    statusBarParts_[1] = classic_notepad::FormatCharacterCount(GetStatusCharacterCount());
+    if (TryGetNativeLogicalCoordinate(
+            static_cast<int>(activeCaretPosition), logicalLine, logicalColumn)) {
+        statusBarParts_[0] += classic_notepad::FormatNumberWithSeparators(
+            static_cast<std::size_t>(logicalLine));
+        statusBarParts_[0] += L", Col ";
+        statusBarParts_[0] += classic_notepad::FormatNumberWithSeparators(
+            static_cast<std::size_t>(logicalColumn));
+    } else if (!statusCharacterCountAvailable_) {
+        statusBarParts_[0] += L"unavailable, Col unavailable";
+    } else {
+        statusBarParts_[0] += L"indexing, Col indexing";
+    }
+    GetStatusCharacterCount();
+    statusBarParts_[1] = GetStatusCharacterCountLabel();
     statusBarParts_[2] = classic_notepad::FormatLineEnding(document_.LineEnding());
     statusBarParts_[3] = classic_notepad::FormatEncoding(document_.Encoding());
 
@@ -3912,11 +5478,249 @@ void ClassicNotepadApp::UpdateStatusBarPartLayout()
 
 void ClassicNotepadApp::SetStatusCharacterCountFromText(const std::wstring& text)
 {
-    statusCharacterCount_ = classic_notepad::CountStatusCharacters(text);
+    statusCharacterCount_ = 0U;
     statusCharacterTextLength_ = static_cast<int>(std::min<std::size_t>(
         text.size(),
         static_cast<std::size_t>(std::numeric_limits<int>::max())));
+    statusCharacterHasPreviousUnit_ = false;
+    statusCharacterPreviousUnit_ = 0;
+    statusLogicalLineBreakCount_ = 0U;
+    statusLogicalLineStartPosition_ = 0;
+    statusLogicalPreviousWasCarriageReturn_ = false;
+    statusLogicalLineIndexAvailable_ = true;
+    nativeStatusLineCheckpoints_.clear();
+    try {
+        nativeStatusLineCheckpoints_.reserve(
+            static_cast<std::size_t>(statusCharacterTextLength_) / kStatusCharacterCountBatchUnitLimit + 2U);
+        if (!AppendNativeStatusCheckpoint(0)) throw std::bad_alloc();
+        for (int position = 0; position < statusCharacterTextLength_; ++position) {
+            if (position != 0 &&
+                position % static_cast<int>(kStatusCharacterCountBatchUnitLimit) == 0 &&
+                !AppendNativeStatusCheckpoint(position)) {
+                throw std::bad_alloc();
+            }
+            AccumulateNativeStatusCodeUnit(position, text[static_cast<std::size_t>(position)]);
+        }
+        if (nativeStatusLineCheckpoints_.empty() ||
+            nativeStatusLineCheckpoints_.back().textPosition != statusCharacterTextLength_) {
+            if (!AppendNativeStatusCheckpoint(statusCharacterTextLength_)) throw std::bad_alloc();
+        }
+    } catch (const std::bad_alloc&) {
+        nativeStatusLineCheckpoints_.clear();
+        statusCharacterCount_ = classic_notepad::CountStatusCharacters(text);
+        statusLogicalLineBreakCount_ = 0U;
+        statusLogicalLineStartPosition_ = 0;
+        statusLogicalPreviousWasCarriageReturn_ = false;
+        statusLogicalLineIndexAvailable_ = false;
+    }
+    statusCharacterScanPosition_ = statusCharacterTextLength_;
+    statusCharacterCountComplete_ = true;
+    statusCharacterCountAvailable_ = true;
+    statusLogicalLineIndexAvailable_ = statusLogicalLineIndexAvailable_ &&
+        !nativeStatusLineCheckpoints_.empty();
     statusCharacterCountDirty_ = false;
+    if (mainWindow_ != nullptr) KillTimer(mainWindow_, kStatusCharacterCountTimerId);
+}
+
+void ClassicNotepadApp::ResetNativeStatusSummary(int textLength)
+{
+    statusCharacterCount_ = 0U;
+    statusCharacterTextLength_ = std::max(0, textLength);
+    statusCharacterScanPosition_ = 0;
+    statusCharacterPreviousUnit_ = 0;
+    statusCharacterHasPreviousUnit_ = false;
+    statusLogicalLineBreakCount_ = 0U;
+    statusLogicalLineStartPosition_ = 0;
+    statusLogicalPreviousWasCarriageReturn_ = false;
+    statusLogicalLineIndexAvailable_ = true;
+    statusCharacterCountComplete_ = textLength == 0;
+    statusCharacterCountAvailable_ = true;
+    statusCharacterCountDirty_ = false;
+    nativeStatusLineCheckpoints_.clear();
+    try {
+        nativeStatusLineCheckpoints_.reserve(
+            static_cast<std::size_t>(std::max(0, textLength)) / kStatusCharacterCountBatchUnitLimit + 2U);
+        if (!AppendNativeStatusCheckpoint(0)) throw std::bad_alloc();
+    } catch (const std::bad_alloc&) {
+        nativeStatusLineCheckpoints_.clear();
+        statusLogicalLineIndexAvailable_ = false;
+    }
+}
+
+bool ClassicNotepadApp::AppendNativeStatusCheckpoint(int textPosition)
+{
+    try {
+        nativeStatusLineCheckpoints_.push_back({
+            textPosition,
+            statusLogicalLineBreakCount_,
+            statusLogicalLineStartPosition_,
+            statusLogicalPreviousWasCarriageReturn_});
+        return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+}
+
+void ClassicNotepadApp::AccumulateNativeStatusCodeUnit(int textPosition, wchar_t character)
+{
+    const bool joinsPrevious = statusCharacterHasPreviousUnit_ &&
+        ((statusCharacterPreviousUnit_ == L'\r' && character == L'\n') ||
+            (classic_notepad::IsHighSurrogateUnit(statusCharacterPreviousUnit_) &&
+                classic_notepad::IsLowSurrogateUnit(character)));
+    ++statusCharacterCount_;
+    if (joinsPrevious) --statusCharacterCount_;
+    statusCharacterPreviousUnit_ = character;
+    statusCharacterHasPreviousUnit_ = true;
+
+    if (character == L'\r') {
+        ++statusLogicalLineBreakCount_;
+        statusLogicalLineStartPosition_ = textPosition + 1;
+        statusLogicalPreviousWasCarriageReturn_ = true;
+    } else if (character == L'\n') {
+        if (!statusLogicalPreviousWasCarriageReturn_) ++statusLogicalLineBreakCount_;
+        statusLogicalLineStartPosition_ = textPosition + 1;
+        statusLogicalPreviousWasCarriageReturn_ = false;
+    } else {
+        statusLogicalPreviousWasCarriageReturn_ = false;
+    }
+}
+
+bool ClassicNotepadApp::TryGetNativeLogicalCoordinate(
+    int textPosition, std::uint64_t& oneBasedLine, std::uint64_t& oneBasedColumn) const
+{
+    if (editor_ == nullptr || !statusCharacterCountAvailable_ || !statusCharacterCountComplete_ ||
+        !statusLogicalLineIndexAvailable_ ||
+        textPosition < 0 || textPosition > statusCharacterTextLength_ ||
+        nativeStatusLineCheckpoints_.empty()) return false;
+
+    const auto checkpoint = std::upper_bound(
+        nativeStatusLineCheckpoints_.begin(), nativeStatusLineCheckpoints_.end(), textPosition,
+        [](int position, const NativeStatusLineCheckpoint& candidate) {
+            return position < candidate.textPosition;
+        });
+    if (checkpoint == nativeStatusLineCheckpoints_.begin()) return false;
+    const NativeStatusLineCheckpoint& base = *std::prev(checkpoint);
+    std::uint64_t lineBreaks = base.lineBreaks;
+    int lineStart = base.lineStartPosition;
+    bool previousWasCr = base.previousWasCarriageReturn;
+    {
+        const HLOCAL buffer = reinterpret_cast<HLOCAL>(SendMessageW(editor_, EM_GETHANDLE, 0, 0));
+        ScopedLocalBufferLock lockedBuffer(buffer);
+        if (lockedBuffer.Get() == nullptr) return false;
+        const wchar_t* text = lockedBuffer.Get();
+        for (int position = base.textPosition; position < textPosition; ++position) {
+            const wchar_t character = text[position];
+            if (character == L'\r') {
+                ++lineBreaks;
+                lineStart = position + 1;
+                previousWasCr = true;
+            } else if (character == L'\n') {
+                if (!previousWasCr) ++lineBreaks;
+                lineStart = position + 1;
+                previousWasCr = false;
+            } else {
+                previousWasCr = false;
+            }
+        }
+    }
+    oneBasedLine = lineBreaks + 1U;
+    oneBasedColumn = textPosition >= lineStart
+        ? static_cast<std::uint64_t>(textPosition - lineStart) + 1U
+        : 1U;
+    return true;
+}
+
+bool ClassicNotepadApp::EnsureNativeStatusSummaryComplete()
+{
+    if (editor_ == nullptr || IsLargeFileMode()) return false;
+    if (statusCharacterCountComplete_ && statusCharacterCountAvailable_ && statusLogicalLineIndexAvailable_) return true;
+
+    const int textLength = std::max(0, GetWindowTextLengthW(editor_));
+    ResetNativeStatusSummary(textLength);
+    if (!statusLogicalLineIndexAvailable_) return false;
+    bool okay = false;
+    {
+        const HLOCAL buffer = reinterpret_cast<HLOCAL>(SendMessageW(editor_, EM_GETHANDLE, 0, 0));
+        ScopedLocalBufferLock lockedBuffer(buffer);
+        if (lockedBuffer.Get() != nullptr) {
+            const wchar_t* text = lockedBuffer.Get();
+            for (int position = 0; position < textLength; ++position) {
+                if (position != 0 &&
+                    position % static_cast<int>(kStatusCharacterCountBatchUnitLimit) == 0 &&
+                    !AppendNativeStatusCheckpoint(position)) {
+                    break;
+                }
+                AccumulateNativeStatusCodeUnit(position, text[position]);
+                statusCharacterScanPosition_ = position + 1;
+            }
+            if (statusCharacterScanPosition_ == textLength &&
+                (nativeStatusLineCheckpoints_.empty() ||
+                    nativeStatusLineCheckpoints_.back().textPosition != textLength)) {
+                okay = AppendNativeStatusCheckpoint(textLength);
+            } else {
+                okay = statusCharacterScanPosition_ == textLength;
+            }
+        }
+    }
+    statusCharacterCountAvailable_ = okay;
+    statusLogicalLineIndexAvailable_ = okay;
+    statusCharacterCountComplete_ = okay;
+    statusCharacterCountDirty_ = false;
+    if (mainWindow_ != nullptr) {
+        KillTimer(mainWindow_, kStatusCharacterCountTimerId);
+        UpdateStatusBar();
+    }
+    return okay;
+}
+
+bool ClassicNotepadApp::GetNativeLogicalLineStart(std::uint64_t oneBasedLine, DWORD& textPosition) const
+{
+    if (oneBasedLine == 0U || !statusCharacterCountAvailable_ || !statusCharacterCountComplete_ ||
+        !statusLogicalLineIndexAvailable_ ||
+        nativeStatusLineCheckpoints_.empty() || oneBasedLine > statusLogicalLineBreakCount_ + 1U) return false;
+    const std::uint64_t targetBreaks = oneBasedLine - 1U;
+    if (targetBreaks == 0U) {
+        textPosition = 0U;
+        return true;
+    }
+    const auto checkpoint = std::upper_bound(
+        nativeStatusLineCheckpoints_.begin(), nativeStatusLineCheckpoints_.end(), targetBreaks,
+        [](std::uint64_t breaks, const NativeStatusLineCheckpoint& candidate) {
+            return breaks < candidate.lineBreaks;
+        });
+    if (checkpoint == nativeStatusLineCheckpoints_.begin()) return false;
+    const NativeStatusLineCheckpoint& base = *std::prev(checkpoint);
+    std::uint64_t lineBreaks = base.lineBreaks;
+    int lineStart = base.lineStartPosition;
+    bool previousWasCr = base.previousWasCarriageReturn;
+    const int textLength = statusCharacterTextLength_;
+    {
+        const HLOCAL buffer = reinterpret_cast<HLOCAL>(SendMessageW(editor_, EM_GETHANDLE, 0, 0));
+        ScopedLocalBufferLock lockedBuffer(buffer);
+        if (lockedBuffer.Get() == nullptr) return false;
+        const wchar_t* text = lockedBuffer.Get();
+        int position = base.textPosition;
+        while (position < textLength && lineBreaks < targetBreaks) {
+            const wchar_t character = text[position];
+            if (character == L'\r') {
+                ++lineBreaks;
+                lineStart = position + 1;
+                previousWasCr = true;
+            } else if (character == L'\n') {
+                if (!previousWasCr) ++lineBreaks;
+                lineStart = position + 1;
+                previousWasCr = false;
+            } else {
+                previousWasCr = false;
+            }
+            ++position;
+        }
+        if (lineBreaks != targetBreaks) return false;
+        if (previousWasCr && lineStart < textLength && text[lineStart] == L'\n') ++lineStart;
+    }
+    if (lineStart < 0 || static_cast<std::uint64_t>(lineStart) > (std::numeric_limits<DWORD>::max)()) return false;
+    textPosition = static_cast<DWORD>(lineStart);
+    return true;
 }
 
 std::size_t ClassicNotepadApp::GetStatusCharacterCount()
@@ -3924,24 +5728,114 @@ std::size_t ClassicNotepadApp::GetStatusCharacterCount()
     if (editor_ == nullptr) {
         statusCharacterCount_ = 0;
         statusCharacterTextLength_ = 0;
+        statusCharacterScanPosition_ = 0;
+        statusCharacterCountComplete_ = true;
+        statusCharacterCountAvailable_ = true;
         statusCharacterCountDirty_ = false;
+        statusLogicalLineBreakCount_ = 0U;
+        statusLogicalLineStartPosition_ = 0;
+        statusLogicalPreviousWasCarriageReturn_ = false;
+        statusLogicalLineIndexAvailable_ = true;
+        nativeStatusLineCheckpoints_.clear();
+        AppendNativeStatusCheckpoint(0);
         return statusCharacterCount_;
     }
 
-    const int textLength = GetWindowTextLengthW(editor_);
-    if (!statusCharacterCountDirty_ && textLength == statusCharacterTextLength_) {
-        return statusCharacterCount_;
+    const int textLength = std::max(0, GetWindowTextLengthW(editor_));
+    if (!statusCharacterCountDirty_ && textLength == statusCharacterTextLength_ &&
+        statusCharacterCountAvailable_) {
+        const bool scanInProgress = textLength > 0 && !statusCharacterCountComplete_;
+        const bool completedIndexReady = statusCharacterCountComplete_ &&
+            statusLogicalLineIndexAvailable_ && !nativeStatusLineCheckpoints_.empty();
+        if (scanInProgress || completedIndexReady) return statusCharacterCount_;
     }
 
-    statusCharacterTextLength_ = std::max(0, textLength);
-    if (textLength > kExactStatusCharacterCountLimit) {
-        statusCharacterCount_ = static_cast<std::size_t>(textLength);
-    } else {
-        statusCharacterCount_ = classic_notepad::CountStatusCharacters(GetEditorText());
+    ResetNativeStatusSummary(textLength);
+    if (textLength == 0) {
+        if (mainWindow_ != nullptr) KillTimer(mainWindow_, kStatusCharacterCountTimerId);
+    } else if (textLength <= kStatusCharacterCountBatchUnitLimit) {
+        SetStatusCharacterCountFromText(GetEditorText());
+        if (mainWindow_ != nullptr) KillTimer(mainWindow_, kStatusCharacterCountTimerId);
+    } else if (mainWindow_ == nullptr ||
+        SetTimer(mainWindow_, kStatusCharacterCountTimerId, 1U, nullptr) == 0U) {
+        statusCharacterCountAvailable_ = false;
     }
-
-    statusCharacterCountDirty_ = false;
     return statusCharacterCount_;
+}
+
+std::wstring ClassicNotepadApp::GetStatusCharacterCountLabel() const
+{
+    if (!statusCharacterCountAvailable_) return L"Character count unavailable";
+    if (!statusCharacterCountComplete_) {
+        const int percent = statusCharacterTextLength_ <= 0 ? 0 : std::clamp(
+            static_cast<int>(static_cast<std::int64_t>(statusCharacterScanPosition_) * 100 /
+                statusCharacterTextLength_), 0, 100);
+        return L"Counting characters " + std::to_wstring(percent) + L"%";
+    }
+    return classic_notepad::FormatCharacterCount(statusCharacterCount_);
+}
+
+void ClassicNotepadApp::MeasureStatusCharacterCountBatch()
+{
+    if (mainWindow_ == nullptr || editor_ == nullptr || IsLargeFileMode()) {
+        if (mainWindow_ != nullptr) KillTimer(mainWindow_, kStatusCharacterCountTimerId);
+        return;
+    }
+
+    const int textLength = std::max(0, GetWindowTextLengthW(editor_));
+    if (statusCharacterCountDirty_ || textLength != statusCharacterTextLength_) {
+        GetStatusCharacterCount();
+    }
+    if (!statusCharacterCountAvailable_ || statusCharacterCountComplete_) {
+        KillTimer(mainWindow_, kStatusCharacterCountTimerId);
+        UpdateStatusBar();
+        return;
+    }
+
+    bool lockFailed = false;
+    {
+        const HLOCAL buffer = reinterpret_cast<HLOCAL>(SendMessageW(editor_, EM_GETHANDLE, 0, 0));
+        ScopedLocalBufferLock lockedBuffer(buffer);
+        if (lockedBuffer.Get() == nullptr) {
+            lockFailed = true;
+        } else {
+            const int limit = statusCharacterScanPosition_ + std::min(
+                textLength - statusCharacterScanPosition_, kStatusCharacterCountBatchUnitLimit);
+            const wchar_t* text = lockedBuffer.Get();
+            if (statusLogicalLineIndexAvailable_ &&
+                (nativeStatusLineCheckpoints_.empty() ||
+                    nativeStatusLineCheckpoints_.back().textPosition != statusCharacterScanPosition_) &&
+                !AppendNativeStatusCheckpoint(statusCharacterScanPosition_)) {
+                statusLogicalLineIndexAvailable_ = false;
+                nativeStatusLineCheckpoints_.clear();
+            }
+            while (statusCharacterScanPosition_ < limit) {
+                AccumulateNativeStatusCodeUnit(
+                    statusCharacterScanPosition_, text[statusCharacterScanPosition_]);
+                ++statusCharacterScanPosition_;
+            }
+            if (statusLogicalLineIndexAvailable_ &&
+                (nativeStatusLineCheckpoints_.empty() ||
+                    nativeStatusLineCheckpoints_.back().textPosition != statusCharacterScanPosition_) &&
+                !AppendNativeStatusCheckpoint(statusCharacterScanPosition_)) {
+                statusLogicalLineIndexAvailable_ = false;
+                nativeStatusLineCheckpoints_.clear();
+            }
+        }
+    }
+    if (lockFailed) {
+        statusCharacterCountAvailable_ = false;
+        statusCharacterCountComplete_ = false;
+        statusLogicalLineIndexAvailable_ = false;
+        nativeStatusLineCheckpoints_.clear();
+        KillTimer(mainWindow_, kStatusCharacterCountTimerId);
+        UpdateStatusBar();
+        return;
+    }
+
+    statusCharacterCountComplete_ = statusCharacterScanPosition_ >= textLength;
+    if (statusCharacterCountComplete_) KillTimer(mainWindow_, kStatusCharacterCountTimerId);
+    UpdateStatusBar();
 }
 
 void ClassicNotepadApp::UpdateStatusBarSizeGripStyle()
@@ -4124,12 +6018,7 @@ bool ClassicNotepadApp::StartResizeFromStatusGrip(HWND statusBar, LPARAM lParam)
 void ClassicNotepadApp::RefreshSpellCheck(bool immediate)
 {
     if (!spellCheckAvailable_) {
-        spellingErrors_.clear();
-        largeFileSpellingErrors_.clear();
-        if (largeFileView_ != nullptr) largeFileView_->SetSpellingRanges({});
-        if (editor_ != nullptr) {
-            InvalidateRect(editor_, nullptr, FALSE);
-        }
+        ClearSpellingAnnotations();
         return;
     }
 
@@ -4161,64 +6050,563 @@ void ClassicNotepadApp::RunSpellCheckNow()
         spellCheckTimerId_ = 0;
     }
 
-    if (!spellCheckAvailable_) {
-        spellingErrors_.clear();
-        largeFileSpellingErrors_.clear();
-        if (largeFileView_ != nullptr) largeFileView_->SetSpellingRanges({});
-        if (editor_ != nullptr) {
-            InvalidateRect(editor_, nullptr, FALSE);
-        }
+    const classic_notepad::SpellingRevision currentRevision = CurrentSpellingRevision();
+    ignoredSpellingOccurrences_.erase(
+        std::remove_if(ignoredSpellingOccurrences_.begin(), ignoredSpellingOccurrences_.end(),
+            [&currentRevision](const classic_notepad::windows::IgnoredSpellingOccurrence& occurrence) {
+                return occurrence.revision.session != currentRevision.session ||
+                    occurrence.revision.content != currentRevision.content;
+            }),
+        ignoredSpellingOccurrences_.end());
+    ClearSpellingAnnotations();
+    if (!spellCheckAvailable_) return;
+
+    std::vector<classic_notepad::SpellingTextWindow> windows;
+    if (largeFileView_ != nullptr) {
+        std::wstring error;
+        if (!largeFileView_->GetVisibleTextWindows(windows, error)) return;
+    } else if (!GetVisibleEditorTextWindows(windows)) {
         return;
+    }
+
+    SpellOperationStatus checkStatus = SpellOperationStatus::Success;
+    HRESULT checkHresult = S_OK;
+    const auto checkBackend = [this, &checkStatus, &checkHresult](const std::wstring& text) {
+        if (checkStatus != SpellOperationStatus::Success) return std::vector<classic_notepad::TextRange>{};
+        const SpellCheckResult backend = spellChecker_.Check(text);
+        if (backend.status != SpellOperationStatus::Success) {
+            checkStatus = backend.status;
+            checkHresult = backend.hresult;
+            return std::vector<classic_notepad::TextRange>{};
+        }
+        std::vector<classic_notepad::TextRange> ranges;
+        ranges.reserve(backend.value.size());
+        for (const SpellingErrorRange& result : backend.value) {
+            ranges.push_back({static_cast<std::size_t>(result.start),
+                static_cast<std::size_t>(result.length)});
+        }
+        return ranges;
+    };
+    classic_notepad::SpellingAnnotationBatch candidate;
+    const bool checked = classic_notepad::CheckSpellingWindows(windows, checkBackend, candidate);
+    if (checkStatus != SpellOperationStatus::Success) {
+        ReportSpellCheckFailure(checkStatus, checkHresult);
+        return;
+    }
+    if (!checked ||
+        !classic_notepad::SpellingRevisionMatches(candidate.revision, CurrentSpellingRevision())) {
+        ReportSpellCheckFailure(SpellOperationStatus::Failure, E_UNEXPECTED);
+        return;
+    }
+
+    candidate.annotations.erase(
+        std::remove_if(candidate.annotations.begin(), candidate.annotations.end(),
+            [this, &windows, &candidate](const classic_notepad::SpellingAnnotation& annotation) {
+                return IsIgnoredSpellingOccurrence(annotation, candidate.revision, windows);
+            }),
+        candidate.annotations.end());
+
+    if (!classic_notepad::TryPublishSpellingBatch(
+            spellingBatch_, candidate, CurrentSpellingRevision())) {
+        ReportSpellCheckFailure(SpellOperationStatus::Failure, E_ABORT);
+        return;
+    }
+    spellCheckFailureDialogShown_ = false;
+    if (largeFileView_ != nullptr) largeFileView_->SetSpellingBatch(spellingBatch_);
+    else if (editor_ != nullptr) InvalidateRect(editor_, nullptr, FALSE);
+}
+
+bool ClassicNotepadApp::IsIgnoredSpellingOccurrence(
+    const classic_notepad::SpellingAnnotation& annotation,
+    const classic_notepad::SpellingRevision& revision,
+    const std::vector<classic_notepad::SpellingTextWindow>& windows) const
+{
+    return classic_notepad::windows::IsIgnoredSpellingOccurrence(
+        ignoredSpellingOccurrences_, annotation, revision, windows);
+}
+
+void ClassicNotepadApp::ClearIgnoredSpellingOccurrences()
+{
+    ignoredSpellingOccurrences_.clear();
+}
+
+void ClassicNotepadApp::ReportSpellCheckFailure(SpellOperationStatus status, HRESULT hresult)
+{
+    if (spellCheckFailureDialogShown_ || automationMode_) return;
+    spellCheckFailureDialogShown_ = true;
+    std::wstring message = status == SpellOperationStatus::Unavailable
+        ? L"British English spell checking became unavailable. No spelling results were published."
+        : L"Spell checking failed. No spelling results were published. HRESULT ";
+    if (status != SpellOperationStatus::Unavailable) {
+        message += FormatSpellHRESULT(hresult);
+        message += L".";
+    }
+    ShowError(message);
+}
+
+bool ClassicNotepadApp::ReadCurrentSpellingTextRange(
+    std::uint64_t start,
+    std::uint64_t length,
+    std::wstring& text,
+    std::wstring& errorMessage) const
+{
+    text.clear();
+    if (length == 0U || length > classic_notepad::kMaximumSpellingWindowUnits ||
+        length > (std::numeric_limits<std::uint64_t>::max)() - start) {
+        errorMessage = L"The spelling target range is invalid or exceeds the bounded word limit.";
+        return false;
     }
 
     if (largeFileView_ != nullptr) {
-        std::wstring visibleText;
-        std::wstring error;
-        std::uint64_t visibleStart = 0;
-        if (!largeFileView_->GetVisibleText(visibleText, visibleStart, error)) {
-            largeFileSpellingErrors_.clear();
-            largeFileView_->SetSpellingRanges({});
-            return;
-        }
-        const std::vector<SpellingErrorRange> localErrors = spellChecker_.Check(visibleText);
-        largeFileSpellingErrors_.clear();
-        largeFileSpellingErrors_.reserve(localErrors.size());
-        for (const SpellingErrorRange& local : localErrors) {
-            if (static_cast<std::uint64_t>(local.start) >
-                (std::numeric_limits<std::uint64_t>::max)() - visibleStart) continue;
-            const std::uint64_t start = visibleStart + static_cast<std::uint64_t>(local.start);
-            largeFileSpellingErrors_.push_back({start, static_cast<std::uint64_t>(local.length)});
-        }
-        largeFileView_->SetSpellingRanges(largeFileSpellingErrors_);
-        return;
+        return largeFileView_->GetTextRange(start, length, text, errorMessage);
+    }
+    if (editor_ == nullptr || start > static_cast<std::uint64_t>((std::numeric_limits<LONG>::max)()) ||
+        start + length > static_cast<std::uint64_t>((std::numeric_limits<LONG>::max)())) {
+        errorMessage = L"The spelling target is outside the native editor range.";
+        return false;
     }
 
-    std::wstring visibleText;
-    DWORD visibleStart = 0;
-    if (!GetVisibleEditorText(visibleText, visibleStart)) {
-        spellingErrors_.clear();
-        if (editor_ != nullptr) {
-            InvalidateRect(editor_, nullptr, FALSE);
-        }
-        return;
+    const int nativeTextLength = GetWindowTextLengthW(editor_);
+    if (nativeTextLength < 0 || start + length > static_cast<std::uint64_t>(nativeTextLength)) {
+        errorMessage = L"The spelling target is no longer present in the native editor.";
+        return false;
     }
 
-    spellingErrors_ = spellChecker_.Check(visibleText);
-    for (SpellingErrorRange& error : spellingErrors_) {
-        if (error.start > std::numeric_limits<DWORD>::max() - visibleStart) {
-            error.start = std::numeric_limits<DWORD>::max();
+    const HLOCAL memory = reinterpret_cast<HLOCAL>(SendMessageW(editor_, EM_GETHANDLE, 0, 0));
+    if (memory == nullptr) {
+        errorMessage = L"The native editor text buffer is unavailable.";
+        return false;
+    }
+    ScopedLocalBufferLock lockedBuffer(memory);
+    const wchar_t* buffer = lockedBuffer.Get();
+    if (buffer == nullptr) {
+        errorMessage = L"The native editor text buffer could not be locked.";
+        return false;
+    }
+
+    const std::size_t begin = static_cast<std::size_t>(start);
+    const std::size_t count = static_cast<std::size_t>(length);
+    const auto isHigh = [](wchar_t value) {
+        const std::uint32_t unit = static_cast<std::uint32_t>(value);
+        return unit >= 0xD800U && unit <= 0xDBFFU;
+    };
+    const auto isLow = [](wchar_t value) {
+        const std::uint32_t unit = static_cast<std::uint32_t>(value);
+        return unit >= 0xDC00U && unit <= 0xDFFFU;
+    };
+    if ((begin > 0U && isHigh(buffer[begin - 1U]) && isLow(buffer[begin])) ||
+        (begin + count < static_cast<std::size_t>(nativeTextLength) &&
+            isHigh(buffer[begin + count - 1U]) && isLow(buffer[begin + count]))) {
+        errorMessage = L"The spelling target ends inside a Unicode character.";
+        return false;
+    }
+    text.assign(buffer + begin, count);
+    return true;
+}
+
+bool ClassicNotepadApp::IsSpellingTargetCurrent(
+    const classic_notepad::SpellingContextTarget& target,
+    std::wstring& currentText,
+    std::wstring& errorMessage) const
+{
+    const classic_notepad::SpellingRevision current = CurrentSpellingRevision();
+    if (target.revision.session != current.session || target.revision.content != current.content) {
+        errorMessage = L"The document changed after this spelling action was opened.";
+        return false;
+    }
+    if (target.length != target.text.size() || target.length == 0U ||
+        target.length > classic_notepad::kMaximumSpellingWindowUnits) {
+        errorMessage = L"The spelling action target is malformed.";
+        return false;
+    }
+    if (!ReadCurrentSpellingTextRange(target.start, target.length, currentText, errorMessage)) return false;
+    if (currentText != target.text) {
+        errorMessage = L"The spelling target changed while its menu was open.";
+        return false;
+    }
+    const std::vector<classic_notepad::TextRange> words =
+        classic_notepad::FindSpellCheckWordRanges(currentText);
+    if (words.size() != 1U || words.front().start != 0U || words.front().length != currentText.size()) {
+        errorMessage = L"The spelling target is no longer a complete word.";
+        return false;
+    }
+    return true;
+}
+
+ClassicNotepadApp::AutomationSpellingActionResult ClassicNotepadApp::ApplySpellingAction(
+    const std::wstring& action,
+    const classic_notepad::SpellingContextTarget& target,
+    const std::wstring& suggestion,
+    bool injectMappedInsertFailureForTesting)
+{
+    AutomationSpellingActionResult outcome;
+    outcome.status = SpellOperationStatus::Failure;
+    outcome.hresult = E_FAIL;
+    if (!spellCheckAvailable_) {
+        outcome.status = SpellOperationStatus::Unavailable;
+        outcome.hresult = S_FALSE;
+        outcome.message = L"Spell checking is unavailable.";
+        return outcome;
+    }
+
+    std::wstring currentText;
+    if (!IsSpellingTargetCurrent(target, currentText, outcome.message)) {
+        outcome.hresult = E_ABORT;
+        return outcome;
+    }
+
+    if (action == L"ignoreOnce") {
+        const classic_notepad::SpellingRevision current = CurrentSpellingRevision();
+        const auto found = std::find_if(ignoredSpellingOccurrences_.begin(), ignoredSpellingOccurrences_.end(),
+            [&target, &currentText, &current](
+                const classic_notepad::windows::IgnoredSpellingOccurrence& ignored) {
+                return ignored.revision.session == current.session &&
+                    ignored.revision.content == current.content && ignored.start == target.start &&
+                    ignored.length == target.length && ignored.text == currentText;
+            });
+        if (found == ignoredSpellingOccurrences_.end()) {
+            ignoredSpellingOccurrences_.push_back({current, target.start, target.length, currentText});
+        }
+        RunSpellCheckNow();
+        outcome.status = SpellOperationStatus::Success;
+        outcome.hresult = S_OK;
+        outcome.message.clear();
+        return outcome;
+    }
+
+    if (action == L"addToDictionary") {
+        const SpellActionResult added = spellChecker_.Add(currentText);
+        outcome.status = added.status;
+        outcome.hresult = added.hresult;
+        outcome.changed = added.status == SpellOperationStatus::Success && added.value;
+        if (added.status == SpellOperationStatus::Unavailable) {
+            outcome.message = L"The spelling backend is unavailable; the word was not added.";
+        } else if (added.status == SpellOperationStatus::Failure) {
+            outcome.message = L"The word could not be added to the spelling dictionary. HRESULT " +
+                FormatSpellHRESULT(added.hresult) + L".";
         } else {
-            error.start += visibleStart;
+            RefreshSpellCheck(true);
         }
+        return outcome;
     }
-    if (editor_ != nullptr) {
-        InvalidateRect(editor_, nullptr, FALSE);
+
+    if (action != L"replaceSuggestion") {
+        outcome.hresult = E_INVALIDARG;
+        outcome.message = L"Unknown spelling action.";
+        return outcome;
     }
+    if (!IsValidSpellReplacement(suggestion)) {
+        outcome.hresult = E_INVALIDARG;
+        outcome.message = L"The suggestion is empty or contains invalid Unicode or control characters.";
+        return outcome;
+    }
+
+    const SpellSuggestResult availableSuggestions = spellChecker_.Suggest(currentText, 5U);
+    if (availableSuggestions.status != SpellOperationStatus::Success) {
+        outcome.status = availableSuggestions.status;
+        outcome.hresult = availableSuggestions.hresult;
+        outcome.message = availableSuggestions.status == SpellOperationStatus::Unavailable
+            ? L"The spelling backend became unavailable; the suggestion was not applied."
+            : L"The suggestion could not be validated with the spelling backend. HRESULT " +
+                FormatSpellHRESULT(availableSuggestions.hresult) + L".";
+        return outcome;
+    }
+    if (std::find(availableSuggestions.value.begin(), availableSuggestions.value.end(), suggestion) ==
+        availableSuggestions.value.end()) {
+        outcome.hresult = E_INVALIDARG;
+        outcome.message = L"The selected suggestion is no longer available.";
+        return outcome;
+    }
+    if (!IsSpellingTargetCurrent(target, currentText, outcome.message)) {
+        outcome.hresult = E_ABORT;
+        return outcome;
+    }
+
+    if (largeFileView_ != nullptr) {
+        std::wstring error;
+        if (!largeFileView_->SetSelection(target.start, target.start + target.length, error)) {
+            outcome.message = error.empty() ? L"The spelling target could not be selected." : error;
+            outcome.hresult = E_FAIL;
+            return outcome;
+        }
+        if (injectMappedInsertFailureForTesting) {
+            largeFileView_->InjectNextInsertFailureForTesting(
+                L"Injected mapped insertion failure for spelling action verification.");
+        }
+        if (!largeFileView_->InsertText(suggestion, error)) {
+            outcome.message = error.empty() ? L"The suggestion could not be inserted." : error;
+            outcome.hresult = E_FAIL;
+            outcome.verification = L"unchanged";
+            return outcome;
+        }
+        document_.SetModified(true);
+        UpdateTitle();
+        UpdateStatusBar();
+        outcome.changed = true;
+        std::wstring insertedText;
+        std::wstring readError;
+        if (!ReadCurrentSpellingTextRange(target.start, suggestion.size(), insertedText, readError)) {
+            outcome.status = SpellOperationStatus::Failure;
+            outcome.hresult = E_FAIL;
+            outcome.verification = L"unavailable";
+            outcome.message = L"The mapped document changed, but the spelling replacement could not be verified. Inspect the text before using Undo.";
+            if (!readError.empty()) outcome.message += L" " + readError;
+            RefreshSpellCheck(false);
+            return outcome;
+        }
+        if (insertedText != suggestion) {
+            outcome.status = SpellOperationStatus::Failure;
+            outcome.hresult = E_FAIL;
+            outcome.partial = true;
+            outcome.verification = L"mismatch";
+            outcome.message = L"The mapped document changed, but the inserted spelling text did not match the suggestion. Inspect the text before using Undo.";
+            RefreshSpellCheck(false);
+            return outcome;
+        }
+        outcome.status = SpellOperationStatus::Success;
+        outcome.hresult = S_OK;
+        outcome.verification = L"verified";
+        outcome.message.clear();
+        RefreshSpellCheck(false);
+        return outcome;
+    } else {
+        const int oldLength = GetWindowTextLengthW(editor_);
+        const DWORD nativeLimit = static_cast<DWORD>(SendMessageW(editor_, EM_GETLIMITTEXT, 0, 0));
+        if (oldLength < 0 || target.start + target.length > static_cast<std::uint64_t>(oldLength) ||
+            target.start + target.length > static_cast<std::uint64_t>((std::numeric_limits<LONG>::max)())) {
+            outcome.hresult = E_BOUNDS;
+            outcome.message = L"The native spelling target is outside the editor text range.";
+            return outcome;
+        }
+        const std::uint64_t finalLength = static_cast<std::uint64_t>(oldLength) - target.length + suggestion.size();
+        if (finalLength > nativeLimit || finalLength > static_cast<std::uint64_t>((std::numeric_limits<LONG>::max)())) {
+            outcome.hresult = HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW);
+            outcome.message = L"The suggestion exceeds the native editor text limit.";
+            return outcome;
+        }
+        const DWORD start = static_cast<DWORD>(target.start);
+        const DWORD end = static_cast<DWORD>(target.start + target.length);
+        SendMessageW(editor_, EM_SETSEL, static_cast<WPARAM>(start), static_cast<LPARAM>(end));
+
+        const bool injectUnchangedNativeFailure = automationMode_ && automationPasteFaultStage_ == L"native-errspace";
+        const bool injectPartialNativeFailure = automationMode_ &&
+            (automationPasteFaultStage_ == L"native-maxtext" ||
+                automationPasteFaultStage_ == L"native-errspace-changed");
+        const bool injectVerificationFailure = automationMode_ &&
+            automationPasteFaultStage_ == L"native-spell-verification";
+        editorPasteChangeNotification_ = false;
+        editorPasteNativeFailureNotification_ = 0U;
+        if (injectUnchangedNativeFailure) {
+            ScopedBoolRestore replacementActive(editorPasteReplacementActive_, true);
+            SendMessageW(mainWindow_, WM_COMMAND, MAKEWPARAM(0, EN_ERRSPACE), reinterpret_cast<LPARAM>(editor_));
+        } else {
+            if (injectPartialNativeFailure) {
+                const std::uint64_t injectedLimit = finalLength == 0U ? 0U : finalLength - 1U;
+                SendMessageW(editor_, EM_SETLIMITTEXT, static_cast<WPARAM>(injectedLimit), 0);
+            }
+            {
+                ScopedBoolRestore replacementActive(editorPasteReplacementActive_, true);
+                SendMessageW(editor_, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(suggestion.c_str()));
+                if (automationMode_ && automationPasteFaultStage_ == L"native-errspace-changed") {
+                    SendMessageW(mainWindow_, WM_COMMAND,
+                        MAKEWPARAM(0, EN_ERRSPACE), reinterpret_cast<LPARAM>(editor_));
+                }
+            }
+            if (injectPartialNativeFailure) {
+                SendMessageW(editor_, EM_SETLIMITTEXT, static_cast<WPARAM>(nativeLimit), 0);
+            }
+        }
+
+        outcome.nativeNotification = editorPasteNativeFailureNotification_;
+        const int actualLength = GetWindowTextLengthW(editor_);
+        DWORD actualSelectionStart = 0U;
+        DWORD actualSelectionEnd = 0U;
+        GetSelectionRange(actualSelectionStart, actualSelectionEnd);
+        const std::uint64_t expectedCaret = target.start + suggestion.size();
+
+        std::wstring actualTargetText;
+        std::wstring insertedText;
+        std::wstring readError;
+        const bool allowVerification = !injectVerificationFailure;
+        const bool originalRangeReadable = allowVerification && ReadCurrentSpellingTextRange(
+            target.start, currentText.size(), actualTargetText, readError);
+        const bool insertedRangeReadable = allowVerification &&
+            target.start <= static_cast<std::uint64_t>((std::max)(0, actualLength)) &&
+            suggestion.size() <= static_cast<std::uint64_t>((std::max)(0, actualLength)) - target.start &&
+            ReadCurrentSpellingTextRange(target.start, suggestion.size(), insertedText, readError);
+
+        const bool changeNotification = editorPasteChangeNotification_;
+        const bool lengthChanged = actualLength >= 0 && actualLength != oldLength;
+        const bool targetChanged = originalRangeReadable && actualTargetText != currentText;
+        outcome.changed = changeNotification || lengthChanged || targetChanged;
+
+        const bool exactText = insertedRangeReadable && insertedText == suggestion;
+        const bool exactPostconditions = actualLength >= 0 &&
+            static_cast<std::uint64_t>(actualLength) == finalLength &&
+            actualSelectionStart == expectedCaret && actualSelectionEnd == expectedCaret && exactText;
+        bool partialPrefixVerified = false;
+        if (allowVerification && actualSelectionStart == actualSelectionEnd &&
+            actualSelectionStart > start && actualSelectionStart < expectedCaret) {
+            const std::size_t acceptedUnits = static_cast<std::size_t>(actualSelectionStart - start);
+            std::wstring acceptedText;
+            std::wstring acceptedReadError;
+            if (acceptedUnits <= suggestion.size() &&
+                ReadCurrentSpellingTextRange(target.start, acceptedUnits, acceptedText, acceptedReadError) &&
+                acceptedText == suggestion.substr(0U, acceptedUnits)) {
+                partialPrefixVerified = true;
+            }
+        }
+
+        if (outcome.changed) {
+            UpdateEditorWidthIndexForMutation();
+            HandleEditorChanged();
+        }
+
+        const bool verificationUnavailable = !allowVerification ||
+            (!originalRangeReadable && !insertedRangeReadable);
+        if (verificationUnavailable) {
+            outcome.status = SpellOperationStatus::Failure;
+            outcome.hresult = E_FAIL;
+            outcome.verification = L"unavailable";
+            outcome.message = outcome.changed
+                ? L"The native editor may have changed the document, but the spelling replacement could not be verified. Inspect the text; Undo availability is unknown."
+                : L"The native editor replacement could not be verified, so the document state is unknown.";
+            if (!readError.empty()) outcome.message += L" " + readError;
+            if (outcome.changed) RefreshSpellCheck(false);
+            return outcome;
+        }
+
+        if (exactPostconditions) {
+            if (outcome.nativeNotification == 0U) {
+                outcome.status = SpellOperationStatus::Success;
+                outcome.hresult = S_OK;
+                outcome.verification = L"verified";
+                outcome.message.clear();
+            } else {
+                outcome.status = SpellOperationStatus::Failure;
+                outcome.hresult = outcome.nativeNotification == EN_ERRSPACE
+                    ? HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_MEMORY)
+                    : HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW);
+                outcome.verification = L"verified-with-notification";
+                outcome.message = outcome.nativeNotification == EN_ERRSPACE
+                    ? L"The native editor reported EN_ERRSPACE even though the complete replacement text, length, and caret were verified."
+                    : L"The native editor reported EN_MAXTEXT even though the complete replacement text, length, and caret were verified.";
+            }
+            RefreshSpellCheck(false);
+            return outcome;
+        }
+
+        const bool unchangedVerified = !outcome.changed && actualLength == oldLength &&
+            originalRangeReadable && actualTargetText == currentText;
+        if (unchangedVerified) {
+            outcome.status = SpellOperationStatus::Failure;
+            outcome.hresult = outcome.nativeNotification == 0U ? E_FAIL :
+                (outcome.nativeNotification == EN_ERRSPACE
+                    ? HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_MEMORY)
+                    : HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW));
+            outcome.verification = L"unchanged";
+            if (outcome.nativeNotification == EN_ERRSPACE) {
+                outcome.message = L"The native editor reported EN_ERRSPACE and left the document text unchanged. The prior Undo state is preserved.";
+            } else if (outcome.nativeNotification == EN_MAXTEXT) {
+                outcome.message = L"The native editor reported EN_MAXTEXT and left the document text unchanged. The prior Undo state is preserved.";
+            } else {
+                outcome.message = L"The native editor did not apply the suggestion; the document text is unchanged.";
+            }
+            return outcome;
+        }
+
+        outcome.status = SpellOperationStatus::Failure;
+        outcome.hresult = outcome.nativeNotification == EN_ERRSPACE
+            ? HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_MEMORY)
+            : (outcome.nativeNotification == EN_MAXTEXT
+                ? HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW)
+                : E_FAIL);
+        outcome.partial = partialPrefixVerified;
+        outcome.verification = partialPrefixVerified ? L"partial" : L"mismatch";
+        if (partialPrefixVerified) {
+            outcome.message = L"The native editor reported a rejection after inserting only part of the suggestion. The document changed; Undo availability was not verified.";
+        } else if (outcome.nativeNotification == EN_ERRSPACE) {
+            outcome.message = L"The native editor reported EN_ERRSPACE, but the replacement postconditions did not match. Inspect the text; Undo availability is unknown.";
+        } else if (outcome.nativeNotification == EN_MAXTEXT) {
+            outcome.message = L"The native editor reported EN_MAXTEXT, but the replacement postconditions did not match. Inspect the text; Undo availability is unknown.";
+        } else {
+            outcome.message = L"The native editor changed text, but the expected replacement text, length, or caret position did not match. Inspect the text before using Undo.";
+        }
+        if (!readError.empty()) outcome.message += L" " + readError;
+        if (outcome.changed) RefreshSpellCheck(false);
+        return outcome;
+    }
+}
+
+ClassicNotepadApp::AutomationSpellingActionResult ClassicNotepadApp::AutomationApplySpellingAction(
+    const std::wstring& action,
+    const classic_notepad::SpellingContextTarget& target,
+    const std::wstring& suggestion,
+    bool injectMappedInsertFailureForTesting)
+{
+    if (!automationMode_) {
+        AutomationSpellingActionResult outcome;
+        outcome.status = SpellOperationStatus::Failure;
+        outcome.hresult = E_ACCESSDENIED;
+        outcome.message = L"Spelling action diagnostics are available only in automation mode.";
+        return outcome;
+    }
+    if (injectMappedInsertFailureForTesting && largeFileView_ == nullptr) {
+        AutomationSpellingActionResult outcome;
+        outcome.status = SpellOperationStatus::Failure;
+        outcome.hresult = E_INVALIDARG;
+        outcome.message = L"The mapped insertion failure probe requires the mapped editor.";
+        return outcome;
+    }
+    return ApplySpellingAction(action, target, suggestion, injectMappedInsertFailureForTesting);
+}
+
+bool ClassicNotepadApp::AutomationConfigureSpellingTestBackend(
+    const SpellTestBackendConfiguration& configuration)
+{
+    if (!automationMode_) return false;
+    spellChecker_.ConfigureTestBackend(configuration);
+    spellCheckAvailable_ = spellChecker_.IsAvailable();
+    ClearIgnoredSpellingOccurrences();
+    RefreshSpellCheck(true);
+    return true;
+}
+
+bool ClassicNotepadApp::AutomationClearSpellingTestBackend()
+{
+    if (!automationMode_) return false;
+    spellChecker_.ClearTestBackend();
+    spellCheckAvailable_ = spellChecker_.IsAvailable();
+    ClearIgnoredSpellingOccurrences();
+    RefreshSpellCheck(true);
+    return true;
+}
+
+std::uint64_t ClassicNotepadApp::AutomationSpellingTestBackendCallCount(const wchar_t* operation) const
+{
+    return automationMode_ ? spellChecker_.TestBackendCallCount(operation) : 0U;
+}
+
+classic_notepad::SpellingAnnotationBatch ClassicNotepadApp::AutomationGetSpellingAnnotationBatch() const
+{
+    if (!automationMode_ || !classic_notepad::SpellingBatchIsCurrent(spellingBatch_, CurrentSpellingRevision())) {
+        return {};
+    }
+    return spellingBatch_;
+}
+
+bool ClassicNotepadApp::AutomationRefreshSpellCheckNow()
+{
+    if (!automationMode_) return false;
+    RunSpellCheckNow();
+    return true;
 }
 
 void ClassicNotepadApp::DrawSpellingUnderlines(HWND editorWindow)
 {
-    if (!spellCheckAvailable_ || spellingErrors_.empty() || editorWindow == nullptr) {
+    if (!spellCheckAvailable_ || editorWindow == nullptr ||
+        !classic_notepad::SpellingBatchIsCurrent(spellingBatch_, CurrentSpellingRevision()) ||
+        spellingBatch_.annotations.empty()) {
         return;
     }
 
@@ -4269,13 +6657,15 @@ void ClassicNotepadApp::DrawSpellingUnderlines(HWND editorWindow)
     const int visibleLineCount = std::max(1, (clientHeight + lineHeight - 1) / lineHeight + 1);
     const int lastVisibleLine = firstVisibleLine + visibleLineCount;
 
-    for (const SpellingErrorRange& error : spellingErrors_) {
-        if (error.length == 0) {
+    for (const classic_notepad::SpellingAnnotation& error : spellingBatch_.annotations) {
+        if (error.length == 0U || error.start > (std::numeric_limits<DWORD>::max)() ||
+            error.length > (std::numeric_limits<DWORD>::max)() - error.start) {
             continue;
         }
 
-        const DWORD errorEnd = error.start + error.length;
-        const int startLine = static_cast<int>(SendMessageW(editorWindow, EM_LINEFROMCHAR, error.start, 0));
+        const DWORD errorStart = static_cast<DWORD>(error.start);
+        const DWORD errorEnd = static_cast<DWORD>(error.start + error.length);
+        const int startLine = static_cast<int>(SendMessageW(editorWindow, EM_LINEFROMCHAR, errorStart, 0));
         const int endLine = static_cast<int>(SendMessageW(editorWindow, EM_LINEFROMCHAR, errorEnd, 0));
         if (endLine < firstVisibleLine || startLine > lastVisibleLine) {
             continue;
@@ -4288,10 +6678,12 @@ void ClassicNotepadApp::DrawSpellingUnderlines(HWND editorWindow)
             }
 
             const DWORD lineStart = static_cast<DWORD>(lineStartResult);
-            const WORD lineLength = static_cast<WORD>(SendMessageW(editorWindow, EM_LINELENGTH, lineStart, 0));
-            const DWORD lineEnd = lineStart + lineLength;
+            const LRESULT lineLengthResult = SendMessageW(editorWindow, EM_LINELENGTH, lineStart, 0);
+            if (lineLengthResult < 0 || static_cast<std::uint64_t>(lineLengthResult) >
+                static_cast<std::uint64_t>((std::numeric_limits<DWORD>::max)() - lineStart)) continue;
+            const DWORD lineEnd = lineStart + static_cast<DWORD>(lineLengthResult);
 
-            const DWORD segmentStart = std::max(lineStart, error.start);
+            const DWORD segmentStart = std::max<DWORD>(lineStart, static_cast<DWORD>(error.start));
             const DWORD segmentEnd = std::min(lineEnd, errorEnd);
             if (segmentEnd <= segmentStart) {
                 continue;
@@ -4351,35 +6743,40 @@ void ClassicNotepadApp::ShowSpellingUnavailableMessage()
         MB_OK | MB_ICONINFORMATION);
 }
 
-bool ClassicNotepadApp::HandleLargeFileContextMenu(POINT screenPoint, std::uint64_t position)
+bool ClassicNotepadApp::HandleLargeFileContextMenu(
+    POINT screenPoint,
+    const classic_notepad::SpellingContextTarget& target)
 {
-    if (largeFileView_ == nullptr || !spellCheckAvailable_) return false;
-    std::wstring visibleText;
-    std::wstring error;
-    std::uint64_t visibleStart = 0;
-    if (!largeFileView_->GetVisibleText(visibleText, visibleStart, error) || position < visibleStart ||
-        position - visibleStart >= visibleText.size()) return false;
-    classic_notepad::TextRange wordRange{};
-    if (!classic_notepad::ExpandWordRangeAt(
-            visibleText, static_cast<std::size_t>(position - visibleStart), wordRange)) return false;
-    const std::uint64_t wordStart = visibleStart + static_cast<std::uint64_t>(wordRange.start);
-    const std::uint64_t wordEnd = wordStart + static_cast<std::uint64_t>(wordRange.length);
+    if (largeFileView_ == nullptr || !spellCheckAvailable_ ||
+        !classic_notepad::SpellingBatchIsCurrent(spellingBatch_, CurrentSpellingRevision()) ||
+        !classic_notepad::SpellingRevisionMatches(target.revision, spellingBatch_.revision) ||
+        target.length == 0U || target.length >
+            (std::numeric_limits<std::uint64_t>::max)() - target.start) return false;
+    const std::uint64_t wordStart = target.start;
+    const std::uint64_t wordEnd = target.start + target.length;
     bool misspelled = false;
-    for (const LargeFileSpellingRange& issue : largeFileSpellingErrors_) {
+    for (const classic_notepad::SpellingAnnotation& issue : spellingBatch_.annotations) {
+        if (issue.length > (std::numeric_limits<std::uint64_t>::max)() - issue.start) return false;
         const std::uint64_t issueEnd = issue.start + issue.length;
         if (issue.start < wordEnd && issueEnd > wordStart) { misspelled = true; break; }
     }
     if (!misspelled) return false;
 
-    const std::wstring word = visibleText.substr(wordRange.start, wordRange.length);
-    const std::vector<std::wstring> suggestions = spellChecker_.Suggest(word, 5);
+    const std::wstring& word = target.text;
+    const SpellSuggestResult suggestionResult = spellChecker_.Suggest(word, 5U);
+    const std::vector<std::wstring>& suggestions = suggestionResult.value;
     HMENU popup = CreatePopupMenu();
     if (popup == nullptr) return true;
     UINT commandId = kSpellMenuSuggestionBase;
-    if (suggestions.empty()) {
-        AppendMenuW(popup, MF_STRING | MF_GRAYED, kSpellMenuNoSuggestions, L"No spelling suggestions");
-    } else {
+    if (suggestionResult.status == SpellOperationStatus::Success && !suggestions.empty()) {
         for (const std::wstring& suggestion : suggestions) AppendMenuW(popup, MF_STRING, commandId++, suggestion.c_str());
+    } else {
+        const std::wstring statusText = suggestionResult.status == SpellOperationStatus::Success
+            ? L"No spelling suggestions"
+            : suggestionResult.status == SpellOperationStatus::Unavailable
+                ? L"Spelling suggestions unavailable"
+                : L"Could not get spelling suggestions (" + FormatSpellHRESULT(suggestionResult.hresult) + L")";
+        AppendMenuW(popup, MF_STRING | MF_GRAYED, kSpellMenuNoSuggestions, statusText.c_str());
     }
     AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(popup, MF_STRING, kSpellMenuIgnoreOnce, L"Ignore Once");
@@ -4395,21 +6792,21 @@ bool ClassicNotepadApp::HandleLargeFileContextMenu(POINT screenPoint, std::uint6
     AppendMenuW(popup, MF_STRING, ID_EDIT_SELECT_ALL, L"Select All");
     const UINT selected = TrackPopupMenu(popup, TPM_RETURNCMD | TPM_RIGHTBUTTON,
         screenPoint.x, screenPoint.y, 0, mainWindow_, nullptr);
+    std::wstring action;
+    std::wstring replacement;
     if (selected >= kSpellMenuSuggestionBase &&
         selected < kSpellMenuSuggestionBase + static_cast<UINT>(suggestions.size())) {
-        const std::wstring& replacement = suggestions[selected - kSpellMenuSuggestionBase];
-        if (largeFileView_->SetSelection(wordStart, wordEnd, error)) largeFileView_->InsertText(replacement, error);
-        RefreshSpellCheck(false);
-    } else if (selected == kSpellMenuIgnoreOnce) {
-        spellChecker_.Ignore(word);
-        RunSpellCheckNow();
-    } else if (selected == kSpellMenuAddToDictionary) {
-        spellChecker_.Add(word);
-        RunSpellCheckNow();
+        action = L"replaceSuggestion";
+        replacement = suggestions[selected - kSpellMenuSuggestionBase];
+    } else if (selected == kSpellMenuIgnoreOnce) action = L"ignoreOnce";
+    else if (selected == kSpellMenuAddToDictionary) action = L"addToDictionary";
+    DestroyMenu(popup);
+    if (!action.empty()) {
+        const AutomationSpellingActionResult result = ApplySpellingAction(action, target, replacement);
+        if (result.status != SpellOperationStatus::Success && !automationMode_) ShowError(result.message);
     } else if (selected != 0U) {
         SendMessageW(mainWindow_, WM_COMMAND, MAKEWPARAM(selected, 0), 0);
     }
-    DestroyMenu(popup);
     return true;
 }
 
@@ -4419,63 +6816,47 @@ bool ClassicNotepadApp::HandleEditorContextMenu(HWND editorWindow, LPARAM lParam
         return false;
     }
 
+    const bool keyboardInvocation = lParam == -1;
     POINT screenPoint{};
-    if (lParam == -1) {
-        DWORD start = 0;
-        DWORD end = 0;
-        GetSelectionRange(start, end);
-        const POINT caret = PointFromEditorCharPosition(editorWindow, end);
-        screenPoint = caret;
+    POINT clientPoint{};
+    if (keyboardInvocation) {
+        if (!GetCaretPos(&clientPoint)) {
+            DWORD selectionStart = 0U;
+            DWORD selectionEnd = 0U;
+            GetSelectionRange(selectionStart, selectionEnd);
+            clientPoint = PointFromEditorCharPosition(editorWindow, selectionEnd);
+        }
+        screenPoint = clientPoint;
         ClientToScreen(editorWindow, &screenPoint);
     } else {
-        screenPoint.x = static_cast<short>(LOWORD(lParam));
-        screenPoint.y = static_cast<short>(HIWORD(lParam));
+        screenPoint = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        clientPoint = screenPoint;
+        ScreenToClient(editorWindow, &clientPoint);
     }
 
-    POINT clientPoint = screenPoint;
-    ScreenToClient(editorWindow, &clientPoint);
-    DWORD charIndex = 0;
-    bool hasCharacterIndex = false;
-    if (lParam == -1) {
-        DWORD selectionStart = 0;
-        DWORD selectionEnd = 0;
-        GetSelectionRange(selectionStart, selectionEnd);
-        charIndex = selectionEnd;
-        hasCharacterIndex = true;
-    } else {
-        const LRESULT charResult = SendMessageW(
-            editorWindow,
-            EM_CHARFROMPOS,
-            0,
-            MAKELPARAM(clientPoint.x, clientPoint.y));
-        charIndex = LOWORD(charResult);
-        hasCharacterIndex = true;
-    }
-
-    std::wstring visibleText;
-    DWORD visibleTextStart = 0;
-    const bool hasVisibleText = GetVisibleEditorText(visibleText, visibleTextStart);
-    classic_notepad::TextRange wordRange{};
-    std::size_t absoluteWordStart = 0;
-    const bool hasWord = hasCharacterIndex &&
-        hasVisibleText &&
-        charIndex >= visibleTextStart &&
-        static_cast<std::size_t>(charIndex - visibleTextStart) < visibleText.size() &&
-        classic_notepad::ExpandWordRangeAt(visibleText, charIndex - visibleTextStart, wordRange);
-    if (hasWord) {
-        absoluteWordStart = static_cast<std::size_t>(visibleTextStart) + wordRange.start;
-    }
-
+    classic_notepad::SpellingContextTarget contextTarget;
+    bool hasWord = ResolveEditorSpellingContextTarget(
+        clientPoint, keyboardInvocation, contextTarget) &&
+        contextTarget.start <= (std::numeric_limits<DWORD>::max)() &&
+        contextTarget.length <= (std::numeric_limits<DWORD>::max)();
     bool wordMisspelled = false;
     if (hasWord) {
-        for (const SpellingErrorRange& error : spellingErrors_) {
-            if (classic_notepad::RangesOverlap(
-                    absoluteWordStart,
-                    wordRange.length,
-                    error.start,
-                    error.length)) {
-                wordMisspelled = true;
-                break;
+        if (contextTarget.length >
+            (std::numeric_limits<std::uint64_t>::max)() - contextTarget.start) {
+            hasWord = false;
+        } else {
+            const std::uint64_t wordEnd = contextTarget.start + contextTarget.length;
+            for (const classic_notepad::SpellingAnnotation& error : spellingBatch_.annotations) {
+                if (error.length > (std::numeric_limits<std::uint64_t>::max)() - error.start) {
+                    hasWord = false;
+                    wordMisspelled = false;
+                    break;
+                }
+                const std::uint64_t errorEnd = error.start + error.length;
+                if (error.length != 0U && contextTarget.start < errorEnd && error.start < wordEnd) {
+                    wordMisspelled = true;
+                    break;
+                }
             }
         }
     }
@@ -4487,22 +6868,23 @@ bool ClassicNotepadApp::HandleEditorContextMenu(HWND editorWindow, LPARAM lParam
     std::vector<std::unique_ptr<OwnerDrawMenuItem>> contextMenuItems;
     ApplyMenuBackground(popup);
 
-    contextMenuWord_.clear();
-    contextMenuWordStart_ = 0;
-    contextMenuWordLength_ = 0;
-
+    SpellSuggestResult suggestionResult;
+    std::vector<std::wstring> suggestions;
     if (spellCheckAvailable_ && wordMisspelled) {
-        contextMenuWord_ = visibleText.substr(wordRange.start, wordRange.length);
-        contextMenuWordStart_ = static_cast<DWORD>(absoluteWordStart);
-        contextMenuWordLength_ = static_cast<DWORD>(wordRange.length);
-
-        const std::vector<std::wstring> suggestions = spellChecker_.Suggest(contextMenuWord_, 5);
-        if (suggestions.empty()) {
+        suggestionResult = spellChecker_.Suggest(contextTarget.text, 5U);
+        suggestions = suggestionResult.value;
+        if (suggestionResult.status != SpellOperationStatus::Success || suggestions.empty()) {
+            const std::wstring statusText = suggestionResult.status == SpellOperationStatus::Success
+                ? L"No spelling suggestions"
+                : suggestionResult.status == SpellOperationStatus::Unavailable
+                    ? L"Spelling suggestions unavailable"
+                    : L"Could not get spelling suggestions (" +
+                        FormatSpellHRESULT(suggestionResult.hresult) + L")";
             AppendOwnerDrawMenuItem(
                 popup,
                 MF_GRAYED,
                 kSpellMenuNoSuggestions,
-                L"No spelling suggestions",
+                statusText,
                 contextMenuItems);
         } else {
             UINT commandId = kSpellMenuSuggestionBase;
@@ -4551,34 +6933,21 @@ bool ClassicNotepadApp::HandleEditorContextMenu(HWND editorWindow, LPARAM lParam
         mainWindow_,
         nullptr);
 
-    if (selected >= kSpellMenuSuggestionBase && selected <= kSpellMenuSuggestionMax) {
-        MENUITEMINFOW itemInfo{};
-        itemInfo.cbSize = sizeof(itemInfo);
-        itemInfo.fMask = MIIM_DATA;
-        if (GetMenuItemInfoW(popup, selected, FALSE, &itemInfo)) {
-            const auto* suggestionItem = reinterpret_cast<const OwnerDrawMenuItem*>(itemInfo.dwItemData);
-            if (suggestionItem != nullptr) {
-                const DWORD_PTR contextMenuWordEnd =
-                    static_cast<DWORD_PTR>(contextMenuWordStart_) + static_cast<DWORD_PTR>(contextMenuWordLength_);
-                SendMessageW(
-                    editor_,
-                    EM_SETSEL,
-                    static_cast<WPARAM>(contextMenuWordStart_),
-                    static_cast<LPARAM>(contextMenuWordEnd));
-                SendMessageW(editor_, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(suggestionItem->text.c_str()));
-            }
-        }
-    } else if (selected == kSpellMenuIgnoreOnce) {
-        spellChecker_.Ignore(contextMenuWord_);
-        RunSpellCheckNow();
-    } else if (selected == kSpellMenuAddToDictionary) {
-        spellChecker_.Add(contextMenuWord_);
-        RunSpellCheckNow();
+    std::wstring action;
+    std::wstring replacement;
+    if (selected >= kSpellMenuSuggestionBase &&
+        selected < kSpellMenuSuggestionBase + static_cast<UINT>(suggestions.size())) {
+        action = L"replaceSuggestion";
+        replacement = suggestions[selected - kSpellMenuSuggestionBase];
+    } else if (selected == kSpellMenuIgnoreOnce) action = L"ignoreOnce";
+    else if (selected == kSpellMenuAddToDictionary) action = L"addToDictionary";
+    DestroyMenu(popup);
+    if (!action.empty()) {
+        const AutomationSpellingActionResult result = ApplySpellingAction(action, contextTarget, replacement);
+        if (result.status != SpellOperationStatus::Success && !automationMode_) ShowError(result.message);
     } else if (selected != 0) {
         SendMessageW(mainWindow_, WM_COMMAND, MAKEWPARAM(selected, 0), 0);
     }
-
-    DestroyMenu(popup);
     return true;
 }
 
@@ -4622,6 +6991,7 @@ void ClassicNotepadApp::HandleInitialFilePath(const std::wstring& path)
 
 void ClassicNotepadApp::CreateNewDocumentForPath(const std::wstring& path)
 {
+    AdvanceSpellingSession();
     ExitLargeFileMode();
     document_.ResetNewFile(path);
     SetEditorText(L"");
@@ -4645,7 +7015,7 @@ void ClassicNotepadApp::HandleEditorChanged()
     }
 
     statusCharacterCountDirty_ = true;
-    InvalidateWidestLineCache();
+    AdvanceSpellingContentRevision();
     UpdateStatusBar();
     UpdateScrollBars();
     RefreshSpellCheck(false);
@@ -4658,29 +7028,127 @@ void ClassicNotepadApp::HandleEditorChanged()
 
 void ClassicNotepadApp::HandleNew()
 {
-    if (!ConfirmSaveChanges()) {
-        return;
-    }
-
-    ExitLargeFileMode();
-    document_.ResetUntitled();
-    SetEditorText(L"");
-    UpdateTitle();
-    SetFocus(editor_);
+    RequestDocumentTransition(DocumentTransition::NewDocument);
 }
 
 void ClassicNotepadApp::HandleOpen()
 {
-    if (!ConfirmSaveChanges()) {
+    RequestDocumentTransition(DocumentTransition::OpenDialog);
+}
+
+bool ClassicNotepadApp::CurrentDocumentIsModified() const
+{
+    if (largeFileView_ != nullptr) {
+        return largeFileView_->GetInfo().modified;
+    }
+    return document_.IsModified() || (editor_ != nullptr &&
+        SendMessageW(editor_, EM_GETMODIFY, 0, 0) != 0);
+}
+
+void ClassicNotepadApp::RequestDocumentTransition(DocumentTransition transition)
+{
+    if (transition == DocumentTransition::None || documentTransitionCoordinator_.Pending().IsPending()) {
         return;
     }
 
-    const std::wstring path = ShowOpenFileDialog();
-    if (path.empty()) {
+    LargeFileViewInfo largeInfo;
+    if (largeFileView_ != nullptr) {
+        largeInfo = largeFileView_->GetInfo();
+        if (largeInfo.operationInProgress) {
+            ShowError(L"Wait for the current large-document " + largeInfo.operationName + L" operation to finish before changing documents.");
+            return;
+        }
+    }
+
+    if (!CurrentDocumentIsModified()) {
+        PerformDocumentTransition(transition);
         return;
     }
 
-    LoadDocument(path);
+    std::wstring prompt = L"Do you want to save changes to ";
+    prompt += document_.DisplayName();
+    prompt += L"?";
+    const int result = ShowMessageDialog(prompt, MB_YESNOCANCEL | MB_ICONWARNING);
+    if (result == IDNO) {
+        PerformDocumentTransition(transition);
+        return;
+    }
+    if (result != IDYES || !HandleSave()) {
+        return;
+    }
+
+    if (largeFileView_ == nullptr) {
+        // The ordinary editor writes synchronously, so HandleSave returning
+        // true means the bytes are already on disk.
+        PerformDocumentTransition(transition);
+        return;
+    }
+
+    largeInfo = largeFileView_->GetInfo();
+    const classic_notepad::TransitionRequestSaveDisposition saveDisposition =
+        classic_notepad::ClassifyTransitionRequestSave(MakeTransitionSaveObservation(largeInfo));
+    if (saveDisposition == classic_notepad::TransitionRequestSaveDisposition::WaitForSave) {
+        if (!documentTransitionCoordinator_.TryQueue(transition, largeInfo.operationToken)) {
+            ShowError(L"The save is still running, but its completion could not be associated with this document transition.");
+        }
+        return;
+    }
+
+    // A fast worker may finish before the transition request observes it.
+    // Consult its completion result instead of treating the accepted start as
+    // a completed save.
+    if (saveDisposition == classic_notepad::TransitionRequestSaveDisposition::Saved) {
+        PerformDocumentTransition(transition);
+        return;
+    }
+    if (saveDisposition == classic_notepad::TransitionRequestSaveDisposition::SaveFailed) {
+        ShowError(largeInfo.operationError.empty() ? L"The large document could not be saved. The current document is still open."
+            : largeInfo.operationError);
+    }
+}
+
+void ClassicNotepadApp::PerformDocumentTransition(DocumentTransition transition)
+{
+    switch (transition) {
+    case DocumentTransition::NewDocument:
+        ExitLargeFileMode();
+        document_.ResetUntitled();
+        SetEditorText(L"");
+        UpdateTitle();
+        SetFocus(editor_);
+        break;
+    case DocumentTransition::OpenDialog: {
+        const std::wstring path = ShowOpenFileDialog();
+        if (!path.empty()) LoadDocument(path);
+        break;
+    }
+    case DocumentTransition::CloseWindow:
+        if (mainWindow_ != nullptr) DestroyWindow(mainWindow_);
+        break;
+    case DocumentTransition::None:
+        break;
+    }
+}
+
+bool ClassicNotepadApp::ResumePendingTransitionAfterLargeSave(const LargeFileViewInfo& info)
+{
+    const classic_notepad::PendingDocumentTransition pending = documentTransitionCoordinator_.Pending();
+    const classic_notepad::PendingTransitionCompletion completion =
+        classic_notepad::ClassifyPendingTransitionCompletion(pending, MakeTransitionSaveObservation(info));
+    if (completion == classic_notepad::PendingTransitionCompletion::NotReady) {
+        return false;
+    }
+
+    const DocumentTransition transition = documentTransitionCoordinator_.TakePending().intent;
+    if (completion == classic_notepad::PendingTransitionCompletion::PerformTransition) {
+        PerformDocumentTransition(transition);
+    } else if (completion == classic_notepad::PendingTransitionCompletion::DocumentChangedDuringSave) {
+        ShowError(L"The document changed while it was being saved. The newer changes remain open and unsaved.");
+    } else {
+        ShowError(info.operationError.empty() ? L"The large document could not be saved. The current document is still open."
+            : info.operationError);
+    }
+    return true;
 }
 
 bool ClassicNotepadApp::HandleSave()
@@ -4781,6 +7249,9 @@ void ClassicNotepadApp::HandlePageSetup()
 
 void ClassicNotepadApp::HandlePrint()
 {
+    if (automationMode_) {
+        automationPrintDiagnostics_ = {};
+    }
     if (IsLargeFileMode()) {
         ShowLargeFileReadOnlyMessage();
         return;
@@ -4829,6 +7300,8 @@ void ClassicNotepadApp::HandlePrint()
     std::wstring errorMessage;
     if (!PrintEditorText(printDialog.hDC, errorMessage)) {
         ShowError(errorMessage);
+    } else if (automationMode_) {
+        automationPrintDiagnostics_.succeeded = true;
     }
 
     DeleteDC(printDialog.hDC);
@@ -4843,6 +7316,10 @@ void ClassicNotepadApp::HandleUndo()
         return;
     }
     SendMessageW(editor_, EM_UNDO, 0, 0);
+    // Some EDIT undo paths do not deliver EN_CHANGE to the parent even though
+    // EM_UNDO changed the buffer. Force the incremental character summary to
+    // rescan against the current native text length.
+    statusCharacterCountDirty_ = true;
     UpdateStatusBar();
     UpdateScrollBars();
     SetFocus(editor_);
@@ -4876,21 +7353,189 @@ void ClassicNotepadApp::HandleCopy()
 void ClassicNotepadApp::HandlePaste()
 {
     if (IsLargeFileMode()) {
-        std::wstring clipboardText;
+        ClipboardTextReadResult clipboard = TryReadClipboardText(mainWindow_);
         std::wstring error;
-        if (TryReadClipboardText(mainWindow_, clipboardText) && !largeFileView_->PasteText(clipboardText, error) && !error.empty()) ShowError(error);
+        if (clipboard.outcome == PasteOutcome::Succeeded &&
+            !largeFileView_->PasteText(clipboard.text, error) && !error.empty()) ShowError(error);
         return;
     }
-    std::wstring clipboardText;
-    if (TryReadClipboardText(mainWindow_, clipboardText)) {
-        const std::wstring normalizedText = classic_notepad::NormalizeLineEndingsForEditor(clipboardText);
-        // EN_CHANGE is sent synchronously by EM_REPLACESEL. Defer the expensive
-        // status/scrollbar pass until the caret has moved to the pasted text.
-        suppressEditorChange_ = true;
-        ReplaceSelection(normalizedText);
-        suppressEditorChange_ = false;
-        SendMessageW(editor_, EM_SCROLLCARET, 0, 0);
-        HandleEditorChanged();
+
+    ClipboardTextReadResult clipboard;
+    automationPasteClipboardDiagnostics_ = {};
+    if (automationPasteTextActive_) {
+        try {
+            SyntheticClipboardFixture fixture(automationPasteText_, automationPasteFaultStage_);
+            clipboard = TryReadClipboardText(mainWindow_, fixture.Api());
+            automationPasteClipboardDiagnostics_ = fixture.Diagnostics();
+        } catch (const std::bad_alloc&) {
+            clipboard.outcome = PasteOutcome::AllocationFailure;
+        } catch (const std::length_error&) {
+            clipboard.outcome = PasteOutcome::CapacityRejected;
+        }
+    } else {
+        clipboard = TryReadClipboardText(mainWindow_);
+    }
+
+    PasteOutcome outcome = clipboard.outcome;
+    if (outcome == PasteOutcome::Succeeded && automationPasteFaultStage_ == L"copy") {
+        outcome = PasteOutcome::AllocationFailure;
+    }
+    if (outcome == PasteOutcome::Succeeded && !IsValidClipboardUtf16(clipboard.text)) {
+        outcome = PasteOutcome::InvalidData;
+    }
+    if (outcome == PasteOutcome::Succeeded && clipboard.text.empty()) {
+        outcome = PasteOutcome::Empty;
+    }
+
+    if (outcome == PasteOutcome::Succeeded) {
+        std::size_t normalizedLength = 0U;
+        if (!GetNormalizedPasteLength(clipboard.text, normalizedLength)) {
+            outcome = PasteOutcome::CapacityRejected;
+        } else {
+            const int nativeTextLength = GetWindowTextLengthW(editor_);
+            DWORD selectionStart = 0;
+            DWORD selectionEnd = 0;
+            GetSelectionRange(selectionStart, selectionEnd);
+            if (selectionEnd < selectionStart) std::swap(selectionStart, selectionEnd);
+
+            const LRESULT nativeLimitValue = SendMessageW(editor_, EM_GETLIMITTEXT, 0, 0);
+            const std::size_t nativeLimit = nativeLimitValue <= 0
+                ? 0U
+                : static_cast<std::size_t>(nativeLimitValue);
+            const std::size_t representableLimit = std::min(
+                nativeLimit,
+                static_cast<std::size_t>(std::numeric_limits<int>::max()));
+            bool capacityRejected = nativeTextLength < 0;
+            std::size_t expectedLength = 0U;
+            std::size_t retainedLength = 0U;
+            if (!capacityRejected) {
+                const std::size_t oldLength = static_cast<std::size_t>(nativeTextLength);
+                if (selectionEnd > oldLength || selectionStart > selectionEnd) {
+                    capacityRejected = true;
+                } else {
+                    retainedLength = oldLength - static_cast<std::size_t>(selectionEnd - selectionStart);
+                    if (normalizedLength > std::numeric_limits<std::size_t>::max() - retainedLength) {
+                        capacityRejected = true;
+                    } else {
+                        expectedLength = retainedLength + normalizedLength;
+                        capacityRejected = expectedLength > representableLimit;
+                    }
+                }
+            }
+
+            if (capacityRejected || automationPasteFaultStage_ == L"capacity") {
+                outcome = PasteOutcome::CapacityRejected;
+            } else if (automationPasteFaultStage_ == L"normalization") {
+                outcome = PasteOutcome::AllocationFailure;
+            } else {
+                std::wstring normalizedText;
+                try {
+                    normalizedText = NormalizeClipboardTextForEditor(clipboard.text, normalizedLength);
+                } catch (const std::bad_alloc&) {
+                    outcome = PasteOutcome::AllocationFailure;
+                } catch (const std::length_error&) {
+                    outcome = PasteOutcome::AllocationFailure;
+                }
+
+                if (outcome == PasteOutcome::Succeeded && normalizedText.size() != normalizedLength) {
+                    outcome = PasteOutcome::NativeFailure;
+                }
+
+                if (outcome == PasteOutcome::Succeeded && automationPasteFaultStage_ == L"native-replacement") {
+                    outcome = PasteOutcome::AllocationFailure;
+                } else if (outcome == PasteOutcome::Succeeded && automationPasteFaultStage_ == L"native-errspace") {
+                    editorPasteChangeNotification_ = false;
+                    editorPasteNativeFailureNotification_ = 0U;
+                    {
+                        ScopedBoolRestore replacementActive(editorPasteReplacementActive_, true);
+                        ScopedBoolRestore suppressChange(suppressEditorChange_, true);
+                        SendMessageW(mainWindow_, WM_COMMAND, MAKEWPARAM(0, EN_ERRSPACE), reinterpret_cast<LPARAM>(editor_));
+                    }
+                    outcome = PasteOutcome::NativeFailure;
+                }
+
+                if (outcome == PasteOutcome::Succeeded) {
+                    const bool injectPartialNativeFailure = automationPasteTextActive_ &&
+                        (automationPasteFaultStage_ == L"native-maxtext" ||
+                            automationPasteFaultStage_ == L"native-errspace-changed");
+                    if (injectPartialNativeFailure) {
+                        const std::size_t injectedLimit = expectedLength == 0U ? 0U : expectedLength - 1U;
+                        SendMessageW(editor_, EM_SETLIMITTEXT, static_cast<WPARAM>(injectedLimit), 0);
+                    }
+                    editorPasteChangeNotification_ = false;
+                    editorPasteNativeFailureNotification_ = 0U;
+                    {
+                        ScopedBoolRestore replacementActive(editorPasteReplacementActive_, true);
+                        ScopedBoolRestore suppressChange(suppressEditorChange_, true);
+                        SendMessageW(editor_, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(normalizedText.c_str()));
+                        if (automationPasteTextActive_ && automationPasteFaultStage_ == L"native-errspace-changed") {
+                            SendMessageW(
+                                mainWindow_, WM_COMMAND, MAKEWPARAM(0, EN_ERRSPACE), reinterpret_cast<LPARAM>(editor_));
+                        }
+                    }
+                    if (injectPartialNativeFailure) {
+                        SendMessageW(editor_, EM_SETLIMITTEXT, static_cast<WPARAM>(nativeLimit), 0);
+                    }
+
+                    const int actualLength = GetWindowTextLengthW(editor_);
+                    DWORD actualSelectionStart = 0;
+                    DWORD actualSelectionEnd = 0;
+                    GetSelectionRange(actualSelectionStart, actualSelectionEnd);
+                    const std::size_t expectedCaret = static_cast<std::size_t>(selectionStart) + normalizedLength;
+                    const bool postStateMatches = actualLength >= 0 &&
+                        static_cast<std::size_t>(actualLength) == expectedLength &&
+                        actualSelectionStart == expectedCaret && actualSelectionEnd == expectedCaret &&
+                        editorPasteChangeNotification_;
+
+                    if (editorPasteNativeFailureNotification_ == EN_MAXTEXT) {
+                        outcome = editorPasteChangeNotification_
+                            ? PasteOutcome::NativePartial
+                            : PasteOutcome::CapacityRejected;
+                    } else if (editorPasteNativeFailureNotification_ == EN_ERRSPACE) {
+                        outcome = editorPasteChangeNotification_
+                            ? PasteOutcome::NativePartial
+                            : PasteOutcome::NativeFailure;
+                    } else if (!postStateMatches) {
+                        outcome = editorPasteChangeNotification_
+                            ? PasteOutcome::NativePartial
+                            : PasteOutcome::NativeFailure;
+                    }
+
+                    if (outcome == PasteOutcome::Succeeded) {
+                        SendMessageW(editor_, EM_SCROLLCARET, 0, 0);
+                        AdvanceSpellingLayoutRevision();
+                        if (automationPasteTextActive_) {
+                            automationPastePostCaretFirstVisibleLine_ = std::max(0, static_cast<int>(SendMessageW(
+                                editor_, EM_GETFIRSTVISIBLELINE, 0, 0)));
+                            const LRESULT topContentPosition = SendMessageW(
+                                editor_, EM_LINEINDEX, static_cast<WPARAM>(automationPastePostCaretFirstVisibleLine_), 0);
+                            automationPastePostCaretTopContentPosition_ = topContentPosition < 0
+                                ? 0
+                                : static_cast<int>(topContentPosition);
+                            automationPastePostCaretHorizontalOffset_ = GetHorizontalAnchorPixels();
+                        }
+                        UpdateEditorWidthIndexForMutation();
+                        HandleEditorChanged();
+                    } else if (editorPasteChangeNotification_) {
+                        // An unexpected native rejection can leave a partial insertion. Keep app metadata
+                        // in sync with the content the control actually accepted; never try to Undo it.
+                        UpdateEditorWidthIndexForMutation();
+                        HandleEditorChanged();
+                    }
+                }
+            }
+        }
+    }
+
+    automationPasteLastOutcome_ = PasteOutcomeName(outcome);
+    if (!automationMode_ && outcome == PasteOutcome::CapacityRejected) {
+        ShowError(L"The clipboard text exceeds the native editor control's current text limit.");
+    } else if (!automationMode_ && outcome == PasteOutcome::AllocationFailure) {
+        ShowError(L"The clipboard text could not be pasted because memory allocation failed.");
+    } else if (!automationMode_ && outcome == PasteOutcome::NativeFailure) {
+        ShowError(L"The editor control did not accept the complete clipboard text.");
+    } else if (!automationMode_ && outcome == PasteOutcome::NativePartial) {
+        ShowError(L"The editor control accepted only part of the clipboard text. The document now contains that partial paste.");
     }
 
     SetFocus(editor_);
@@ -4907,9 +7552,10 @@ void ClassicNotepadApp::HandleDelete()
     DWORD selectionEnd = 0;
     GetSelectionRange(selectionStart, selectionEnd);
     if (selectionStart == selectionEnd) {
-        const int textLength = GetWindowTextLengthW(editor_);
-        if (selectionStart < static_cast<DWORD>(textLength)) {
-            SendMessageW(editor_, EM_SETSEL, selectionStart, selectionStart + 1);
+        classic_notepad::TextUnitRange range{};
+        if (TryGetNativeCollapsedDeleteRange(editor_, selectionStart, false, range) &&
+            range.start != range.end) {
+            SendMessageW(editor_, EM_SETSEL, range.start, range.end);
         }
     }
 
@@ -5032,21 +7678,24 @@ void ClassicNotepadApp::HandleGoTo()
     if (IsLargeFileMode()) {
         const LargeFileViewInfo info = largeFileView_->GetInfo();
         const std::uint64_t target = ShowGoToDialog(
-            std::max<std::uint64_t>(1U, info.topLine + 1U),
+            std::max<std::uint64_t>(1U, info.caretLine + 1U),
             std::max<std::uint64_t>(1U, info.totalLines));
         if (target > 0) { std::wstring error; if (!largeFileView_->GoToLine(target, error)) ShowError(error); }
         return;
     }
-    DWORD selectionStart = 0;
-    DWORD selectionEnd = 0;
-    GetSelectionRange(selectionStart, selectionEnd);
-
-    const int currentLine = static_cast<int>(SendMessageW(editor_, EM_LINEFROMCHAR, selectionStart, 0)) + 1;
-    const int maxLine = std::max<int>(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
+    if (!EnsureNativeStatusSummaryComplete()) {
+        ShowError(L"Logical line information is unavailable for this document.");
+        return;
+    }
+    const DWORD activeCaretPosition = GetActiveCaretPosition();
+    std::uint64_t currentLine = 1U;
+    std::uint64_t currentColumn = 1U;
+    TryGetNativeLogicalCoordinate(static_cast<int>(activeCaretPosition), currentLine, currentColumn);
+    const std::uint64_t maxLine = statusLogicalLineBreakCount_ + 1U;
     const std::uint64_t targetLine = ShowGoToDialog(
-        static_cast<std::uint64_t>(currentLine), static_cast<std::uint64_t>(maxLine));
+        currentLine, maxLine);
     if (targetLine > 0) {
-        GoToLine(static_cast<int>(targetLine));
+        GoToLine(targetLine);
     }
 }
 
@@ -5096,27 +7745,50 @@ void ClassicNotepadApp::HandleToggleWordWrap()
     DWORD selectionStart = 0;
     DWORD selectionEnd = 0;
     GetSelectionRange(selectionStart, selectionEnd);
-    const std::wstring text = GetEditorText();
-
-    HWND oldEditor = editor_;
-    editor_ = nullptr;
-    wordWrap_ = !wordWrap_;
-    DestroyWindow(oldEditor);
-
-    editor_ = CreateEditor();
-    if (editor_ == nullptr) {
-        ShowMessageDialog(L"Could not recreate the editor control.", MB_OK | MB_ICONERROR);
-        DestroyWindow(mainWindow_);
+    std::wstring text;
+    try {
+        text = GetEditorText();
+    } catch (const std::bad_alloc&) {
+        ShowError(L"Word wrap could not be changed because memory allocation failed.");
+        return;
+    } catch (const std::length_error&) {
+        ShowError(L"Word wrap could not be changed because the document is too large.");
         return;
     }
 
-    SetEditorText(text);
-    SendMessageW(editor_, EM_SETMODIFY, wasModified ? TRUE : FALSE, 0);
-    document_.SetModified(wasModified);
-    SendMessageW(editor_, EM_SETSEL, selectionStart, selectionEnd);
-    if (firstVisibleLine > 0) {
-        SendMessageW(editor_, EM_LINESCROLL, 0, firstVisibleLine);
+    const bool targetWordWrap = !wordWrap_;
+    ScopedWindow candidateEditor(CreateEditor(false, targetWordWrap));
+    if (candidateEditor.Get() == nullptr) {
+        ShowError(L"Could not create the replacement editor control.");
+        return;
     }
+    std::wstring adoptionError;
+    bool textAdopted = false;
+    {
+        ScopedBoolRestore restoreSuppression(suppressEditorChange_, true);
+        textAdopted = TrySetEditorText(candidateEditor.Get(), text, adoptionError);
+    }
+    if (!textAdopted) {
+        ShowError(adoptionError);
+        return;
+    }
+    SendMessageW(candidateEditor.Get(), EM_EMPTYUNDOBUFFER, 0, 0);
+    SendMessageW(candidateEditor.Get(), EM_SETMODIFY, wasModified ? TRUE : FALSE, 0);
+    SendMessageW(candidateEditor.Get(), EM_SETSEL, selectionStart, selectionEnd);
+    if (firstVisibleLine > 0) {
+        SendMessageW(candidateEditor.Get(), EM_LINESCROLL, 0, firstVisibleLine);
+    }
+
+    AdvanceSpellingSession();
+    HWND oldEditor = editor_;
+    editor_ = candidateEditor.Release();
+    nativeSelectionTrackingValid_ = false;
+    TrackNativeSelectionAfterMessage(editor_, EM_SETSEL, selectionStart, selectionEnd);
+    wordWrap_ = targetWordWrap;
+    document_.SetModified(wasModified);
+    InvalidateWidestLineCache();
+    ShowWindow(editor_, SW_SHOW);
+    if (oldEditor != nullptr && IsWindow(oldEditor)) DestroyWindow(oldEditor);
 
     ResizeEditor();
     UpdateStatusBar();
@@ -5126,6 +7798,15 @@ void ClassicNotepadApp::HandleToggleWordWrap()
     UpdateMenuState(ActiveMenu());
     UpdateMenuChrome();
     if (hadFocus) {
+        SetFocus(editor_);
+    }
+}
+
+void ClassicNotepadApp::FocusActiveEditor()
+{
+    if (IsLargeFileMode()) {
+        largeFileView_->Focus();
+    } else if (editor_ != nullptr) {
         SetFocus(editor_);
     }
 }
@@ -5157,6 +7838,8 @@ void ClassicNotepadApp::HandleChooseFont()
         return;
     }
 
+    AdvanceSpellingLayoutRevision();
+    BeginEditorViewportAnchorPreservation();
     HFONT oldFont = editorFont_;
     const bool ownedOldFont = ownsEditorFont_;
     editorFont_ = newFont;
@@ -5174,6 +7857,7 @@ void ClassicNotepadApp::HandleChooseFont()
     UpdateStatusBar();
     UpdateScrollBars();
     InvalidateRect(editor_, nullptr, FALSE);
+    EndEditorViewportAnchorPreservation();
     if (largeFileView_ != nullptr) {
         largeFileView_->Focus();
     } else {
@@ -5183,6 +7867,7 @@ void ClassicNotepadApp::HandleChooseFont()
 
 void ClassicNotepadApp::HandleToggleStatusBar()
 {
+    BeginEditorViewportAnchorPreservation();
     statusBarVisible_ = !statusBarVisible_;
     if (statusBar_ != nullptr) {
         ShowWindow(statusBar_, statusBarVisible_ ? SW_SHOW : SW_HIDE);
@@ -5193,6 +7878,7 @@ void ClassicNotepadApp::HandleToggleStatusBar()
     UpdateScrollBars();
     UpdateMenuState(ActiveMenu());
     UpdateMenuChrome();
+    EndEditorViewportAnchorPreservation();
     if (largeFileView_ != nullptr) {
         largeFileView_->Focus();
     } else {
@@ -5200,7 +7886,7 @@ void ClassicNotepadApp::HandleToggleStatusBar()
     }
 }
 
-bool ClassicNotepadApp::LoadDocument(const std::wstring& path)
+bool ClassicNotepadApp::LoadDocument(const std::wstring& path, std::uint32_t ansiCodePageOverride)
 {
     std::uint64_t fileSize = 0;
     std::wstring thresholdError;
@@ -5212,7 +7898,15 @@ bool ClassicNotepadApp::LoadDocument(const std::wstring& path)
     }
     if (useLargeFileMode) {
         std::wstring errorMessage;
-        if (!LoadLargeDocument(path, errorMessage)) {
+        bool loaded = false;
+        try {
+            loaded = LoadLargeDocument(path, errorMessage);
+        } catch (const std::bad_alloc&) {
+            SetAllocationFailureMessage(errorMessage);
+        } catch (const std::length_error&) {
+            SetAllocationFailureMessage(errorMessage);
+        }
+        if (!loaded) {
             ShowError(errorMessage);
             UpdateTitle();
             return false;
@@ -5220,18 +7914,64 @@ bool ClassicNotepadApp::LoadDocument(const std::wstring& path)
         return true;
     }
 
-    std::wstring editorText;
+    Document::StagedLoad staged;
     std::wstring errorMessage;
-
-    if (!document_.Load(path, editorText, errorMessage)) {
+    bool prepared = false;
+    try {
+        prepared = ansiCodePageOverride == 0U
+            ? document_.PrepareLoad(path, staged, errorMessage)
+            : document_.PrepareLoadWithAnsiCodePage(path, staged, errorMessage, ansiCodePageOverride);
+    } catch (const std::bad_alloc&) {
+        SetAllocationFailureMessage(errorMessage);
+    } catch (const std::length_error&) {
+        SetAllocationFailureMessage(errorMessage);
+    }
+    if (!prepared) {
         ShowError(errorMessage);
         UpdateTitle();
         return false;
     }
 
-    ExitLargeFileMode();
-    SetEditorText(editorText);
+    ScopedWindow candidateEditor(CreateEditor(false, wordWrap_));
+    if (candidateEditor.Get() == nullptr) {
+        ShowError(L"The replacement editor control could not be created.");
+        UpdateTitle();
+        return false;
+    }
+    bool textAdopted = false;
+    {
+        ScopedBoolRestore restoreSuppression(suppressEditorChange_, true);
+        textAdopted = TrySetEditorText(candidateEditor.Get(), staged.editorText, errorMessage);
+    }
+    if (!textAdopted) {
+        ShowError(errorMessage);
+        UpdateTitle();
+        return false;
+    }
+    SendMessageW(candidateEditor.Get(), EM_EMPTYUNDOBUFFER, 0, 0);
+    SendMessageW(candidateEditor.Get(), EM_SETMODIFY, FALSE, 0);
+    SendMessageW(candidateEditor.Get(), EM_SETSEL, 0, 0);
+
+    // Every fallible read, decode, allocation, and control adoption step has
+    // completed. Now publish the new control and its staged file metadata.
+    AdvanceSpellingSession();
+    largeFileView_.reset();
+    HWND oldEditor = editor_;
+    editor_ = candidateEditor.Release();
+    nativeSelectionTrackingValid_ = false;
+    TrackNativeSelectionAfterMessage(editor_, EM_SETSEL, 0, 0);
+    SetStatusCharacterCountFromText(staged.editorText);
+    document_.CommitLoad(std::move(staged));
+    horizontalScrollPosition_ = 0;
+    InvalidateWidestLineCache();
+    ShowWindow(editor_, SW_SHOW);
+    if (oldEditor != nullptr && IsWindow(oldEditor)) DestroyWindow(oldEditor);
+    ResizeEditor();
     UpdateTitle();
+    UpdateStatusBar();
+    UpdateScrollBars();
+    InvalidateRect(editor_, nullptr, TRUE);
+    RefreshSpellCheck(true);
     SetFocus(editor_);
     return true;
 }
@@ -5239,11 +7979,21 @@ bool ClassicNotepadApp::LoadDocument(const std::wstring& path)
 bool ClassicNotepadApp::LoadLargeDocument(const std::wstring& path, std::wstring& errorMessage)
 {
     auto view = std::make_unique<LargeFileView>();
-    if (!view->Create(instance_, mainWindow_, IDC_MAIN_EDITOR, path, editorFont_, darkModeEnabled_, errorMessage)) {
+    if (!view->Create(
+            instance_, mainWindow_, IDC_MAIN_EDITOR, path, editorFont_, darkModeEnabled_, errorMessage, false,
+            spellingSessionId_ == (std::numeric_limits<std::uint64_t>::max)()
+                ? 1U : spellingSessionId_ + 1U)) {
+        return false;
+    }
+    if (!view->WaitForCompleteIndex(errorMessage)) {
         return false;
     }
 
     const LargeFileViewInfo info = view->GetInfo();
+    if (!info.indexingComplete || !info.encodingValid) {
+        errorMessage = L"The large file could not be fully validated and indexed.";
+        return false;
+    }
     Document::TextEncoding encoding = Document::TextEncoding::Utf8NoBom;
     if (info.encoding == classic_notepad::LargeFileEncoding::Utf16Le) {
         encoding = Document::TextEncoding::Utf16LeBom;
@@ -5251,17 +8001,44 @@ bool ClassicNotepadApp::LoadLargeDocument(const std::wstring& path, std::wstring
         encoding = Document::TextEncoding::Utf8Bom;
     }
 
-    ExitLargeFileMode();
-    largeFileView_ = std::move(view);
-    largeFileView_->SetContextMenuHandler(
-        [this](POINT point, std::uint64_t position) { return HandleLargeFileContextMenu(point, position); });
-    largeFileView_->SetWordWrap(wordWrap_);
+    const classic_notepad::LineEndingAnalysis lineEndings = classic_notepad::AnalyzeLineEndingCounts(
+        info.crlfCount, info.lfCount, info.crCount);
+    Document::StagedLargeLoad stagedMetadata;
+    document_.PrepareReadOnlyLargeFile(
+        path, encoding, lineEndings.style, lineEndings.dominantStyle, stagedMetadata);
+    std::function<bool(POINT, const classic_notepad::SpellingContextTarget&)> contextMenuHandler =
+        [this](POINT point, const classic_notepad::SpellingContextTarget& target) {
+            return HandleLargeFileContextMenu(point, target);
+        };
+    view->SetContextMenuHandler(std::move(contextMenuHandler));
+    view->SetWordWrap(wordWrap_);
+
+    // This test-only failure is placed after path/handler staging and before
+    // either the current view or its document metadata are published.
+    if (IsInjectedMappedMetadataAllocationFailure(automationMode_)) throw std::bad_alloc();
+
+    // Both commits are nonthrowing. Retain the old view until metadata and the
+    // new candidate have been installed, so any earlier failure destroys only
+    // the candidate and leaves the active document untouched.
+    largeFileView_.swap(view);
+    document_.CommitReadOnlyLargeFile(std::move(stagedMetadata));
+    AdvanceSpellingSession();
+    ShowWindow(largeFileView_->Window(), SW_SHOW);
     ShowWindow(editor_, SW_HIDE);
-    document_.OpenReadOnlyLargeFile(path, encoding);
-    ResizeEditor();
-    UpdateStatusBar();
-    UpdateTitle();
-    largeFileView_->Focus();
+    // Adoption is complete. Presentation failures must never escape to the
+    // preparation catch in LoadDocument and report a failed Open after replacing
+    // the active document. The new view and metadata remain authoritative.
+    try {
+        ResizeEditor();
+        InjectMappedPresentationAllocationFailure(automationMode_);
+        UpdateStatusBar();
+        UpdateTitle();
+    } catch (const std::bad_alloc&) {
+        ReportAdoptedDocumentPresentationFailure(mainWindow_, automationMode_);
+    } catch (const std::length_error&) {
+        ReportAdoptedDocumentPresentationFailure(mainWindow_, automationMode_);
+    }
+    largeFileView_->Focus(MappedCallbackAllocationFailureForTesting(automationMode_));
     return true;
 }
 
@@ -5274,6 +8051,7 @@ void ClassicNotepadApp::ExitLargeFileMode()
     if (editor_ != nullptr) {
         ShowWindow(editor_, SW_SHOW);
     }
+    InvalidateWidestLineCache();
     UpdateScrollBars();
 }
 
@@ -5290,15 +8068,27 @@ void ClassicNotepadApp::ShowLargeFileReadOnlyMessage()
 bool ClassicNotepadApp::AutomationNewDocument()
 {
     ExitLargeFileMode();
+    AdvanceSpellingSession();
     document_.ResetUntitled();
     SetEditorText(L"");
     UpdateTitle();
     return true;
 }
 
-bool ClassicNotepadApp::AutomationOpenFile(const std::wstring& path, std::wstring& errorMessage)
+bool ClassicNotepadApp::AutomationRequestNewTransition(bool saveChanges)
 {
-    if (LoadDocument(path)) {
+    automationMessageDialogResultOverride_ = saveChanges ? IDYES : IDCANCEL;
+    RequestDocumentTransition(DocumentTransition::NewDocument);
+    automationMessageDialogResultOverride_ = 0;
+    return true;
+}
+
+bool ClassicNotepadApp::AutomationOpenFile(
+    const std::wstring& path,
+    std::wstring& errorMessage,
+    std::uint32_t ansiCodePageOverride)
+{
+    if (LoadDocument(path, ansiCodePageOverride)) {
         return true;
     }
     errorMessage = L"The file could not be opened.";
@@ -5327,8 +8117,9 @@ bool ClassicNotepadApp::AutomationSave(std::wstring& errorMessage)
 bool ClassicNotepadApp::AutomationSaveAs(const std::wstring& path, std::wstring& errorMessage)
 {
     if (IsLargeFileMode()) {
+        std::wstring stagedPath = path;
         if (!largeFileView_->Save(path, document_.Encoding(), document_.SaveLineEnding(), true, errorMessage)) return false;
-        document_.OpenReadOnlyLargeFile(path, document_.Encoding());
+        document_.AdoptLargeFileSaveAs(std::move(stagedPath));
         document_.SetModified(false);
         UpdateTitle();
         UpdateStatusBar();
@@ -5441,6 +8232,393 @@ ClassicNotepadApp::AutomationSelection ClassicNotepadApp::AutomationGetSelection
     return selection;
 }
 
+ClassicNotepadApp::AutomationEditorWidthState ClassicNotepadApp::AutomationGetEditorWidthState() const
+{
+    AutomationEditorWidthState state;
+    if (IsLargeFileMode() || editor_ == nullptr) {
+        return state;
+    }
+
+    state.generation = editorWidthGeneration_;
+    state.editDisplayLineCount = static_cast<std::uint64_t>(std::max<LRESULT>(
+        1, SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
+    state.pendingLines = editorWidthIndexAllocationFailed_
+        ? state.editDisplayLineCount
+        : static_cast<std::uint64_t>(editorWidthUnknownLines_);
+    state.measuredDisplayLines = editorWidthMeasuredLines_;
+    state.measuredTextUnits = editorWidthMeasuredTextUnits_;
+    state.measurementBatches = editorWidthMeasurementBatches_;
+    state.lastBatchDiscoveredDisplayLines = editorWidthLastBatchDiscoveredLines_;
+    state.lastBatchPublishedDisplayLines = editorWidthLastBatchPublishedLines_;
+    state.lastBatchDiscoveredTextUnits = editorWidthLastBatchDiscoveredTextUnits_;
+    state.lastBatchMeasuredTextUnits = editorWidthLastBatchMeasuredTextUnits_;
+    state.maximumBatchDiscoveredDisplayLines = editorWidthMaximumBatchDiscoveredLines_;
+    state.maximumBatchPublishedDisplayLines = editorWidthMaximumBatchPublishedLines_;
+    state.maximumBatchTextUnits = editorWidthMaximumBatchTextUnits_;
+    state.localEditMeasuredDisplayLines = editorWidthLocalEditMeasurements_;
+    state.localEditMeasuredTextUnits = editorWidthLocalEditTextUnits_;
+    state.conservativeLineEstimates = editorWidthConservativeLines_;
+    state.maximumEditDisplayLineLength = editorWidthMaximumEditDisplayLineLength_;
+    state.measurementPending = editorWidthIndexNeedsRebuild_ || editorWidthIndexAllocationFailed_ ||
+        editorWidthUnknownLines_ != 0U;
+    state.documentWidth = MeasureWidestEditorLine();
+    state.fontMaximumAdvance = GetEditorFontMaximumAdvance();
+    state.editTextLimit = static_cast<DWORD>(SendMessageW(editor_, EM_GETLIMITTEXT, 0, 0));
+    state.windowDpi = mainWindow_ == nullptr ? 0 : static_cast<int>(GetDpiForWindow(mainWindow_));
+    POINT caretPoint{};
+    state.caretPositionAvailable = GetCaretPos(&caretPoint) != 0;
+    state.caretX = caretPoint.x;
+    state.caretY = caretPoint.y;
+    DWORD currentSelectionStart = 0;
+    DWORD currentSelectionEnd = 0;
+    SendMessageW(editor_, EM_GETSEL, reinterpret_cast<WPARAM>(&currentSelectionStart),
+        reinterpret_cast<LPARAM>(&currentSelectionEnd));
+    state.caretDisplayLine = static_cast<int>(SendMessageW(
+        editor_, EM_LINEFROMCHAR, static_cast<WPARAM>(currentSelectionEnd), 0));
+    const DWORD charPositionIndex = currentSelectionEnd > 0U ? currentSelectionEnd - 1U : currentSelectionEnd;
+    state.charPositionCharacterIndex = static_cast<int>(charPositionIndex);
+    const LRESULT charPosition = SendMessageW(
+        editor_, EM_POSFROMCHAR, static_cast<WPARAM>(charPositionIndex), 0);
+    if (charPosition != -1) {
+        state.charPositionAvailable = true;
+        state.charPositionX = static_cast<short>(LOWORD(charPosition));
+        state.charPositionY = static_cast<short>(HIWORD(charPosition));
+    }
+    if (state.charPositionAvailable) {
+        const LRESULT hitTest = SendMessageW(editor_, EM_CHARFROMPOS, 0,
+            MAKELPARAM(static_cast<short>(state.charPositionX), static_cast<short>(state.charPositionY)));
+        if (hitTest != -1) {
+            state.hitTestAvailable = true;
+            state.hitTestCharacterLowWord = LOWORD(hitTest);
+            state.hitTestLineHighWord = HIWORD(hitTest);
+        }
+    }
+    state.horizontalScrollBarVisible = horizontalScrollBarVisible_ && !wordWrap_;
+
+    RECT clientRect{};
+    GetClientRect(editor_, &clientRect);
+    state.viewportWidth = std::max(0, static_cast<int>(clientRect.right - clientRect.left));
+    state.viewportHeight = std::max(0, static_cast<int>(clientRect.bottom - clientRect.top));
+    const int unit = std::max(1, GetEditorHorizontalScrollUnit());
+    const int contentUnits = state.documentWidth / unit + ((state.documentWidth % unit) != 0 ? 1 : 0);
+    const int pageUnits = std::max(1, std::max(0, state.viewportWidth - 8) / unit);
+    state.documentHorizontalRangeMaximumOffset = std::max(0, contentUnits - 1);
+    state.horizontalMaximumOffset = std::max(0, contentUnits - pageUnits);
+
+    SCROLLINFO scrollInfo{};
+    scrollInfo.cbSize = sizeof(scrollInfo);
+    scrollInfo.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    if (GetScrollInfo(editor_, SB_HORZ, &scrollInfo)) {
+        state.nativeHorizontalScrollMinimum = scrollInfo.nMin;
+        state.nativeHorizontalScrollMaximum = scrollInfo.nMax;
+        state.nativeHorizontalScrollPage = static_cast<int>(scrollInfo.nPage);
+        state.nativeHorizontalOffset = std::max(0, scrollInfo.nPos);
+        const long long nativeMaximum = static_cast<long long>(scrollInfo.nMax) - scrollInfo.nMin -
+            static_cast<long long>(std::max<UINT>(1U, scrollInfo.nPage)) + 1LL;
+        state.nativeHorizontalMaximumOffset = static_cast<int>(std::clamp(
+            nativeMaximum,
+            0LL,
+            static_cast<long long>((std::numeric_limits<int>::max)())));
+        state.nativeHorizontalScrollInfoAvailable = scrollInfo.nMax > scrollInfo.nMin ||
+            scrollInfo.nPos > 0 || scrollInfo.nPage > 0;
+    }
+    state.horizontalScrollUnit = unit;
+    state.horizontalAnchorPixels = GetHorizontalAnchorPixels();
+    state.verticalFirstVisibleLine = std::max(0, static_cast<int>(SendMessageW(
+        editor_, EM_GETFIRSTVISIBLELINE, 0, 0)));
+    const LRESULT topContentPosition = SendMessageW(
+        editor_, EM_LINEINDEX, static_cast<WPARAM>(state.verticalFirstVisibleLine), 0);
+    state.verticalTopContentPosition = topContentPosition < 0 ? 0 : static_cast<int>(topContentPosition);
+    state.verticalLineHeight = GetEditorLineHeight();
+    state.verticalPage = std::max(1, std::max(0,
+        static_cast<int>(clientRect.bottom - clientRect.top)) / state.verticalLineHeight);
+    state.verticalMaximumOffset = std::max(0,
+        static_cast<int>(state.editDisplayLineCount) - state.verticalPage);
+    state.verticalScrollBarVisible = verticalScrollBarVisible_;
+    state.pastePostCaretFirstVisibleLine = automationPastePostCaretFirstVisibleLine_;
+    state.pastePostCaretTopContentPosition = automationPastePostCaretTopContentPosition_;
+    state.pastePostCaretHorizontalOffset = automationPastePostCaretHorizontalOffset_;
+    if (UseCustomScrollBars()) {
+        const ScrollBarMetrics metrics = GetCustomScrollBarMetrics(ScrollBarOrientation::Horizontal);
+        state.horizontalOffset = metrics.position;
+    } else {
+        if (state.nativeHorizontalScrollInfoAvailable) {
+            state.horizontalOffset = scrollInfo.nPos;
+        }
+        state.horizontalOffset = std::max(0, state.horizontalOffset);
+    }
+    state.customHorizontalOffset = UseCustomScrollBars()
+        ? GetCustomScrollBarMetrics(ScrollBarOrientation::Horizontal).position
+        : (state.nativeHorizontalScrollInfoAvailable
+            ? state.nativeHorizontalOffset / unit
+            : std::max(0, horizontalScrollPosition_));
+    state.customHorizontalOffsetPixels = state.customHorizontalOffset >
+        (std::numeric_limits<int>::max)() / unit
+        ? (std::numeric_limits<int>::max)()
+        : state.customHorizontalOffset * unit;
+    return state;
+}
+
+bool ClassicNotepadApp::AutomationSetEditorViewportSize(int width, int height)
+{
+    if (mainWindow_ == nullptr || editor_ == nullptr || IsLargeFileMode() || width <= 0 || height <= 0 ||
+        width > 16384 || height > 16384) {
+        return false;
+    }
+    if (!SetWindowPos(
+            mainWindow_, nullptr, 0, 0, width, height,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE)) {
+        return false;
+    }
+    ResizeEditor();
+    return true;
+}
+
+bool ClassicNotepadApp::AutomationSendEditorHorizontalScroll(UINT command, int trackPosition)
+{
+    if (editor_ == nullptr || IsLargeFileMode() || command > SB_ENDSCROLL ||
+        trackPosition < 0 || trackPosition > (std::numeric_limits<WORD>::max)()) {
+        return false;
+    }
+    SendMessageW(editor_, WM_HSCROLL, MAKEWPARAM(command, trackPosition), 0);
+    return true;
+}
+
+bool ClassicNotepadApp::AutomationSendEditorVerticalScroll(UINT command, int trackPosition)
+{
+    if (editor_ == nullptr || IsLargeFileMode() || command > SB_ENDSCROLL ||
+        trackPosition < 0 || trackPosition > (std::numeric_limits<WORD>::max)()) {
+        return false;
+    }
+    SendMessageW(editor_, WM_VSCROLL, MAKEWPARAM(command, trackPosition), 0);
+    return true;
+}
+
+bool ClassicNotepadApp::AutomationSendEditorLineScroll(int horizontalUnits, int verticalLines)
+{
+    if (editor_ == nullptr || IsLargeFileMode()) {
+        return false;
+    }
+    SendMessageW(editor_, EM_LINESCROLL, horizontalUnits, verticalLines);
+    if (horizontalUnits != 0 || verticalLines != 0) {
+        AdvanceSpellingLayoutRevision();
+        RefreshSpellCheck(false);
+    }
+    if (UseCustomScrollBars() && horizontalUnits != 0) {
+        const int unit = std::max(1, GetEditorHorizontalScrollUnit());
+        int nativeMaximumPixels = -1;
+        const int actualPositionPixels = GetNativeEditorHorizontalPosition(&nativeMaximumPixels);
+        if (nativeMaximumPixels >= 0) {
+            horizontalScrollPosition_ = std::max(0, actualPositionPixels) / unit;
+        } else {
+            const ScrollBarMetrics metrics = GetCustomScrollBarMetrics(ScrollBarOrientation::Horizontal);
+            const int maximum = std::max(metrics.minimum, metrics.maximum - metrics.page + 1);
+            horizontalScrollPosition_ = std::clamp(
+                horizontalScrollPosition_ + horizontalUnits, metrics.minimum, maximum);
+        }
+    }
+    UpdateStatusBar();
+    UpdateScrollBars();
+    return true;
+}
+
+bool ClassicNotepadApp::AutomationSendEditorKey(UINT virtualKey, bool shift, bool control)
+{
+    if (editor_ == nullptr || IsLargeFileMode() || virtualKey > 0xFFU) return false;
+    BYTE previousState[256]{};
+    if (!GetKeyboardState(previousState)) return false;
+    BYTE simulatedState[256]{};
+    std::copy(std::begin(previousState), std::end(previousState), std::begin(simulatedState));
+    auto setPressed = [&](UINT key, bool pressed) {
+        if (pressed) simulatedState[key] = static_cast<BYTE>(simulatedState[key] | 0x80U);
+        else simulatedState[key] = static_cast<BYTE>(simulatedState[key] & 0x7FU);
+    };
+    setPressed(VK_SHIFT, shift);
+    setPressed(VK_CONTROL, control);
+    setPressed(virtualKey, true);
+    if (!SetKeyboardState(simulatedState)) return false;
+    SendMessageW(editor_, WM_KEYDOWN, virtualKey, 1);
+    SendMessageW(editor_, WM_KEYUP, virtualKey, static_cast<LPARAM>(0xC0000001U));
+    SetKeyboardState(previousState);
+    UpdateStatusBar();
+    UpdateScrollBars();
+    return true;
+}
+
+void ClassicNotepadApp::AutomationPasteTextThroughProductionHandler(const std::wstring& text)
+{
+    automationPasteTiming_ = {};
+    if (editor_ == nullptr || IsLargeFileMode()) {
+        return;
+    }
+    const auto providerSetupStarted = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point providerCleanupStarted{};
+    try {
+        automationPasteText_ = text;
+        editorPasteNativeFailureNotification_ = 0U;
+        automationPasteClipboardDiagnostics_ = {};
+        automationPasteLastOutcome_ = L"not-run";
+        automationPastePostCaretFirstVisibleLine_ = -1;
+        automationPastePostCaretTopContentPosition_ = -1;
+        automationPastePostCaretHorizontalOffset_ = -1;
+        {
+            ScopedBoolRestore pasteProvider(automationPasteTextActive_, true);
+            automationPasteTiming_.providerSetupMicroseconds = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - providerSetupStarted).count();
+            const auto dispatchStarted = std::chrono::steady_clock::now();
+            SendMessageW(editor_, WM_PASTE, 0, 0);
+            automationPasteTiming_.productionDispatchMicroseconds = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - dispatchStarted).count();
+            providerCleanupStarted = std::chrono::steady_clock::now();
+        }
+    } catch (const std::bad_alloc&) {
+        automationPasteLastOutcome_ = PasteOutcomeName(PasteOutcome::AllocationFailure);
+    } catch (const std::length_error&) {
+        automationPasteLastOutcome_ = PasteOutcomeName(PasteOutcome::AllocationFailure);
+    }
+    if (providerCleanupStarted == std::chrono::steady_clock::time_point{}) {
+        providerCleanupStarted = std::chrono::steady_clock::now();
+    }
+    automationPasteText_.clear();
+    automationPasteTiming_.providerCleanupMicroseconds = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - providerCleanupStarted).count();
+}
+
+ClassicNotepadApp::AutomationPasteTiming ClassicNotepadApp::AutomationGetLastPasteTiming() const
+{
+    return automationPasteTiming_;
+}
+
+std::wstring ClassicNotepadApp::AutomationGetLastPasteOutcome() const
+{
+    return automationPasteLastOutcome_;
+}
+
+UINT ClassicNotepadApp::AutomationGetLastPasteNativeNotification() const
+{
+    return editorPasteNativeFailureNotification_;
+}
+
+ClassicNotepadApp::AutomationClipboardDiagnostics ClassicNotepadApp::AutomationGetLastClipboardDiagnostics() const
+{
+    return automationPasteClipboardDiagnostics_;
+}
+
+bool ClassicNotepadApp::AutomationFocusEditor()
+{
+    if (editor_ == nullptr || IsLargeFileMode()) return false;
+    SetFocus(editor_);
+    return GetFocus() == editor_;
+}
+
+bool ClassicNotepadApp::AutomationClickEditorClientPoint(int x, int y)
+{
+    if (editor_ == nullptr || IsLargeFileMode() || x < 0 || y < 0 ||
+        x > static_cast<int>((std::numeric_limits<short>::max)()) ||
+        y > static_cast<int>((std::numeric_limits<short>::max)())) {
+        return false;
+    }
+    RECT client{};
+    if (!GetClientRect(editor_, &client) || x >= client.right || y >= client.bottom) {
+        return false;
+    }
+    SetFocus(editor_);
+    const LPARAM point = MAKELPARAM(static_cast<short>(x), static_cast<short>(y));
+    SendMessageW(editor_, WM_LBUTTONDOWN, MK_LBUTTON, point);
+    SendMessageW(editor_, WM_LBUTTONUP, 0, point);
+    return true;
+}
+
+bool ClassicNotepadApp::AutomationSendEditorDrag(int startX, int startY, int endX, int endY)
+{
+    if (editor_ == nullptr || IsLargeFileMode() || !IsWindow(editor_)) return false;
+    const auto point = [](int x, int y) {
+        return MAKELPARAM(static_cast<short>(x), static_cast<short>(y));
+    };
+    SendMessageW(editor_, WM_LBUTTONDOWN, MK_LBUTTON, point(startX, startY));
+    constexpr int steps = 8;
+    for (int step = 1; step <= steps; ++step) {
+        const int x = startX + (endX - startX) * step / steps;
+        const int y = startY + (endY - startY) * step / steps;
+        SendMessageW(editor_, WM_MOUSEMOVE, MK_LBUTTON, point(x, y));
+    }
+    SendMessageW(editor_, WM_LBUTTONUP, 0, point(endX, endY));
+    UpdateStatusBar();
+    UpdateScrollBars();
+    return true;
+}
+
+bool ClassicNotepadApp::AutomationSetPasteFaultStage(const std::wstring& stage)
+{
+    static const std::array<const wchar_t*, 21> supportedStages{
+        L"", L"no-text", L"open", L"get", L"size", L"lock", L"conversion", L"invalid",
+        L"unicode-padding", L"unicode-odd-size", L"unicode-unterminated", L"ansi", L"clipboard-allocation",
+        L"copy", L"normalization", L"capacity", L"native-replacement", L"native-errspace", L"native-maxtext",
+        L"native-errspace-changed", L"native-spell-verification" };
+    if (!std::any_of(supportedStages.begin(), supportedStages.end(), [&stage](const wchar_t* candidate) {
+            return stage == candidate;
+        })) {
+        return false;
+    }
+    automationPasteFaultStage_ = stage;
+    return true;
+}
+
+DWORD ClassicNotepadApp::AutomationSetEditorTextLimit(DWORD limit)
+{
+    if (editor_ == nullptr || IsLargeFileMode()) return 0U;
+    SendMessageW(editor_, EM_SETLIMITTEXT, static_cast<WPARAM>(limit), 0);
+    return static_cast<DWORD>(SendMessageW(editor_, EM_GETLIMITTEXT, 0, 0));
+}
+
+ClassicNotepadApp::AutomationNativeReplaceProbe ClassicNotepadApp::AutomationProbeNativeReplace(
+    const std::wstring& text,
+    DWORD selectionStart,
+    DWORD selectionEnd,
+    const std::wstring& replacement,
+    DWORD textLimit)
+{
+    AutomationNativeReplaceProbe result;
+    if (mainWindow_ == nullptr || !automationMode_) return result;
+
+    ScopedWindow probeWindow(CreateWindowExW(
+        0,
+        L"EDIT",
+        L"",
+        WS_CHILD | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+        0,
+        0,
+        1,
+        1,
+        mainWindow_,
+        nullptr,
+        instance_,
+        nullptr));
+    HWND control = probeWindow.Get();
+    if (control == nullptr) return result;
+
+    ScopedValueRestore<HWND> activeProbe(automationProbeEditor_, control);
+    ScopedValueRestore<UINT> notificationReset(automationProbeNotificationMask_, 0U);
+    SendMessageW(control, EM_SETLIMITTEXT, static_cast<WPARAM>(textLimit), 0);
+    SetWindowTextW(control, text.c_str());
+    result.textLimit = static_cast<DWORD>(SendMessageW(control, EM_GETLIMITTEXT, 0, 0));
+
+    const auto readControlText = [control]() {
+        const int length = GetWindowTextLengthW(control);
+        if (length <= 0) return std::wstring();
+        std::wstring value(static_cast<std::size_t>(length) + 1U, L'\0');
+        const int copied = GetWindowTextW(control, value.data(), static_cast<int>(value.size()));
+        value.resize(static_cast<std::size_t>(std::max(0, copied)));
+        return value;
+    };
+    result.textBefore = readControlText();
+    SendMessageW(control, EM_SETSEL, selectionStart, selectionEnd);
+    SendMessageW(control, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(replacement.c_str()));
+    result.textAfter = readControlText();
+    result.notificationMask = automationProbeNotificationMask_;
+    return result;
+}
+
 void ClassicNotepadApp::AutomationSetSelection(DWORD selectionStart, DWORD selectionEnd)
 {
     if (IsLargeFileMode()) {
@@ -5450,6 +8628,8 @@ void ClassicNotepadApp::AutomationSetSelection(DWORD selectionStart, DWORD selec
     }
     SendMessageW(editor_, EM_SETSEL, selectionStart, selectionEnd);
     SendMessageW(editor_, EM_SCROLLCARET, 0, 0);
+    AdvanceSpellingLayoutRevision();
+    RefreshSpellCheck(false);
     UpdateStatusBar();
     UpdateScrollBars();
 }
@@ -5540,6 +8720,7 @@ bool ClassicNotepadApp::AutomationFind(
         CopyToFixedBuffer(findBuffer_, text);
         std::wstring selectionError;
         const LargeFileViewInfo info = largeFileView_->GetInfo();
+        if (!info.indexingComplete || !info.encodingValid) return false;
         largeFileView_->SetSelection(
             searchDown ? 0U : info.characterCount,
             searchDown ? 0U : info.characterCount,
@@ -5601,19 +8782,16 @@ bool ClassicNotepadApp::AutomationReplace(
 {
     if (IsLargeFileMode()) {
         std::wstring error;
-        std::uint64_t selectionStart = 0;
-        std::uint64_t selectionEnd = 0;
-        largeFileView_->GetSelection(selectionStart, selectionEnd);
-        std::wstring selected;
-        const bool haveSelectedMatch = selectionEnd >= selectionStart &&
-            largeFileView_->GetTextRange(selectionStart, selectionEnd - selectionStart, selected, error) &&
-            ((matchCase && selected == text) ||
-                (!matchCase && selected.size() == text.size() && std::equal(selected.begin(), selected.end(), text.begin(),
-                    [](wchar_t left, wchar_t right) { return std::towlower(left) == std::towlower(right); })));
-        if (!haveSelectedMatch && !largeFileView_->Find(text, matchCase, wholeWord, searchDown, error)) return false;
+        bool selectedMatch = largeFileView_->SelectionMatches(text, matchCase, wholeWord, error);
+        if (!selectedMatch && !error.empty()) return false;
+        if (!selectedMatch && !largeFileView_->Find(text, matchCase, wholeWord, searchDown, error)) return false;
+        selectedMatch = largeFileView_->SelectionMatches(text, matchCase, wholeWord, error);
+        if (!selectedMatch || !error.empty()) return false;
         if (!largeFileView_->InsertText(replacement, error)) return false;
         document_.SetModified(true);
         UpdateTitle();
+        UpdateStatusBar();
+        largeFileView_->Find(text, matchCase, wholeWord, searchDown, error);
         return true;
     }
     if (text.empty() || text.size() >= findBuffer_.size() || replacement.size() >= replaceBuffer_.size()) {
@@ -5645,6 +8823,49 @@ bool ClassicNotepadApp::AutomationReplace(
     ReplaceSelection(replacement);
     UpdateStatusBar();
     UpdateScrollBars();
+    FindNextWithFlags(flags, false);
+    return true;
+}
+
+bool ClassicNotepadApp::AutomationDispatchFindReplace(
+    const std::wstring& action,
+    const std::wstring& text,
+    const std::wstring& replacement,
+    bool matchCase,
+    bool wholeWord,
+    bool searchDown,
+    std::wstring& errorMessage)
+{
+    errorMessage.clear();
+    DWORD actionFlag = 0U;
+    if (action == L"findNext") actionFlag = FR_FINDNEXT;
+    else if (action == L"replace") actionFlag = FR_REPLACE;
+    else if (action == L"replaceAll") actionFlag = FR_REPLACEALL;
+    else {
+        errorMessage = L"The production Find/Replace action is invalid.";
+        return false;
+    }
+    if (text.empty() || text.size() >= findBuffer_.size() || replacement.size() >= replaceBuffer_.size()) {
+        errorMessage = L"The production Find/Replace text exceeds the dialog buffer limits.";
+        return false;
+    }
+
+    CopyToFixedBuffer(findBuffer_, text);
+    CopyToFixedBuffer(replaceBuffer_, replacement);
+    FINDREPLACEW request{};
+    request.lStructSize = sizeof(request);
+    request.hwndOwner = mainWindow_;
+    request.lpstrFindWhat = findBuffer_.data();
+    request.wFindWhatLen = static_cast<WORD>(findBuffer_.size());
+    request.lpstrReplaceWith = replaceBuffer_.data();
+    request.wReplaceWithLen = static_cast<WORD>(replaceBuffer_.size());
+    request.Flags = actionFlag | (searchDown ? FR_DOWN : 0U) |
+        (matchCase ? FR_MATCHCASE : 0U) | (wholeWord ? FR_WHOLEWORD : 0U);
+    if (mainWindow_ == nullptr || findReplaceMessage_ == 0U) {
+        errorMessage = L"The production Find/Replace callback is unavailable.";
+        return false;
+    }
+    SendMessageW(mainWindow_, findReplaceMessage_, 0, reinterpret_cast<LPARAM>(&request));
     return true;
 }
 
@@ -5687,9 +8908,12 @@ std::size_t ClassicNotepadApp::AutomationReplaceAll(
         return 0;
     }
 
-    ReplaceEditorTextFromCommand(replaced);
+    std::wstring replaceError;
+    if (!ReplaceNativeWholeDocumentUndoably(replaced, replaceError)) return 0U;
     SendMessageW(editor_, EM_SETSEL, 0, 0);
     SendMessageW(editor_, EM_SCROLLCARET, 0, 0);
+    AdvanceSpellingLayoutRevision();
+    RefreshSpellCheck(false);
     UpdateStatusBar();
     UpdateScrollBars();
     return replacementCount;
@@ -5700,16 +8924,29 @@ bool ClassicNotepadApp::AutomationGoToLine(std::uint64_t lineNumber, std::wstrin
     if (IsLargeFileMode()) {
         return largeFileView_->GoToLine(lineNumber, errorMessage);
     }
-    const int maxLine = std::max<int>(1, static_cast<int>(SendMessageW(editor_, EM_GETLINECOUNT, 0, 0)));
-    if (lineNumber < 1U || lineNumber > static_cast<std::uint64_t>(maxLine)) {
+    if (!EnsureNativeStatusSummaryComplete()) {
+        errorMessage = L"Logical line information is unavailable for this document.";
+        return false;
+    }
+    const std::uint64_t maxLine = statusLogicalLineBreakCount_ + 1U;
+    if (lineNumber < 1U || lineNumber > maxLine) {
         errorMessage = L"Line number must be between 1 and ";
         errorMessage += std::to_wstring(maxLine);
         errorMessage += L".";
         return false;
     }
 
-    GoToLine(static_cast<int>(lineNumber));
+    GoToLine(lineNumber);
     return true;
+}
+
+std::wstring ClassicNotepadApp::AutomationProbeGoToDialogDefault()
+{
+    if (!automationMode_ || mainWindow_ == nullptr || IsLargeFileMode()) return {};
+    automationGoToDialogInitialValue_.clear();
+    ScopedBoolRestore probe(automationGoToDialogProbe_, true);
+    SendMessageW(mainWindow_, WM_COMMAND, MAKEWPARAM(ID_EDIT_GO_TO, 0), 0);
+    return automationGoToDialogInitialValue_;
 }
 
 void ClassicNotepadApp::AutomationInsertTimeDate()
@@ -5733,6 +8970,43 @@ void ClassicNotepadApp::AutomationSetWordWrap(bool enabled)
 bool ClassicNotepadApp::AutomationGetWordWrap() const
 {
     return wordWrap_;
+}
+
+void ClassicNotepadApp::AutomationInvokeWordWrapMenuCommand()
+{
+    if (mainWindow_ != nullptr) {
+        SendMessageW(mainWindow_, WM_COMMAND, MAKEWPARAM(ID_FORMAT_WORD_WRAP, 0), 0);
+    }
+}
+
+bool ClassicNotepadApp::AutomationGetWordWrapMenuState(bool& enabled, bool& checked)
+{
+    HMENU menu = ActiveMenu();
+    if (menu == nullptr) {
+        return false;
+    }
+    UpdateMenuState(menu);
+    const UINT state = GetMenuState(menu, ID_FORMAT_WORD_WRAP, MF_BYCOMMAND);
+    if (state == static_cast<UINT>(-1)) {
+        return false;
+    }
+    enabled = (state & (MF_DISABLED | MF_GRAYED)) == 0;
+    checked = (state & MF_CHECKED) != 0;
+    return true;
+}
+
+bool ClassicNotepadApp::AutomationActiveEditorHasFocus() const
+{
+    const HWND focused = GetFocus();
+    if (IsLargeFileMode()) {
+        return focused == largeFileView_->Window();
+    }
+    return editor_ != nullptr && focused == editor_;
+}
+
+bool ClassicNotepadApp::AutomationNativeEditorHasFocus() const
+{
+    return editor_ != nullptr && GetFocus() == editor_;
 }
 
 void ClassicNotepadApp::AutomationSetStatusBarVisible(bool visible)
@@ -5778,6 +9052,7 @@ bool ClassicNotepadApp::AutomationSetFont(const std::wstring& fontDescription, s
         return false;
     }
 
+    BeginEditorViewportAnchorPreservation();
     HFONT oldFont = editorFont_;
     const bool ownedOldFont = ownsEditorFont_;
     editorFont_ = newFont;
@@ -5795,6 +9070,7 @@ bool ClassicNotepadApp::AutomationSetFont(const std::wstring& fontDescription, s
     UpdateStatusBar();
     UpdateScrollBars();
     InvalidateRect(editor_, nullptr, FALSE);
+    EndEditorViewportAnchorPreservation();
     return true;
 }
 
@@ -5841,50 +9117,62 @@ bool ClassicNotepadApp::AutomationPrintToTestSink(const std::wstring& path, std:
     return WriteUtf8TextFile(path, sinkText, errorMessage);
 }
 
+bool ClassicNotepadApp::AutomationSetPrintFaultStage(const std::wstring& stage)
+{
+    if (!automationMode_) {
+        return false;
+    }
+
+    if (stage.empty() || stage == L"none") {
+        automationPrintFaultStage_.clear();
+        automationPrintDiagnostics_ = {};
+        return true;
+    }
+
+    if (stage != L"startDoc" && stage != L"startPage" && stage != L"textOut" &&
+        stage != L"endPage" && stage != L"endDoc") {
+        return false;
+    }
+
+    automationPrintFaultStage_ = stage;
+    automationPrintDiagnostics_ = {};
+    return true;
+}
+
+ClassicNotepadApp::AutomationPrintDiagnostics ClassicNotepadApp::AutomationGetPrintDiagnostics() const
+{
+    return automationMode_ ? automationPrintDiagnostics_ : AutomationPrintDiagnostics{};
+}
+
 bool ClassicNotepadApp::AutomationSpellCheckAvailable() const
 {
     return spellCheckAvailable_;
 }
 
-std::vector<SpellingErrorRange> ClassicNotepadApp::AutomationCheckSpelling(const std::wstring& text) const
+SpellCheckResult ClassicNotepadApp::AutomationCheckSpelling(const std::wstring& text) const
 {
     return spellChecker_.Check(text);
 }
 
-std::vector<std::wstring> ClassicNotepadApp::AutomationSuggestSpelling(
+SpellSuggestResult ClassicNotepadApp::AutomationSuggestSpelling(
     const std::wstring& word,
     std::size_t limit) const
 {
     return spellChecker_.Suggest(word, limit);
 }
 
-bool ClassicNotepadApp::AutomationIgnoreSpelling(const std::wstring& word, std::wstring& errorMessage)
+SpellActionResult ClassicNotepadApp::AutomationIgnoreSpelling(const std::wstring& word)
 {
-    if (!spellCheckAvailable_) {
-        errorMessage = L"Spell checking is unavailable.";
-        return false;
-    }
-
-    spellChecker_.Ignore(word);
-    if (IsLargeFileMode()) RunSpellCheckNow();
-    return true;
+    SpellActionResult result = spellChecker_.Ignore(word);
+    if (result.status == SpellOperationStatus::Success) RefreshSpellCheck(true);
+    return result;
 }
 
-bool ClassicNotepadApp::AutomationAddSpelling(
-    const std::wstring& word,
-    bool dryRun,
-    std::wstring& errorMessage)
+SpellActionResult ClassicNotepadApp::AutomationAddSpelling(const std::wstring&, bool dryRun)
 {
-    if (!spellCheckAvailable_) {
-        errorMessage = L"Spell checking is unavailable.";
-        return false;
-    }
-
-    if (!dryRun) {
-        spellChecker_.Add(word);
-        if (IsLargeFileMode()) RunSpellCheckNow();
-    }
-    return true;
+    if (!dryRun) return {SpellOperationStatus::Failure, E_ACCESSDENIED, false};
+    if (!spellCheckAvailable_) return {SpellOperationStatus::Unavailable, S_FALSE, false};
+    return {SpellOperationStatus::Success, S_OK, false};
 }
 
 bool ClassicNotepadApp::AutomationDarkModeEnabled() const
@@ -5912,15 +9200,10 @@ ClassicNotepadApp::AutomationLargeFileState ClassicNotepadApp::AutomationGetLarg
 {
     AutomationLargeFileState state;
     if (largeFileView_ == nullptr) {
+        state.saveDiagnostics = document_.LastSaveDiagnostics();
         return state;
     }
     const LargeFileViewInfo info = largeFileView_->GetInfo();
-    if (info.operationCompleted && info.operationSucceeded && info.operationName == L"Save" &&
-        !info.operationTargetPath.empty() && document_.Path() != info.operationTargetPath) {
-        auto& mutableDocument = const_cast<Document&>(document_);
-        mutableDocument.OpenReadOnlyLargeFile(info.operationTargetPath, document_.Encoding());
-        mutableDocument.SetModified(info.modified);
-    }
     state.active = info.active;
     state.readOnly = info.readOnly;
     state.editable = info.editable;
@@ -5940,20 +9223,35 @@ ClassicNotepadApp::AutomationLargeFileState ClassicNotepadApp::AutomationGetLarg
     state.selectionStart = info.selectionStart;
     state.selectionEnd = info.selectionEnd;
     state.topLine = info.topLine;
+    state.maximumTopLine = info.maximumTopLine;
+    state.verticalScrollRangeMaximum = info.verticalScrollRangeMaximum;
+    state.verticalScrollPosition = info.verticalScrollPosition;
+    state.verticalScrollPage = info.verticalScrollPage;
+    state.visibleLineCount = info.visibleLineCount;
     state.generation = info.generation;
     state.pieceCount = info.pieceCount;
     state.insertedBufferBytes = info.insertedBufferBytes;
     state.saveProgressBytes = info.saveProgressBytes;
     state.saveInProgress = info.saveInProgress;
     state.paintGeneration = info.paintGeneration;
+    state.callbackAllocationFailures = info.callbackAllocationFailures;
     state.viewportGeneration = info.viewportGeneration;
     state.wordWrap = info.wordWrap;
     state.viewportVisualRows = info.viewportVisualRows;
     state.wrappedContinuationRows = info.wrappedContinuationRows;
+    state.viewportCacheRebuilds = info.viewportCacheRebuilds;
+    state.viewportCacheHits = info.viewportCacheHits;
+    state.viewportLastBuildDecodedCharacters = info.viewportLastBuildDecodedCharacters;
+    state.viewportLastBuildMeasuredCharacters = info.viewportLastBuildMeasuredCharacters;
+    state.viewportLastLogicalAnchor = info.viewportLastLogicalAnchor;
+    state.viewportLastSegmentStart = info.viewportLastSegmentStart;
+    state.viewportLastSegmentEnd = info.viewportLastSegmentEnd;
     state.spellingIssueCount = info.spellingIssueCount;
     state.maximumLineColumns = info.maximumLineColumns;
     state.horizontalOffset = info.horizontalOffset;
     state.horizontalMaximumOffset = info.horizontalMaximumOffset;
+    state.viewportWidth = info.viewportWidth;
+    state.viewportHeight = info.viewportHeight;
     state.caretRectangle = info.caretRectangle;
     state.operationInProgress = info.operationInProgress;
     state.operationCompleted = info.operationCompleted;
@@ -5961,7 +9259,9 @@ ClassicNotepadApp::AutomationLargeFileState ClassicNotepadApp::AutomationGetLarg
     state.operationName = info.operationName;
     state.operationError = info.operationError;
     state.operationTargetPath = info.operationTargetPath;
+    state.saveDiagnostics = info.saveDiagnostics;
     state.operationGeneration = info.operationGeneration;
+    state.operationToken = info.operationToken;
     state.operationProgress = info.operationProgress;
     state.operationResultCount = info.operationResultCount;
     return state;
@@ -5977,6 +9277,97 @@ bool ClassicNotepadApp::AutomationGetLargeFileLine(
         return false;
     }
     return largeFileView_->GetLine(oneBasedLine, text, errorMessage);
+}
+
+bool ClassicNotepadApp::AutomationGetLargeFileVisibleText(
+    std::uint64_t& rangeStart,
+    std::wstring& text,
+    std::wstring& errorMessage)
+{
+    if (largeFileView_ == nullptr) {
+        errorMessage = L"Large-file mode is not active.";
+        return false;
+    }
+    return largeFileView_->GetVisibleText(text, rangeStart, errorMessage);
+}
+
+bool ClassicNotepadApp::AutomationGetLargeFileVisibleWindows(
+    std::vector<LargeFileVisibleTextWindow>& windows,
+    std::wstring& errorMessage)
+{
+    if (largeFileView_ == nullptr) {
+        errorMessage = L"Large-file mode is not active.";
+        return false;
+    }
+    return largeFileView_->GetVisibleTextWindows(windows, errorMessage);
+}
+
+bool ClassicNotepadApp::AutomationGetEditorVisibleSpellingWindows(
+    std::vector<classic_notepad::SpellingTextWindow>& windows,
+    std::wstring& errorMessage) const
+{
+    errorMessage.clear();
+    if (largeFileView_ != nullptr || editor_ == nullptr) {
+        errorMessage = L"The current document is not using the ordinary native editor.";
+        return false;
+    }
+    if (!GetVisibleEditorTextWindows(windows)) {
+        errorMessage = L"The ordinary editor has no visible spelling text window.";
+        return false;
+    }
+    return true;
+}
+
+bool ClassicNotepadApp::AutomationResolveSpellingContextTarget(
+    POINT clientPoint,
+    bool keyboardInvocation,
+    classic_notepad::SpellingContextTarget& target)
+{
+    target = {};
+    if (!spellCheckAvailable_) return false;
+    if (largeFileView_ != nullptr) {
+        return largeFileView_->ResolveSpellingContextTargetAtPoint(
+            clientPoint, keyboardInvocation, target);
+    }
+    return ResolveEditorSpellingContextTarget(clientPoint, keyboardInvocation, target);
+}
+
+bool ClassicNotepadApp::AutomationGetTextPositionPoint(std::uint64_t position, POINT& clientPoint)
+{
+    if (largeFileView_ != nullptr) {
+        return largeFileView_->GetVisibleTextPositionPoint(position, clientPoint);
+    }
+    if (editor_ == nullptr || position > (std::numeric_limits<DWORD>::max)() ||
+        position > static_cast<std::uint64_t>(GetWindowTextLengthW(editor_))) return false;
+    clientPoint = PointFromEditorCharPosition(editor_, static_cast<DWORD>(position));
+    RECT client{};
+    return GetClientRect(editor_, &client) && PtInRect(&client, clientPoint) != 0;
+}
+
+bool ClassicNotepadApp::AutomationSendEditorContextMenu(int x, int y, bool keyboardInvocation)
+{
+    HWND targetWindow = largeFileView_ != nullptr ? largeFileView_->Window() : editor_;
+    if (targetWindow == nullptr || !IsWindow(targetWindow) || mainWindow_ == nullptr ||
+        SetTimer(mainWindow_, kAutomationContextMenuDismissTimerId, 150U, nullptr) == 0U) {
+        return false;
+    }
+    LPARAM coordinates = -1;
+    if (!keyboardInvocation) {
+        POINT screenPoint{ x, y };
+        if (!ClientToScreen(targetWindow, &screenPoint)) {
+            KillTimer(mainWindow_, kAutomationContextMenuDismissTimerId);
+            return false;
+        }
+        coordinates = MAKELPARAM(static_cast<short>(screenPoint.x), static_cast<short>(screenPoint.y));
+    }
+    SendMessageW(targetWindow, WM_CONTEXTMENU, reinterpret_cast<WPARAM>(targetWindow), coordinates);
+    KillTimer(mainWindow_, kAutomationContextMenuDismissTimerId);
+    return true;
+}
+
+bool ClassicNotepadApp::AutomationSetLargeFileViewportSize(int width, int height)
+{
+    return largeFileView_ != nullptr && largeFileView_->SetViewportSizeForTesting(width, height);
 }
 
 bool ClassicNotepadApp::AutomationGetLargeFileTextRange(
@@ -6010,6 +9401,16 @@ bool ClassicNotepadApp::AutomationSendLargeFileDrag(int startX, int startY, int 
 bool ClassicNotepadApp::AutomationSendLargeFileKey(UINT virtualKey, bool shift, bool control)
 {
     return largeFileView_ != nullptr && largeFileView_->SendKeyInput(virtualKey, shift, control);
+}
+
+bool ClassicNotepadApp::AutomationSendLargeFileVerticalScroll(UINT command, int trackPosition)
+{
+    return largeFileView_ != nullptr && largeFileView_->SendVerticalScrollInput(command, trackPosition);
+}
+
+bool ClassicNotepadApp::AutomationSendLargeFileWheel(int delta)
+{
+    return largeFileView_ != nullptr && largeFileView_->SendMouseWheelInput(delta);
 }
 
 bool ClassicNotepadApp::AutomationSendLargeFileHorizontalScroll(UINT command)
@@ -6049,25 +9450,6 @@ bool ClassicNotepadApp::AutomationStartLargeFileSave(const std::wstring& path, s
 {
     if (largeFileView_ == nullptr) { errorMessage = L"Large-file mode is not active."; return false; }
     return largeFileView_->StartSaveAsync(path, document_.Encoding(), document_.SaveLineEnding(), true, errorMessage);
-}
-
-bool ClassicNotepadApp::ConfirmSaveChanges()
-{
-    if (!document_.IsModified()) {
-        return true;
-    }
-
-    std::wstring prompt = L"Do you want to save changes to ";
-    prompt += document_.DisplayName();
-    prompt += L"?";
-
-    const int result = ShowMessageDialog(prompt, MB_YESNOCANCEL | MB_ICONWARNING);
-
-    if (result == IDYES) {
-        return HandleSave();
-    }
-
-    return result == IDNO;
 }
 
 std::wstring ClassicNotepadApp::GetEditorText() const
@@ -6120,9 +9502,11 @@ void ClassicNotepadApp::SetEditorText(const std::wstring& text)
     SendMessageW(editor_, EM_EMPTYUNDOBUFFER, 0, 0);
     SendMessageW(editor_, EM_SETMODIFY, FALSE, 0);
     suppressEditorChange_ = false;
+    InvalidateWidestLineCache();
     UpdateStatusBar();
     UpdateScrollBars();
     InvalidateRect(editor_, nullptr, TRUE);
+    AdvanceSpellingContentRevision();
     RefreshSpellCheck(true);
 }
 
@@ -6138,18 +9522,49 @@ void ClassicNotepadApp::ReplaceEditorTextFromCommand(const std::wstring& text)
     SendMessageW(editor_, EM_EMPTYUNDOBUFFER, 0, 0);
     SendMessageW(editor_, EM_SETMODIFY, TRUE, 0);
     suppressEditorChange_ = false;
+    InvalidateWidestLineCache();
 
     document_.SetModified(true);
     UpdateTitle();
     UpdateStatusBar();
     UpdateScrollBars();
     InvalidateRect(editor_, nullptr, TRUE);
+    AdvanceSpellingContentRevision();
     RefreshSpellCheck(true);
 }
 
 void ClassicNotepadApp::ReplaceSelection(const std::wstring& text)
 {
     SendMessageW(editor_, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(text.c_str()));
+}
+
+bool ClassicNotepadApp::ReplaceNativeWholeDocumentUndoably(
+    const std::wstring& text, std::wstring& errorMessage)
+{
+    errorMessage.clear();
+    if (editor_ == nullptr || text.size() > static_cast<std::size_t>((std::numeric_limits<DWORD>::max)())) {
+        errorMessage = L"The replacement text is too large for the native editor.";
+        return false;
+    }
+    const int oldLength = std::max(0, GetWindowTextLengthW(editor_));
+    const LRESULT nativeLimit = SendMessageW(editor_, EM_GETLIMITTEXT, 0, 0);
+    if (nativeLimit >= 0 && static_cast<std::uint64_t>(text.size()) > static_cast<std::uint64_t>(nativeLimit)) {
+        errorMessage = L"The replacement text exceeds the native editor's current text limit.";
+        return false;
+    }
+
+    SendMessageW(editor_, EM_SETSEL, 0, oldLength);
+    ReplaceSelection(text);
+    const int actualLength = GetWindowTextLengthW(editor_);
+    if (actualLength < 0 || static_cast<std::size_t>(actualLength) != text.size()) {
+        errorMessage = L"The native editor did not accept the complete Replace All result.";
+        return false;
+    }
+    if (GetEditorText() != text) {
+        errorMessage = L"The native editor's Replace All result did not match the requested text.";
+        return false;
+    }
+    return true;
 }
 
 void ClassicNotepadApp::GetSelectionRange(DWORD& selectionStart, DWORD& selectionEnd) const
@@ -6161,6 +9576,159 @@ void ClassicNotepadApp::GetSelectionRange(DWORD& selectionStart, DWORD& selectio
         EM_GETSEL,
         reinterpret_cast<WPARAM>(&selectionStart),
         reinterpret_cast<LPARAM>(&selectionEnd));
+}
+
+DWORD ClassicNotepadApp::GetActiveCaretPosition() const
+{
+    DWORD selectionStart = 0;
+    DWORD selectionEnd = 0;
+    GetSelectionRange(selectionStart, selectionEnd);
+    if (selectionStart == selectionEnd) return selectionEnd;
+    if (nativeSelectionTrackingValid_ && nativeSelectionEditor_ == editor_ &&
+        std::min(nativeSelectionAnchor_, nativeActiveCaretPosition_) == selectionStart &&
+        std::max(nativeSelectionAnchor_, nativeActiveCaretPosition_) == selectionEnd) {
+        return nativeActiveCaretPosition_;
+    }
+
+    POINT caretPoint{};
+    if (!GetCaretPos(&caretPoint)) return selectionEnd;
+
+    const auto pointForCharacter = [this](DWORD position, POINT& point) {
+        const LRESULT packed = SendMessageW(editor_, EM_POSFROMCHAR, static_cast<WPARAM>(position), 0);
+        if (packed == -1) return false;
+        point.x = static_cast<short>(LOWORD(packed));
+        point.y = static_cast<short>(HIWORD(packed));
+        return true;
+    };
+    const auto samePoint = [&caretPoint](const POINT& point) {
+        return point.x == caretPoint.x && point.y == caretPoint.y;
+    };
+
+    POINT startPoint{};
+    POINT endPoint{};
+    const bool hasStartPoint = pointForCharacter(selectionStart, startPoint);
+    const bool hasEndPoint = pointForCharacter(selectionEnd, endPoint);
+    const bool startMatchesCaret = hasStartPoint && samePoint(startPoint);
+    const bool endMatchesCaret = hasEndPoint && samePoint(endPoint);
+    if (startMatchesCaret != endMatchesCaret) {
+        return startMatchesCaret ? selectionStart : selectionEnd;
+    }
+    if (hasStartPoint != hasEndPoint) {
+        // At EOF EM_POSFROMCHAR may not return a point for selectionEnd. The
+        // live caret still distinguishes the visible endpoint from its anchor.
+        if (hasStartPoint) return startMatchesCaret ? selectionStart : selectionEnd;
+        return endMatchesCaret ? selectionEnd : selectionStart;
+    }
+    return selectionEnd;
+}
+
+void ClassicNotepadApp::TrackNativeSelectionAfterMessage(HWND editor, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    // Candidate controls must not change the committed editor's orientation.
+    if (editor == nullptr || editor != editor_) return;
+    if (nativeSelectionEditor_ != editor) nativeSelectionTrackingValid_ = false;
+    nativeSelectionEditor_ = editor;
+    if (message != WM_SETTEXT && message != EM_SETSEL && message != EM_REPLACESEL &&
+        message != EM_UNDO && message != WM_UNDO && message != WM_CUT &&
+        message != WM_CLEAR && message != WM_PASTE && message != WM_KEYDOWN &&
+        message != WM_CHAR && message != WM_LBUTTONDOWN && message != WM_LBUTTONUP &&
+        !(message == WM_MOUSEMOVE && (wParam & MK_LBUTTON) != 0)) return;
+    DWORD selectionStart = 0;
+    DWORD selectionEnd = 0;
+    GetSelectionRange(selectionStart, selectionEnd);
+    if (selectionEnd < selectionStart) std::swap(selectionStart, selectionEnd);
+
+    const auto rememberCollapsed = [this](DWORD position) {
+        nativeSelectionAnchor_ = position;
+        nativeActiveCaretPosition_ = position;
+        nativeSelectionTrackingValid_ = true;
+    };
+    const auto rememberFromAnchor = [this, selectionStart, selectionEnd]() {
+        if (selectionStart == selectionEnd) {
+            nativeSelectionAnchor_ = selectionEnd;
+            nativeActiveCaretPosition_ = selectionEnd;
+        } else if (nativeSelectionAnchor_ == selectionStart || nativeSelectionAnchor_ == selectionEnd) {
+            nativeActiveCaretPosition_ = nativeSelectionAnchor_ == selectionStart
+                ? selectionEnd : selectionStart;
+        } else {
+            nativeSelectionAnchor_ = selectionStart;
+            nativeActiveCaretPosition_ = selectionEnd;
+        }
+        nativeSelectionTrackingValid_ = true;
+    };
+
+    if (message == EM_UNDO || message == WM_UNDO || message == EM_REPLACESEL ||
+        message == WM_CUT || message == WM_CLEAR || message == WM_PASTE) {
+        if (selectionStart != selectionEnd && message != EM_UNDO && message != WM_UNDO) {
+            nativeSelectionTrackingValid_ = false;
+            return;
+        }
+        // Native mutation/Undo selects the restored range with its caret at
+        // the upper endpoint. Never reuse the pre-mutation anchor.
+        nativeSelectionAnchor_ = selectionStart;
+        nativeActiveCaretPosition_ = selectionEnd;
+        nativeSelectionTrackingValid_ = true;
+        return;
+    }
+    if (message == WM_SETTEXT) {
+        rememberCollapsed(selectionEnd);
+        return;
+    }
+    if (message == EM_SETSEL) {
+        const DWORD textLength = static_cast<DWORD>(std::max(0, GetWindowTextLengthW(editor_)));
+        const auto resolveRequested = [textLength](LPARAM value) {
+            if (value < 0) return textLength;
+            return static_cast<DWORD>(std::min<std::uint64_t>(
+                static_cast<std::uint64_t>(value), textLength));
+        };
+        const DWORD requestedAnchor = static_cast<DWORD>(std::min<std::uint64_t>(
+            static_cast<std::uint64_t>(wParam), textLength));
+        const DWORD requestedActive = resolveRequested(lParam);
+        if (selectionStart == selectionEnd) {
+            rememberCollapsed(selectionEnd);
+        } else if (requestedAnchor >= selectionStart && requestedAnchor <= selectionEnd &&
+            requestedActive >= selectionStart && requestedActive <= selectionEnd &&
+            requestedAnchor != requestedActive) {
+            nativeSelectionAnchor_ = requestedAnchor;
+            nativeActiveCaretPosition_ = requestedActive;
+            nativeSelectionTrackingValid_ = true;
+        } else {
+            nativeSelectionAnchor_ = selectionStart;
+            nativeActiveCaretPosition_ = selectionEnd;
+            nativeSelectionTrackingValid_ = true;
+        }
+        return;
+    }
+
+    if (message == WM_LBUTTONDOWN) {
+        if ((wParam & MK_SHIFT) != 0) {
+            rememberFromAnchor();
+            return;
+        }
+        rememberCollapsed(selectionEnd);
+        return;
+    }
+    if ((message == WM_MOUSEMOVE && (wParam & MK_LBUTTON) != 0) || message == WM_LBUTTONUP) {
+        rememberFromAnchor();
+        return;
+    }
+
+    if (message != WM_KEYDOWN && message != WM_CHAR) return;
+    if (selectionStart == selectionEnd) {
+        rememberCollapsed(selectionEnd);
+        return;
+    }
+
+    const bool extending = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    const DWORD trackedStart = std::min(nativeSelectionAnchor_, nativeActiveCaretPosition_);
+    const DWORD trackedEnd = std::max(nativeSelectionAnchor_, nativeActiveCaretPosition_);
+    if (extending) {
+        rememberFromAnchor();
+    } else if (!nativeSelectionTrackingValid_ || trackedStart != selectionStart || trackedEnd != selectionEnd) {
+        nativeSelectionAnchor_ = selectionStart;
+        nativeActiveCaretPosition_ = selectionEnd;
+        nativeSelectionTrackingValid_ = true;
+    }
 }
 
 bool ClassicNotepadApp::HasSelection() const
@@ -6223,6 +9791,8 @@ bool ClassicNotepadApp::FindNextWithFlags(DWORD flags, bool showNotFoundMessage,
             if (TextMatchesAt(text, position, needle, matchCase, wholeWord)) {
                 SendMessageW(editor_, EM_SETSEL, position, position + needle.size());
                 SendMessageW(editor_, EM_SCROLLCARET, 0, 0);
+                AdvanceSpellingLayoutRevision();
+                RefreshSpellCheck(false);
                 UpdateStatusBar();
                 UpdateScrollBars();
                 SetFocus(editor_);
@@ -6230,12 +9800,14 @@ bool ClassicNotepadApp::FindNextWithFlags(DWORD flags, bool showNotFoundMessage,
                 return true;
             }
         }
-    } else if (selectionStart > 0U) {
-        std::size_t position = std::min<std::size_t>(selectionStart - 1U, lastPossible);
+    } else if (selectionStart >= needle.size()) {
+        std::size_t position = std::min<std::size_t>(selectionStart - needle.size(), lastPossible);
         for (;;) {
             if (TextMatchesAt(text, position, needle, matchCase, wholeWord)) {
                 SendMessageW(editor_, EM_SETSEL, position, position + needle.size());
                 SendMessageW(editor_, EM_SCROLLCARET, 0, 0);
+                AdvanceSpellingLayoutRevision();
+                RefreshSpellCheck(false);
                 UpdateStatusBar();
                 UpdateScrollBars();
                 SetFocus(editor_);
@@ -6306,7 +9878,11 @@ void ClassicNotepadApp::ReplaceAllMatches(DWORD flags)
         return;
     }
 
-    ReplaceEditorTextFromCommand(replaced);
+    std::wstring replaceError;
+    if (!ReplaceNativeWholeDocumentUndoably(replaced, replaceError)) {
+        ShowError(replaceError);
+        return;
+    }
     SendMessageW(editor_, EM_SETSEL, 0, 0);
     SendMessageW(editor_, EM_SCROLLCARET, 0, 0);
     UpdateStatusBar();
@@ -6343,10 +9919,29 @@ bool ClassicNotepadApp::SelectionMatchesFindText(DWORD flags, const std::wstring
     return TextMatchesAt(text, selectionStart, needle, matchCase, wholeWord);
 }
 
-bool ClassicNotepadApp::PrintEditorText(HDC printerDc, std::wstring& errorMessage) const
+bool ClassicNotepadApp::PrintEditorText(HDC printerDc, std::wstring& errorMessage)
 {
+    auto setAutomationFailure = [&](const std::wstring& stage, const std::wstring& message) {
+        if (automationMode_) {
+            automationPrintDiagnostics_.succeeded = false;
+            automationPrintDiagnostics_.failureStage = stage;
+            automationPrintDiagnostics_.errorMessage = message;
+        }
+    };
+    auto shouldInjectFailure = [&](const std::wstring& stage) {
+        if (!automationMode_ || automationPrintFaultStage_ != stage) {
+            return false;
+        }
+        automationPrintFaultStage_.clear();
+        automationPrintDiagnostics_.faultInjected = true;
+        automationPrintDiagnostics_.injectedStage = stage;
+        automationPrintDiagnostics_.failureStage = stage;
+        return true;
+    };
+
     if (printerDc == nullptr) {
         errorMessage = L"Printing failed.\n\nThe selected printer could not be opened.";
+        setAutomationFailure(L"PrinterDC", errorMessage);
         return false;
     }
 
@@ -6355,12 +9950,14 @@ bool ClassicNotepadApp::PrintEditorText(HDC printerDc, std::wstring& errorMessag
     const int printableHeight = textRect.bottom - textRect.top;
     if (printableWidth <= 0 || printableHeight <= 0) {
         errorMessage = L"Printing failed.\n\nThe printable page area is too small.";
+        setAutomationFailure(L"PrintableArea", errorMessage);
         return false;
     }
 
     HFONT printFont = CreatePrinterFont(printerDc, editorFont_, mainWindow_);
     if (printFont == nullptr) {
         errorMessage = L"Printing failed.\n\nThe selected editor font could not be prepared for printing.";
+        setAutomationFailure(L"CreateFont", errorMessage);
         return false;
     }
 
@@ -6368,6 +9965,7 @@ bool ClassicNotepadApp::PrintEditorText(HDC printerDc, std::wstring& errorMessag
     if (previousFont == nullptr || previousFont == HGDI_ERROR) {
         DeleteObject(printFont);
         errorMessage = L"Printing failed.\n\nThe printer could not select the editor font.";
+        setAutomationFailure(L"SelectFont", errorMessage);
         return false;
     }
 
@@ -6379,6 +9977,7 @@ bool ClassicNotepadApp::PrintEditorText(HDC printerDc, std::wstring& errorMessag
         SelectObject(printerDc, previousFont);
         DeleteObject(printFont);
         errorMessage = L"Printing failed.\n\nThe printer could not measure the selected font.";
+        setAutomationFailure(L"GetTextMetrics", errorMessage);
         return false;
     }
 
@@ -6387,6 +9986,7 @@ bool ClassicNotepadApp::PrintEditorText(HDC printerDc, std::wstring& errorMessag
         SelectObject(printerDc, previousFont);
         DeleteObject(printFont);
         errorMessage = L"Printing failed.\n\nThe selected font is too large for the printable page area.";
+        setAutomationFailure(L"PrintableArea", errorMessage);
         return false;
     }
 
@@ -6399,32 +9999,54 @@ bool ClassicNotepadApp::PrintEditorText(HDC printerDc, std::wstring& errorMessag
     docInfo.cbSize = sizeof(docInfo);
     docInfo.lpszDocName = documentName.c_str();
 
+    if (shouldInjectFailure(L"startDoc")) {
+        SelectObject(printerDc, previousFont);
+        DeleteObject(printFont);
+        errorMessage = L"Printing failed.\n\nThe print job could not be started.";
+        setAutomationFailure(L"StartDoc", errorMessage);
+        return false;
+    }
+
     if (StartDocW(printerDc, &docInfo) <= 0) {
         SelectObject(printerDc, previousFont);
         DeleteObject(printFont);
         errorMessage = L"Printing failed.\n\nThe print job could not be started.";
+        setAutomationFailure(L"StartDoc", errorMessage);
         return false;
     }
 
-    auto failPrintJob = [&](const std::wstring& message) {
-        AbortDoc(printerDc);
+    auto failPrintJob = [&](const std::wstring& message, const std::wstring& stage) {
+        const int abortResult = AbortDoc(printerDc);
+        if (automationMode_) {
+            automationPrintDiagnostics_.abortDocCalled = true;
+            automationPrintDiagnostics_.abortDocSucceeded = abortResult > 0;
+        }
         SelectObject(printerDc, previousFont);
         DeleteObject(printFont);
         errorMessage = message;
+        setAutomationFailure(stage, message);
         return false;
     };
 
-    if (StartPage(printerDc) <= 0) {
-        return failPrintJob(L"Printing failed.\n\nThe first page could not be started.");
+    if (shouldInjectFailure(L"startPage") || StartPage(printerDc) <= 0) {
+        return failPrintJob(L"Printing failed.\n\nThe first page could not be started.", L"StartPage");
     }
 
     int y = textRect.top;
     auto startNewPage = [&]() {
+        if (shouldInjectFailure(L"endPage")) {
+            return false;
+        }
         if (EndPage(printerDc) <= 0) {
+            setAutomationFailure(L"EndPage", L"Printing failed.\n\nThe current page could not be completed.");
             return false;
         }
 
+        if (shouldInjectFailure(L"startPage")) {
+            return false;
+        }
         if (StartPage(printerDc) <= 0) {
+            setAutomationFailure(L"StartPage", L"Printing failed.\n\nA new page could not be started.");
             return false;
         }
 
@@ -6438,7 +10060,9 @@ bool ClassicNotepadApp::PrintEditorText(HDC printerDc, std::wstring& errorMessag
 
         if (line.empty()) {
             if (y + lineHeight > textRect.bottom && !startNewPage()) {
-                return failPrintJob(L"Printing failed.\n\nA new page could not be started.");
+                const std::wstring stage = automationPrintDiagnostics_.failureStage.empty()
+                    ? L"StartPage" : automationPrintDiagnostics_.failureStage;
+                return failPrintJob(L"Printing failed.\n\nA new page could not be started.", stage);
             }
 
             y += lineHeight;
@@ -6448,7 +10072,9 @@ bool ClassicNotepadApp::PrintEditorText(HDC printerDc, std::wstring& errorMessag
         std::size_t start = 0;
         while (start < line.size()) {
             if (y + lineHeight > textRect.bottom && !startNewPage()) {
-                return failPrintJob(L"Printing failed.\n\nA new page could not be started.");
+                const std::wstring stage = automationPrintDiagnostics_.failureStage.empty()
+                    ? L"StartPage" : automationPrintDiagnostics_.failureStage;
+                return failPrintJob(L"Printing failed.\n\nA new page could not be started.", stage);
             }
 
             std::size_t length = FindFittingTextLength(printerDc, line, start, printableWidth);
@@ -6459,9 +10085,13 @@ bool ClassicNotepadApp::PrintEditorText(HDC printerDc, std::wstring& errorMessag
                 --printLength;
             }
 
-            if (printLength > 0U &&
-                !TextOutW(printerDc, textRect.left, y, line.c_str() + start, static_cast<int>(printLength))) {
-                return failPrintJob(L"Printing failed.\n\nText could not be sent to the printer.");
+            if (printLength > 0U) {
+                if (shouldInjectFailure(L"textOut")) {
+                    return failPrintJob(L"Printing failed.\n\nText could not be sent to the printer.", L"TextOut");
+                }
+                if (!TextOutW(printerDc, textRect.left, y, line.c_str() + start, static_cast<int>(printLength))) {
+                    return failPrintJob(L"Printing failed.\n\nText could not be sent to the printer.", L"TextOut");
+                }
             }
 
             y += lineHeight;
@@ -6472,19 +10102,24 @@ bool ClassicNotepadApp::PrintEditorText(HDC printerDc, std::wstring& errorMessag
         }
     }
 
-    if (EndPage(printerDc) <= 0) {
-        return failPrintJob(L"Printing failed.\n\nThe last page could not be completed.");
+    if (shouldInjectFailure(L"endPage") || EndPage(printerDc) <= 0) {
+        return failPrintJob(L"Printing failed.\n\nThe last page could not be completed.", L"EndPage");
+    }
+
+    if (shouldInjectFailure(L"endDoc")) {
+        return failPrintJob(L"Printing failed.\n\nThe print job could not be completed.", L"EndDoc");
     }
 
     if (EndDoc(printerDc) <= 0) {
-        SelectObject(printerDc, previousFont);
-        DeleteObject(printFont);
         errorMessage = L"Printing failed.\n\nThe print job could not be completed.";
-        return false;
+        return failPrintJob(errorMessage, L"EndDoc");
     }
 
     SelectObject(printerDc, previousFont);
     DeleteObject(printFont);
+    if (automationMode_) {
+        automationPrintDiagnostics_.succeeded = true;
+    }
     return true;
 }
 
@@ -6557,15 +10192,15 @@ void ClassicNotepadApp::HandleFindReplaceMessage(LPARAM lParam)
         if ((findReplace->Flags & FR_FINDNEXT) != 0) {
             largeFileView_->StartFindAsync(findBuffer_.data(), matchCase, wholeWord, down, error);
         } else if ((findReplace->Flags & FR_REPLACE) != 0) {
-            std::uint64_t start = 0, end = 0; std::wstring selected;
-            largeFileView_->GetSelection(start, end);
-            const bool selectedMatch = end >= start && largeFileView_->GetTextRange(start, end - start, selected, error) &&
-                ((matchCase && selected == findBuffer_.data()) ||
-                    (!matchCase && selected.size() == std::wcslen(findBuffer_.data()) &&
-                        std::equal(selected.begin(), selected.end(), findBuffer_.data(),
-                            [](wchar_t left, wchar_t right) { return std::towlower(left) == std::towlower(right); })));
-            if (selectedMatch) largeFileView_->InsertText(replaceBuffer_.data(), error);
-            else largeFileView_->StartFindAsync(findBuffer_.data(), matchCase, wholeWord, down, error);
+            const bool selectedMatch = largeFileView_->SelectionMatches(
+                findBuffer_.data(), matchCase, wholeWord, error);
+            if (error.empty() && selectedMatch) {
+                if (largeFileView_->InsertText(replaceBuffer_.data(), error)) {
+                    largeFileView_->StartFindAsync(findBuffer_.data(), matchCase, wholeWord, down, error);
+                }
+            } else if (error.empty()) {
+                largeFileView_->StartFindAsync(findBuffer_.data(), matchCase, wholeWord, down, error);
+            }
         } else if ((findReplace->Flags & FR_REPLACEALL) != 0) {
             largeFileView_->StartReplaceAllAsync(findBuffer_.data(), replaceBuffer_.data(), matchCase, wholeWord, error);
         }
@@ -6595,6 +10230,8 @@ std::uint64_t ClassicNotepadApp::ShowGoToDialog(std::uint64_t currentLine, std::
     state.currentLine = currentLine;
     state.maxLine = maxLine;
     state.selectedLine = currentLine;
+    state.automationInitialValue = automationGoToDialogProbe_
+        ? &automationGoToDialogInitialValue_ : nullptr;
 
     const INT_PTR result = DialogBoxParamW(
         instance_,
@@ -6606,16 +10243,16 @@ std::uint64_t ClassicNotepadApp::ShowGoToDialog(std::uint64_t currentLine, std::
     return result == IDOK ? state.selectedLine : 0U;
 }
 
-void ClassicNotepadApp::GoToLine(int lineNumber)
+void ClassicNotepadApp::GoToLine(std::uint64_t lineNumber)
 {
-    const int zeroBasedLine = std::max(0, lineNumber - 1);
-    LRESULT characterIndex = SendMessageW(editor_, EM_LINEINDEX, static_cast<WPARAM>(zeroBasedLine), 0);
-    if (characterIndex < 0) {
-        characterIndex = GetWindowTextLengthW(editor_);
-    }
+    DWORD characterIndex = 0U;
+    if (lineNumber == 0U || !EnsureNativeStatusSummaryComplete() ||
+        !GetNativeLogicalLineStart(lineNumber, characterIndex)) return;
 
     SendMessageW(editor_, EM_SETSEL, static_cast<WPARAM>(characterIndex), static_cast<LPARAM>(characterIndex));
     SendMessageW(editor_, EM_SCROLLCARET, 0, 0);
+    AdvanceSpellingLayoutRevision();
+    RefreshSpellCheck(false);
     UpdateStatusBar();
     UpdateScrollBars();
     SetFocus(editor_);
@@ -6714,6 +10351,9 @@ void ClassicNotepadApp::ShowError(const std::wstring& message)
 int ClassicNotepadApp::ShowMessageDialog(const std::wstring& message, UINT flags) const
 {
     if (automationMode_) {
+        if (automationMessageDialogResultOverride_ != 0) {
+            return automationMessageDialogResultOverride_;
+        }
         return IDCANCEL;
     }
 
@@ -6735,7 +10375,7 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
             MessageBoxW(mainWindow_, L"Could not create the menu bar.", L"Classic Notepad", MB_OK | MB_ICONERROR);
             return -1;
         }
-        editor_ = CreateEditor();
+        editor_ = CreateEditor(true, wordWrap_);
         if (editor_ == nullptr) {
             MessageBoxW(mainWindow_, L"Could not create the editor control.", L"Classic Notepad", MB_OK | MB_ICONERROR);
             return -1;
@@ -6874,7 +10514,26 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
         break;
 
     case WM_COMMAND:
+        if (automationProbeEditor_ != nullptr && reinterpret_cast<HWND>(lParam) == automationProbeEditor_) {
+            const UINT notification = HIWORD(wParam);
+            if (notification == EN_CHANGE) automationProbeNotificationMask_ |= 1U;
+            else if (notification == EN_ERRSPACE) automationProbeNotificationMask_ |= 2U;
+            else if (notification == EN_MAXTEXT) automationProbeNotificationMask_ |= 4U;
+            return 0;
+        }
+        if (reinterpret_cast<HWND>(lParam) == editor_ && editorPasteReplacementActive_) {
+            const UINT notification = HIWORD(wParam);
+            if (notification == EN_CHANGE) {
+                editorPasteChangeNotification_ = true;
+                return 0;
+            }
+            else if (notification == EN_ERRSPACE || notification == EN_MAXTEXT) {
+                editorPasteNativeFailureNotification_ = notification;
+                return 0;
+            }
+        }
         if (reinterpret_cast<HWND>(lParam) == editor_ && HIWORD(wParam) == EN_CHANGE) {
+            UpdateEditorWidthIndexForMutation();
             HandleEditorChanged();
             return 0;
         }
@@ -6974,9 +10633,7 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
         break;
 
     case WM_CLOSE:
-        if (ConfirmSaveChanges()) {
-            DestroyWindow(mainWindow_);
-        }
+        RequestDocumentTransition(DocumentTransition::CloseWindow);
         return 0;
 
     case WM_DESTROY:
@@ -6986,6 +10643,8 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
             KillTimer(mainWindow_, spellCheckTimerId_);
             spellCheckTimerId_ = 0;
         }
+        KillTimer(mainWindow_, kEditorWidthIndexTimerId);
+        KillTimer(mainWindow_, kStatusCharacterCountTimerId);
         if (mainMenu_ != nullptr && GetMenu(mainWindow_) != mainMenu_) {
             DestroyMenu(mainMenu_);
             mainMenu_ = nullptr;
@@ -6994,20 +10653,49 @@ LRESULT ClassicNotepadApp::HandleMessage(UINT message, WPARAM wParam, LPARAM lPa
         return 0;
 
     case WM_TIMER:
+        if (wParam == kAutomationContextMenuDismissTimerId) {
+            KillTimer(mainWindow_, kAutomationContextMenuDismissTimerId);
+            EndMenu();
+            return 0;
+        }
         if (wParam == kSpellCheckTimerId) {
             RunSpellCheckNow();
+            return 0;
+        }
+        if (wParam == kEditorWidthIndexTimerId) {
+            MeasureEditorWidthBatch();
+            return 0;
+        }
+        if (wParam == kStatusCharacterCountTimerId) {
+            MeasureStatusCharacterCountBatch();
             return 0;
         }
         break;
 
     case WM_APP + 101:
         if (largeFileView_ != nullptr) {
-            const LargeFileViewInfo info = largeFileView_->GetInfo();
-            if (info.operationCompleted && info.operationSucceeded && info.operationName == L"Save" &&
-                !info.operationTargetPath.empty() && document_.Path() != info.operationTargetPath) {
-                document_.OpenReadOnlyLargeFile(info.operationTargetPath, document_.Encoding());
-            }
+            LargeFileViewInfo info = largeFileView_->GetInfo();
             document_.SetModified(info.modified);
+            const std::uint64_t completionToken = static_cast<std::uint64_t>(wParam);
+            if (documentTransitionCoordinator_.TryAcceptOperationNotification(
+                    completionToken, info.operationToken, info.operationCompleted)) {
+                if (info.operationSucceeded && info.operationName == L"Save" &&
+                    !info.operationTargetPath.empty() && document_.Path() != info.operationTargetPath) {
+                    document_.AdoptLargeFileSaveAs(std::move(info.operationTargetPath));
+                    document_.SetModified(info.modified);
+                }
+                largeFileView_->AcknowledgeOperationCompletion(completionToken);
+                const LargeFileViewInfo acknowledgedInfo = largeFileView_->GetInfo();
+                document_.SetModified(acknowledgedInfo.modified);
+                if (ResumePendingTransitionAfterLargeSave(acknowledgedInfo)) {
+                    if (largeFileView_ != nullptr) {
+                        UpdateStatusBar();
+                        UpdateTitle();
+                        RefreshSpellCheck(false);
+                    }
+                    return 0;
+                }
+            }
             UpdateStatusBar();
             UpdateTitle();
             RefreshSpellCheck(false);
@@ -7033,6 +10721,14 @@ INT_PTR CALLBACK ClassicNotepadApp::GoToDialogProc(HWND dialog, UINT message, WP
             SetDlgItemTextW(dialog, IDC_GOTO_LINE_EDIT, std::to_wstring(state->currentLine).c_str());
             SendDlgItemMessageW(dialog, IDC_GOTO_LINE_EDIT, EM_SETLIMITTEXT, 20, 0);
             SendDlgItemMessageW(dialog, IDC_GOTO_LINE_EDIT, EM_SETSEL, 0, -1);
+            if (state->automationInitialValue != nullptr) {
+                std::array<wchar_t, 32> initialValue{};
+                GetDlgItemTextW(dialog, IDC_GOTO_LINE_EDIT, initialValue.data(),
+                    static_cast<int>(initialValue.size()));
+                *state->automationInitialValue = initialValue.data();
+                EndDialog(dialog, IDCANCEL);
+                return TRUE;
+            }
         }
         SetFocus(GetDlgItem(dialog, IDC_GOTO_LINE_EDIT));
         return FALSE;
@@ -7323,9 +11019,7 @@ LRESULT CALLBACK ClassicNotepadApp::MenuBarWindowProc(HWND window, UINT message,
 
         case VK_ESCAPE:
             app->ClearMenuMode();
-            if (app->editor_ != nullptr) {
-                SetFocus(app->editor_);
-            }
+            app->FocusActiveEditor();
             return 0;
 
         default:
@@ -7468,7 +11162,81 @@ LRESULT CALLBACK ClassicNotepadApp::EditorWindowProc(HWND window, UINT message, 
     }
 
     if (app != nullptr && message == WM_PASTE) {
+        app->BeginEditorMutationTracking(message, wParam);
         app->HandlePaste();
+        app->EndEditorMutationTracking();
+        return 0;
+    }
+
+    if (app != nullptr && message == WM_VSCROLL && app->UseCustomScrollBars()) {
+        const ScrollBarMetrics metrics = app->GetCustomScrollBarMetrics(ScrollBarOrientation::Vertical);
+        const int maximum = std::max(metrics.minimum, metrics.maximum - metrics.page + 1);
+        int target = metrics.position;
+        switch (LOWORD(wParam)) {
+        case SB_LINEUP:
+            --target;
+            break;
+        case SB_LINEDOWN:
+            ++target;
+            break;
+        case SB_PAGEUP:
+            target -= metrics.page;
+            break;
+        case SB_PAGEDOWN:
+            target += metrics.page;
+            break;
+        case SB_TOP:
+            target = metrics.minimum;
+            break;
+        case SB_BOTTOM:
+            target = maximum;
+            break;
+        case SB_THUMBPOSITION:
+        case SB_THUMBTRACK:
+            target = static_cast<int>(HIWORD(wParam));
+            break;
+        default:
+            break;
+        }
+        app->ScrollCustomScrollBarToPosition(
+            ScrollBarOrientation::Vertical,
+            std::clamp(target, metrics.minimum, maximum));
+        return 0;
+    }
+
+    if (app != nullptr && message == WM_HSCROLL && app->UseCustomScrollBars()) {
+        const ScrollBarMetrics metrics = app->GetCustomScrollBarMetrics(ScrollBarOrientation::Horizontal);
+        const int maximum = std::max(metrics.minimum, metrics.maximum - metrics.page + 1);
+        int target = metrics.position;
+        switch (LOWORD(wParam)) {
+        case SB_LINELEFT:
+            --target;
+            break;
+        case SB_LINERIGHT:
+            ++target;
+            break;
+        case SB_PAGELEFT:
+            target -= metrics.page;
+            break;
+        case SB_PAGERIGHT:
+            target += metrics.page;
+            break;
+        case SB_LEFT:
+            target = metrics.minimum;
+            break;
+        case SB_RIGHT:
+            target = maximum;
+            break;
+        case SB_THUMBPOSITION:
+        case SB_THUMBTRACK:
+            target = static_cast<int>(HIWORD(wParam));
+            break;
+        default:
+            break;
+        }
+        app->ScrollCustomScrollBarToPosition(
+            ScrollBarOrientation::Horizontal,
+            std::clamp(target, metrics.minimum, maximum));
         return 0;
     }
 
@@ -7485,23 +11253,53 @@ LRESULT CALLBACK ClassicNotepadApp::EditorWindowProc(HWND window, UINT message, 
             return 0;
         }
 
+        if (message == WM_KEYDOWN) app->overtypeAwaitingLowSurrogate_ = false;
+
         if (message == WM_KEYDOWN && wParam == VK_INSERT && IsPlainInsertKeyPress()) {
             app->overwriteMode_ = !app->overwriteMode_;
             app->UpdateStatusBar();
             InvalidateRect(window, nullptr, FALSE);
             return 0;
         }
+        if (message == WM_CHAR) {
+            const wchar_t typedUnit = static_cast<wchar_t>(wParam);
+            const bool pairedLowSurrogate = app->overtypeAwaitingLowSurrogate_ &&
+                classic_notepad::IsLowSurrogateUnit(typedUnit);
+            if (!pairedLowSurrogate) app->overtypeAwaitingLowSurrogate_ = false;
 
-        if (message == WM_CHAR && app->overwriteMode_ && IsOvertypeCharacter(wParam)) {
+            if (app->overwriteMode_ && IsOvertypeCharacter(wParam)) {
+                if (!pairedLowSurrogate) {
+                    DWORD selectionStart = 0;
+                    DWORD selectionEnd = 0;
+                    app->GetSelectionRange(selectionStart, selectionEnd);
+                    if (selectionStart == selectionEnd) {
+                        classic_notepad::TextUnitRange range{};
+                        if (TryGetNativeOvertypeRange(window, selectionStart, range) &&
+                            range.start != range.end) {
+                            SendMessageW(window, EM_SETSEL, range.start, range.end);
+                        }
+                    }
+                }
+                app->overtypeAwaitingLowSurrogate_ =
+                    classic_notepad::IsHighSurrogateUnit(typedUnit);
+            }
+
+        }
+
+        const bool collapsedDelete =
+            (message == WM_CHAR && wParam == 8U) ||
+            (message == WM_KEYDOWN && wParam == VK_DELETE);
+        if (collapsedDelete) {
             DWORD selectionStart = 0;
             DWORD selectionEnd = 0;
             app->GetSelectionRange(selectionStart, selectionEnd);
             if (selectionStart == selectionEnd) {
-                const std::wstring text = app->GetEditorText();
-                if (selectionStart < text.size() &&
-                    text[selectionStart] != L'\r' &&
-                    text[selectionStart] != L'\n') {
-                    SendMessageW(window, EM_SETSEL, selectionStart, selectionStart + 1);
+                classic_notepad::TextUnitRange range{};
+                const bool backspace = message == WM_CHAR;
+                if (TryGetNativeCollapsedDeleteRange(window, selectionStart, backspace, range) &&
+                    (range.end - range.start > 1U || range.start != selectionStart ||
+                        range.end != selectionEnd)) {
+                    SendMessageW(window, EM_SETSEL, range.start, range.end);
                 }
             }
         }
@@ -7512,9 +11310,46 @@ LRESULT CALLBACK ClassicNotepadApp::EditorWindowProc(HWND window, UINT message, 
     }
 
     WNDPROC originalProc = app != nullptr ? app->originalEditorProc_ : nullptr;
+    const bool hadActiveMutation = app != nullptr && app->editorWidthIndexMutationActive_;
+    if (app != nullptr) {
+        app->BeginEditorMutationTracking(message, wParam);
+    }
+    const bool trackedMutation = app != nullptr && !hadActiveMutation && app->editorWidthIndexMutationActive_;
+    if (app != nullptr && window == app->editor_ && message == WM_LBUTTONDOWN &&
+        (wParam & MK_SHIFT) != 0) {
+        // EDIT extends Shift-click from the existing selection anchor. Capture
+        // it before native mouse processing changes the sorted selection range.
+        DWORD start = 0;
+        DWORD end = 0;
+        app->GetSelectionRange(start, end);
+        const DWORD active = app->GetActiveCaretPosition();
+        app->nativeSelectionEditor_ = window;
+        app->nativeSelectionAnchor_ = active == start ? end : start;
+        app->nativeActiveCaretPosition_ = active;
+        app->nativeSelectionTrackingValid_ = true;
+    }
+    const bool hadValidSelectionTracking = app != nullptr && app->nativeSelectionTrackingValid_;
+    if (app != nullptr && window == app->editor_ &&
+        (message == WM_SETTEXT || message == EM_REPLACESEL || message == EM_UNDO ||
+            message == WM_UNDO || message == WM_CUT || message == WM_CLEAR || message == WM_PASTE)) {
+        app->nativeSelectionTrackingValid_ = false;
+    }
     const LRESULT result = originalProc != nullptr
         ? CallWindowProcW(originalProc, window, message, wParam, lParam)
         : DefWindowProcW(window, message, wParam, lParam);
+
+    if (app != nullptr) {
+        if (window == app->editor_ && (message == EM_UNDO || message == WM_UNDO) && result == 0) {
+            // A failed/no-op Undo keeps the existing selection orientation.
+            app->nativeSelectionTrackingValid_ = hadValidSelectionTracking;
+        } else {
+            app->TrackNativeSelectionAfterMessage(window, message, wParam, lParam);
+        }
+    }
+
+    if (trackedMutation) {
+        app->EndEditorMutationTracking();
+    }
 
     if (app == nullptr) {
         return result;
@@ -7550,6 +11385,7 @@ LRESULT CALLBACK ClassicNotepadApp::EditorWindowProc(HWND window, UINT message, 
             message == WM_HSCROLL ||
             message == WM_VSCROLL ||
             message == WM_SIZE) {
+            app->AdvanceSpellingLayoutRevision();
             app->RefreshSpellCheck(false);
         }
         InvalidateRect(

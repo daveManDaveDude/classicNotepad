@@ -23,6 +23,14 @@ bool DecodeTextBytes(
     DecodeTextResult& result,
     std::wstring& errorMessage);
 
+#if defined(_WIN32) && !defined(CLASSIC_NOTEPAD_PORTABLE_CORE_SMOKE)
+bool DecodeTextBytesWithAnsiCodePage(
+    const std::vector<std::uint8_t>& bytes,
+    DecodeTextResult& result,
+    std::wstring& errorMessage,
+    std::uint32_t ansiCodePage);
+#endif
+
 bool EncodeTextBytes(
     const std::wstring& text,
     TextEncoding encoding,

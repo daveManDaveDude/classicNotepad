@@ -70,8 +70,10 @@ bool ReadFileBytes(const std::wstring& path, std::vector<std::uint8_t>& bytes, s
 bool WriteFileBytesAtomically(
     const std::wstring& path,
     const std::vector<std::uint8_t>& bytes,
-    std::wstring& errorMessage)
+    std::wstring& errorMessage,
+    SaveDiagnostics* diagnostics)
 {
+    if (diagnostics != nullptr) *diagnostics = {};
     const std::filesystem::path targetPath = MakePath(path);
     constexpr int kTempPathAttempts = 64;
 
@@ -87,6 +89,7 @@ bool WriteFileBytesAtomically(
 
     if (!allocatedTempPath) {
         errorMessage = L"Could not allocate a temporary save file.";
+        if (diagnostics != nullptr) diagnostics->failureStage = SaveFailureStage::Create;
         return false;
     }
 
@@ -94,6 +97,7 @@ bool WriteFileBytesAtomically(
         std::ofstream output(tempPath, std::ios::binary | std::ios::trunc);
         if (!output) {
             errorMessage = L"Could not create a temporary save file.";
+            if (diagnostics != nullptr) diagnostics->failureStage = SaveFailureStage::Create;
             return false;
         }
 
@@ -106,6 +110,7 @@ bool WriteFileBytesAtomically(
             std::error_code removeError;
             std::filesystem::remove(tempPath, removeError);
             errorMessage = L"Could not write the complete file.";
+            if (diagnostics != nullptr) diagnostics->failureStage = SaveFailureStage::Write;
             return false;
         }
     }
@@ -123,9 +128,15 @@ bool WriteFileBytesAtomically(
         std::error_code removeTempError;
         std::filesystem::remove(tempPath, removeTempError);
         errorMessage = ErrorMessage(L"Could not replace the destination file.", error);
+        if (diagnostics != nullptr) diagnostics->failureStage = SaveFailureStage::Replace;
         return false;
     }
 
+    if (diagnostics != nullptr) {
+        diagnostics->outputComplete = true;
+        diagnostics->committed = true;
+    }
+    errorMessage.clear();
     return true;
 }
 

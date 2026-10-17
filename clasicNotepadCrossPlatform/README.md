@@ -1,5 +1,7 @@
 # clasicNotepadCrossPlatform
 
+> **Historical research and parity-planning snapshot:** the status statements and planned parity in this pack describe its original planning context; they do not establish current implementation or qualification. See the repository [README](../README.md) for the present feature surface and [Windows reliability status](../docs/WINDOWS_RELIABILITY_STATUS.md) for later Windows evidence and open gates.
+
 This directory contains the cross-platform research and parity planning pack for Classic Notepad.
 
 Current implementation status:

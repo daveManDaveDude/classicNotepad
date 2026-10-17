@@ -46,6 +46,16 @@ bool EncodeAnsiText(const std::wstring& text, std::vector<std::uint8_t>& bytes, 
             continue;
         }
 
+        if (character >= 0x80U && character <= 0x9FU) {
+            const std::size_t index = static_cast<std::size_t>(character - 0x80U);
+            if (kWindows1252Controls[index] == kUndefined) {
+                // These five undefined Windows-1252 slots round-trip as their
+                // corresponding C1 control code points.
+                bytes.push_back(static_cast<std::uint8_t>(character));
+                continue;
+            }
+        }
+
         bool encoded = false;
         for (std::size_t index = 0; index < kWindows1252Controls.size(); ++index) {
             if (kWindows1252Controls[index] == character) {

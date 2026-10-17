@@ -1,5 +1,7 @@
 # Classic Notepad Clone Build Plan
 
+> **Historical implementation plan:** this document preserves the original milestone scope and acceptance notes; its goals and statements describe that planning snapshot, not current qualification status. See the root [README](../README.md) for the present feature surface and [Windows reliability status](WINDOWS_RELIABILITY_STATUS.md) for later evidence and open gates.
+
 ## Goal
 
 Build a Windows-native, fast, efficient clone of classic pre-Windows-11 Notepad.

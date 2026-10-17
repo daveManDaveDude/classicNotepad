@@ -3,13 +3,13 @@
 namespace classic_notepad {
 namespace {
 
-LineEndingStyle DominantLineEnding(const LineEndingAnalysis& analysis)
+LineEndingStyle DominantLineEnding(std::uint64_t crlfCount, std::uint64_t lfCount, std::uint64_t crCount)
 {
-    if (analysis.lfCount > analysis.crlfCount && analysis.lfCount >= analysis.crCount) {
+    if (lfCount > crlfCount && lfCount >= crCount) {
         return LineEndingStyle::Lf;
     }
 
-    if (analysis.crCount > analysis.crlfCount && analysis.crCount > analysis.lfCount) {
+    if (crCount > crlfCount && crCount > lfCount) {
         return LineEndingStyle::Cr;
     }
 
@@ -20,27 +20,42 @@ LineEndingStyle DominantLineEnding(const LineEndingAnalysis& analysis)
 
 LineEndingAnalysis AnalyzeLineEndings(const std::wstring& text)
 {
-    LineEndingAnalysis analysis{};
+    std::uint64_t crlfCount = 0;
+    std::uint64_t lfCount = 0;
+    std::uint64_t crCount = 0;
 
     for (std::size_t index = 0; index < text.size(); ++index) {
         if (text[index] == L'\r') {
             if (index + 1U < text.size() && text[index + 1U] == L'\n') {
-                ++analysis.crlfCount;
+                ++crlfCount;
                 ++index;
             } else {
-                ++analysis.crCount;
+                ++crCount;
             }
         } else if (text[index] == L'\n') {
-            ++analysis.lfCount;
+            ++lfCount;
         }
     }
 
-    const bool hasCrlf = analysis.crlfCount > 0U;
-    const bool hasLf = analysis.lfCount > 0U;
-    const bool hasCr = analysis.crCount > 0U;
+    return AnalyzeLineEndingCounts(crlfCount, lfCount, crCount);
+}
+
+LineEndingAnalysis AnalyzeLineEndingCounts(
+    std::uint64_t crlfCount,
+    std::uint64_t lfCount,
+    std::uint64_t crCount)
+{
+    LineEndingAnalysis analysis{};
+    analysis.crlfCount = crlfCount;
+    analysis.lfCount = lfCount;
+    analysis.crCount = crCount;
+
+    const bool hasCrlf = crlfCount > 0U;
+    const bool hasLf = lfCount > 0U;
+    const bool hasCr = crCount > 0U;
     const int styleCount = (hasCrlf ? 1 : 0) + (hasLf ? 1 : 0) + (hasCr ? 1 : 0);
 
-    analysis.dominantStyle = DominantLineEnding(analysis);
+    analysis.dominantStyle = DominantLineEnding(crlfCount, lfCount, crCount);
 
     if (styleCount == 0) {
         analysis.style = LineEndingStyle::Crlf;

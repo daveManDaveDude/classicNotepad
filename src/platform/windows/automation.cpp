@@ -6,9 +6,12 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -32,6 +35,87 @@ struct JsonValue {
 };
 
 using JsonObject = std::map<std::string, JsonValue>;
+
+long long ElapsedMicroseconds(std::chrono::steady_clock::time_point started)
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - started).count();
+}
+
+bool ReadUtf16LeFile(const std::wstring& path, std::wstring& text, std::wstring& errorMessage)
+{
+    static_assert(sizeof(wchar_t) == 2, "Windows UTF-16 automation files require 16-bit wchar_t.");
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        errorMessage = L"The UTF-16 input file could not be opened.";
+        return false;
+    }
+
+    LARGE_INTEGER fileSize{};
+    if (!GetFileSizeEx(file, &fileSize) || fileSize.QuadPart < 0 || (fileSize.QuadPart % 2) != 0 ||
+        fileSize.QuadPart > 1024LL * 1024LL * 1024LL) {
+        CloseHandle(file);
+        errorMessage = L"The UTF-16 input file must have an even byte length no larger than 1 GiB.";
+        return false;
+    }
+
+    try {
+        text.assign(static_cast<std::size_t>(fileSize.QuadPart / 2), L'\0');
+    } catch (...) {
+        CloseHandle(file);
+        errorMessage = L"The UTF-16 input file could not be allocated.";
+        return false;
+    }
+
+    const std::size_t byteCount = text.size() * sizeof(wchar_t);
+    std::size_t offset = 0;
+    while (offset < byteCount) {
+        const DWORD request = static_cast<DWORD>(std::min<std::size_t>(byteCount - offset, 4U * 1024U * 1024U));
+        DWORD read = 0;
+        if (!ReadFile(file, reinterpret_cast<char*>(text.data()) + offset, request, &read, nullptr) || read != request) {
+            CloseHandle(file);
+            text.clear();
+            errorMessage = L"The UTF-16 input file could not be read completely.";
+            return false;
+        }
+        offset += read;
+    }
+    CloseHandle(file);
+    return true;
+}
+
+bool WriteUtf16LeFile(const std::wstring& path, const std::wstring& text, std::wstring& errorMessage)
+{
+    static_assert(sizeof(wchar_t) == 2, "Windows UTF-16 automation files require 16-bit wchar_t.");
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        errorMessage = L"The UTF-16 output file could not be created.";
+        return false;
+    }
+
+    const std::size_t byteCount = text.size() * sizeof(wchar_t);
+    std::size_t offset = 0;
+    while (offset < byteCount) {
+        const DWORD request = static_cast<DWORD>(std::min<std::size_t>(byteCount - offset, 4U * 1024U * 1024U));
+        DWORD written = 0;
+        if (!WriteFile(file, reinterpret_cast<const char*>(text.data()) + offset, request, &written, nullptr) ||
+            written != request) {
+            CloseHandle(file);
+            errorMessage = L"The UTF-16 output file could not be written completely.";
+            return false;
+        }
+        offset += written;
+    }
+    const bool flushed = FlushFileBuffers(file) != 0;
+    CloseHandle(file);
+    if (!flushed) {
+        errorMessage = L"The UTF-16 output file could not be flushed.";
+        return false;
+    }
+    return true;
+}
 
 std::wstring Utf8ToWide(const std::string& text)
 {
@@ -530,6 +614,30 @@ private:
     std::ostringstream stream_;
 };
 
+const char* SpellOperationStatusName(SpellOperationStatus status)
+{
+    switch (status) {
+    case SpellOperationStatus::Success: return "success";
+    case SpellOperationStatus::Unavailable: return "unavailable";
+    case SpellOperationStatus::Failure: return "failure";
+    }
+    return "failure";
+}
+
+std::optional<SpellOperationStatus> ParseSpellOperationStatus(const std::wstring& value)
+{
+    if (value == L"success") return SpellOperationStatus::Success;
+    if (value == L"unavailable") return SpellOperationStatus::Unavailable;
+    if (value == L"failure") return SpellOperationStatus::Failure;
+    return std::nullopt;
+}
+
+void AddSpellOperationFields(ResponseWriter& response, SpellOperationStatus status, HRESULT hresult)
+{
+    response.AddString("status", Utf8ToWide(SpellOperationStatusName(status)));
+    response.AddNumber("hresult", static_cast<long long>(static_cast<std::uint32_t>(hresult)));
+}
+
 std::string BuildErrorResponse(long long id, const std::wstring& message)
 {
     ResponseWriter response(id, false);
@@ -581,20 +689,35 @@ std::string BuildLargeFileStateObject(const ClassicNotepadApp::AutomationLargeFi
            << ",\"selectionStart\":" << state.selectionStart
            << ",\"selectionEnd\":" << state.selectionEnd
            << ",\"topLine\":" << state.topLine
+           << ",\"maximumTopLine\":" << state.maximumTopLine
+           << ",\"verticalScrollRangeMaximum\":" << state.verticalScrollRangeMaximum
+           << ",\"verticalScrollPosition\":" << state.verticalScrollPosition
+           << ",\"verticalScrollPage\":" << state.verticalScrollPage
+           << ",\"visibleLineCount\":" << state.visibleLineCount
            << ",\"generation\":" << state.generation
            << ",\"pieceCount\":" << state.pieceCount
            << ",\"insertedBufferBytes\":" << state.insertedBufferBytes
            << ",\"saveProgressBytes\":" << state.saveProgressBytes
            << ",\"saveInProgress\":" << (state.saveInProgress ? "true" : "false")
            << ",\"paintGeneration\":" << state.paintGeneration
+           << ",\"callbackAllocationFailures\":" << state.callbackAllocationFailures
            << ",\"viewportGeneration\":" << state.viewportGeneration
            << ",\"wordWrap\":" << (state.wordWrap ? "true" : "false")
            << ",\"viewportVisualRows\":" << state.viewportVisualRows
            << ",\"wrappedContinuationRows\":" << state.wrappedContinuationRows
+           << ",\"viewportCacheRebuilds\":" << state.viewportCacheRebuilds
+           << ",\"viewportCacheHits\":" << state.viewportCacheHits
+           << ",\"viewportLastBuildDecodedCharacters\":" << state.viewportLastBuildDecodedCharacters
+           << ",\"viewportLastBuildMeasuredCharacters\":" << state.viewportLastBuildMeasuredCharacters
+           << ",\"viewportLastLogicalAnchor\":" << state.viewportLastLogicalAnchor
+           << ",\"viewportLastSegmentStart\":" << state.viewportLastSegmentStart
+           << ",\"viewportLastSegmentEnd\":" << state.viewportLastSegmentEnd
            << ",\"spellingIssueCount\":" << state.spellingIssueCount
            << ",\"maximumLineColumns\":" << state.maximumLineColumns
            << ",\"horizontalOffset\":" << state.horizontalOffset
            << ",\"horizontalMaximumOffset\":" << state.horizontalMaximumOffset
+           << ",\"viewportWidth\":" << state.viewportWidth
+           << ",\"viewportHeight\":" << state.viewportHeight
            << ",\"caretRectangle\":{"
            << "\"left\":" << state.caretRectangle.left
            << ",\"top\":" << state.caretRectangle.top
@@ -606,10 +729,101 @@ std::string BuildLargeFileStateObject(const ClassicNotepadApp::AutomationLargeFi
            << ",\"operationName\":" << EscapeJsonString(state.operationName)
            << ",\"operationError\":" << EscapeJsonString(state.operationError)
            << ",\"operationTargetPath\":" << EscapeJsonString(state.operationTargetPath)
+           << ",\"saveFailureStage\":" << EscapeJsonString(classic_notepad::SaveFailureStageName(state.saveDiagnostics.failureStage))
+           << ",\"saveWin32Error\":" << state.saveDiagnostics.win32Error
+           << ",\"saveOutputComplete\":" << (state.saveDiagnostics.outputComplete ? "true" : "false")
+           << ",\"saveCommitted\":" << (state.saveDiagnostics.committed ? "true" : "false")
+           << ",\"saveRecoveryPath\":" << EscapeJsonString(state.saveDiagnostics.recoveryPath)
            << ",\"operationGeneration\":" << state.operationGeneration
+           << ",\"operationToken\":" << state.operationToken
            << ",\"operationProgress\":" << state.operationProgress
            << ",\"operationResultCount\":" << state.operationResultCount
            << "}";
+    return output.str();
+}
+
+std::string BuildEditorWidthStateObject(const ClassicNotepadApp::AutomationEditorWidthState& state)
+{
+    std::ostringstream output;
+    output << "{"
+           << "\"generation\":" << state.generation
+           << ",\"editDisplayLineCount\":" << state.editDisplayLineCount
+           << ",\"pendingLines\":" << state.pendingLines
+           << ",\"measuredDisplayLines\":" << state.measuredDisplayLines
+           << ",\"measuredTextUnits\":" << state.measuredTextUnits
+           << ",\"measurementBatches\":" << state.measurementBatches
+           << ",\"lastBatchDiscoveredDisplayLines\":" << state.lastBatchDiscoveredDisplayLines
+           << ",\"lastBatchPublishedDisplayLines\":" << state.lastBatchPublishedDisplayLines
+           << ",\"lastBatchDiscoveredTextUnits\":" << state.lastBatchDiscoveredTextUnits
+           << ",\"lastBatchMeasuredTextUnits\":" << state.lastBatchMeasuredTextUnits
+           << ",\"maximumBatchDiscoveredDisplayLines\":" << state.maximumBatchDiscoveredDisplayLines
+           << ",\"maximumBatchPublishedDisplayLines\":" << state.maximumBatchPublishedDisplayLines
+           << ",\"maximumBatchTextUnits\":" << state.maximumBatchTextUnits
+           << ",\"localEditMeasuredDisplayLines\":" << state.localEditMeasuredDisplayLines
+           << ",\"localEditMeasuredTextUnits\":" << state.localEditMeasuredTextUnits
+           << ",\"conservativeLineEstimates\":" << state.conservativeLineEstimates
+           << ",\"maximumEditDisplayLineLength\":" << state.maximumEditDisplayLineLength
+           << ",\"documentWidth\":" << state.documentWidth
+           << ",\"viewportWidth\":" << state.viewportWidth
+           << ",\"viewportHeight\":" << state.viewportHeight
+           << ",\"documentHorizontalRangeMaximumOffset\":" << state.documentHorizontalRangeMaximumOffset
+           << ",\"horizontalOffset\":" << state.horizontalOffset
+           << ",\"horizontalMaximumOffset\":" << state.horizontalMaximumOffset
+           << ",\"nativeHorizontalOffset\":" << state.nativeHorizontalOffset
+           << ",\"nativeHorizontalMaximumOffset\":" << state.nativeHorizontalMaximumOffset
+           << ",\"nativeHorizontalScrollMinimum\":" << state.nativeHorizontalScrollMinimum
+           << ",\"nativeHorizontalScrollMaximum\":" << state.nativeHorizontalScrollMaximum
+           << ",\"nativeHorizontalScrollPage\":" << state.nativeHorizontalScrollPage
+           << ",\"fontMaximumAdvance\":" << state.fontMaximumAdvance
+           << ",\"editTextLimit\":" << state.editTextLimit
+           << ",\"windowDpi\":" << state.windowDpi
+           << ",\"caretX\":" << state.caretX
+           << ",\"caretY\":" << state.caretY
+           << ",\"caretPositionAvailable\":" << (state.caretPositionAvailable ? "true" : "false")
+           << ",\"caretDisplayLine\":" << state.caretDisplayLine
+           << ",\"charPositionCharacterIndex\":" << state.charPositionCharacterIndex
+           << ",\"charPositionX\":" << state.charPositionX
+           << ",\"charPositionY\":" << state.charPositionY
+           << ",\"charPositionAvailable\":" << (state.charPositionAvailable ? "true" : "false")
+           << ",\"hitTestCharacterLowWord\":" << state.hitTestCharacterLowWord
+           << ",\"hitTestLineHighWord\":" << state.hitTestLineHighWord
+           << ",\"hitTestAvailable\":" << (state.hitTestAvailable ? "true" : "false")
+           << ",\"customHorizontalOffset\":" << state.customHorizontalOffset
+           << ",\"customHorizontalOffsetPixels\":" << state.customHorizontalOffsetPixels
+           << ",\"horizontalScrollUnit\":" << state.horizontalScrollUnit
+           << ",\"horizontalAnchorPixels\":" << state.horizontalAnchorPixels
+           << ",\"verticalFirstVisibleLine\":" << state.verticalFirstVisibleLine
+           << ",\"verticalTopContentPosition\":" << state.verticalTopContentPosition
+           << ",\"verticalPage\":" << state.verticalPage
+           << ",\"verticalMaximumOffset\":" << state.verticalMaximumOffset
+           << ",\"verticalLineHeight\":" << state.verticalLineHeight
+           << ",\"pastePostCaretFirstVisibleLine\":" << state.pastePostCaretFirstVisibleLine
+           << ",\"pastePostCaretTopContentPosition\":" << state.pastePostCaretTopContentPosition
+           << ",\"pastePostCaretHorizontalOffset\":" << state.pastePostCaretHorizontalOffset
+           << ",\"nativeHorizontalScrollInfoAvailable\":" <<
+                (state.nativeHorizontalScrollInfoAvailable ? "true" : "false")
+           << ",\"measurementPending\":" << (state.measurementPending ? "true" : "false")
+           << ",\"horizontalScrollBarVisible\":" << (state.horizontalScrollBarVisible ? "true" : "false")
+           << ",\"verticalScrollBarVisible\":" << (state.verticalScrollBarVisible ? "true" : "false")
+           << "}";
+    return output.str();
+}
+
+std::string BuildLargeFileVisibleWindowsObject(const std::vector<LargeFileVisibleTextWindow>& windows)
+{
+    std::ostringstream output;
+    output << '[';
+    for (std::size_t index = 0; index < windows.size(); ++index) {
+        if (index != 0U) output << ',';
+        output << "{\"sessionId\":" << windows[index].revision.session
+               << ",\"contentRevision\":" << windows[index].revision.content
+               << ",\"layoutRevision\":" << windows[index].revision.layout
+               << ",\"start\":" << windows[index].absoluteStart
+               << ",\"eligibleStart\":" << windows[index].eligibleStart
+               << ",\"eligibleEnd\":" << windows[index].eligibleEnd
+               << ",\"text\":" << EscapeJsonString(windows[index].text) << '}';
+    }
+    output << ']';
     return output.str();
 }
 
@@ -680,6 +894,20 @@ std::string BuildSpellingErrorsArray(
                << ",\"replacement\":" << EscapeJsonString(error.replacement)
                << ",\"action\":" << EscapeJsonString(CorrectiveActionName(error.action))
                << "}";
+    }
+    output << "]";
+    return output.str();
+}
+
+std::string BuildSpellingAnnotationsArray(const classic_notepad::SpellingAnnotationBatch& batch)
+{
+    std::ostringstream output;
+    output << "[";
+    for (std::size_t index = 0U; index < batch.annotations.size(); ++index) {
+        if (index != 0U) output << ",";
+        const classic_notepad::SpellingAnnotation& annotation = batch.annotations[index];
+        output << "{\"start\":" << annotation.start
+               << ",\"length\":" << annotation.length << "}";
     }
     output << "]";
     return output.str();
@@ -800,13 +1028,27 @@ std::string HandleCommand(
         return ResponseWriter(id, true).Finish();
     }
 
+    if (name == L"requestNewTransition") {
+        app.AutomationRequestNewTransition(GetBool(request, "saveChanges", true));
+        return ResponseWriter(id, true).Finish();
+    }
+
     if (name == L"openFile") {
         std::wstring path;
         if (!RequireString(request, "path", path, errorMessage)) {
             return BuildErrorResponse(id, errorMessage);
         }
 
-        if (!app.AutomationOpenFile(path, errorMessage)) {
+        std::uint32_t ansiCodePageOverride = 0U;
+        const auto ansiCodePage = GetNumber(request, "ansiCodePage");
+        if (ansiCodePage.has_value()) {
+            if (*ansiCodePage <= 0 || *ansiCodePage > 0xFFFFFFFFLL) {
+                return BuildErrorResponse(id, L"ansiCodePage must be a positive 32-bit code page number.");
+            }
+            ansiCodePageOverride = static_cast<std::uint32_t>(*ansiCodePage);
+        }
+
+        if (!app.AutomationOpenFile(path, errorMessage, ansiCodePageOverride)) {
             return BuildErrorResponse(id, errorMessage);
         }
 
@@ -816,6 +1058,98 @@ std::string HandleCommand(
     if (name == L"getLargeFileState") {
         ResponseWriter response(id, true);
         response.AddRaw("largeFile", BuildLargeFileStateObject(app.AutomationGetLargeFileState()));
+        return response.Finish();
+    }
+
+    if (name == L"getEditorWidthState") {
+        ResponseWriter response(id, true);
+        response.AddRaw("editorWidth", BuildEditorWidthStateObject(app.AutomationGetEditorWidthState()));
+        return response.Finish();
+    }
+
+    if (name == L"resizeEditorViewport") {
+        const auto width = GetNumber(request, "width");
+        const auto height = GetNumber(request, "height");
+        if (!width.has_value() || !height.has_value() ||
+            !app.AutomationSetEditorViewportSize(static_cast<int>(*width), static_cast<int>(*height))) {
+            return BuildErrorResponse(id, L"The ordinary editor viewport could not be resized.");
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("editorWidth", BuildEditorWidthStateObject(app.AutomationGetEditorWidthState()));
+        return response.Finish();
+    }
+
+    if (name == L"sendEditorHorizontalScroll") {
+        const auto scrollCommand = GetNumber(request, "scrollCommand");
+        const auto trackPosition = GetNumber(request, "trackPosition").value_or(0);
+        if (!scrollCommand.has_value() || *scrollCommand < 0 || *scrollCommand > SB_ENDSCROLL ||
+            trackPosition < 0 || trackPosition > (std::numeric_limits<int>::max)() ||
+            !app.AutomationSendEditorHorizontalScroll(static_cast<UINT>(*scrollCommand), static_cast<int>(trackPosition))) {
+            return BuildErrorResponse(id, L"Ordinary-editor horizontal scroll input could not be delivered.");
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("editorWidth", BuildEditorWidthStateObject(app.AutomationGetEditorWidthState()));
+        return response.Finish();
+    }
+
+    if (name == L"sendEditorVerticalScroll") {
+        const auto scrollCommand = GetNumber(request, "scrollCommand");
+        const auto trackPosition = GetNumber(request, "trackPosition").value_or(0);
+        if (!scrollCommand.has_value() || *scrollCommand < 0 || *scrollCommand > SB_ENDSCROLL ||
+            trackPosition < 0 || trackPosition > (std::numeric_limits<int>::max)() ||
+            !app.AutomationSendEditorVerticalScroll(static_cast<UINT>(*scrollCommand), static_cast<int>(trackPosition))) {
+            return BuildErrorResponse(id, L"Ordinary-editor vertical scroll input could not be delivered.");
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("editorWidth", BuildEditorWidthStateObject(app.AutomationGetEditorWidthState()));
+        return response.Finish();
+    }
+
+    if (name == L"sendEditorKey") {
+        const auto key = GetNumber(request, "key");
+        if (!key.has_value() || *key < 0 || *key > 0xFF ||
+            !app.AutomationSendEditorKey(static_cast<UINT>(*key),
+                GetBool(request, "shift", false), GetBool(request, "control", false))) {
+            return BuildErrorResponse(id, L"Ordinary-editor key input could not be delivered.");
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("selection", BuildSelectionObject(app.AutomationGetSelection()));
+        return response.Finish();
+    }
+
+    if (name == L"clickEditorClientPoint") {
+        const auto x = GetNumber(request, "x");
+        const auto y = GetNumber(request, "y");
+        if (!x.has_value() || !y.has_value() ||
+            *x < (std::numeric_limits<int>::min)() || *x > (std::numeric_limits<int>::max)() ||
+            *y < (std::numeric_limits<int>::min)() || *y > (std::numeric_limits<int>::max)() ||
+            !app.AutomationClickEditorClientPoint(static_cast<int>(*x), static_cast<int>(*y))) {
+            return BuildErrorResponse(id, L"Native editor click input could not be delivered inside the client area.");
+        }
+        const ClassicNotepadApp::AutomationSelection selection = app.AutomationGetSelection();
+        ResponseWriter response(id, true);
+        response.AddRaw("selection", BuildSelectionObject(selection));
+        return response.Finish();
+    }
+
+    if (name == L"focusEditor") {
+        ResponseWriter response(id, true);
+        response.AddBool("focused", app.AutomationFocusEditor());
+        return response.Finish();
+    }
+
+    if (name == L"scrollEditorByUnits") {
+        const auto horizontalUnits = GetNumber(request, "horizontalUnits").value_or(0);
+        const auto verticalLines = GetNumber(request, "verticalLines").value_or(0);
+        if (horizontalUnits < (std::numeric_limits<int>::min)() ||
+            horizontalUnits > (std::numeric_limits<int>::max)() ||
+            verticalLines < (std::numeric_limits<int>::min)() ||
+            verticalLines > (std::numeric_limits<int>::max)() ||
+            !app.AutomationSendEditorLineScroll(static_cast<int>(horizontalUnits), static_cast<int>(verticalLines))) {
+            return BuildErrorResponse(id, L"Ordinary-editor line scroll input could not be delivered.");
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("editorWidth", BuildEditorWidthStateObject(app.AutomationGetEditorWidthState()));
         return response.Finish();
     }
 
@@ -833,6 +1167,93 @@ std::string HandleCommand(
         return response.Finish();
     }
 
+    if (name == L"getLargeFileVisibleText") {
+        std::uint64_t rangeStart = 0;
+        std::wstring text;
+        if (!app.AutomationGetLargeFileVisibleText(rangeStart, text, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        ResponseWriter response(id, true);
+        response.AddNumber("start", static_cast<long long>(rangeStart));
+        response.AddString("text", text);
+        return response.Finish();
+    }
+
+    if (name == L"getLargeFileVisibleWindows") {
+        std::vector<LargeFileVisibleTextWindow> windows;
+        if (!app.AutomationGetLargeFileVisibleWindows(windows, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("windows", BuildLargeFileVisibleWindowsObject(windows));
+        return response.Finish();
+    }
+
+    if (name == L"getEditorVisibleSpellWindows") {
+        std::vector<classic_notepad::SpellingTextWindow> windows;
+        if (!app.AutomationGetEditorVisibleSpellingWindows(windows, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("windows", BuildLargeFileVisibleWindowsObject(windows));
+        return response.Finish();
+    }
+
+    if (name == L"resolveSpellingContextTarget") {
+        const bool keyboardInvocation = GetBool(request, "keyboard", false);
+        POINT point{};
+        if (!keyboardInvocation) {
+            const auto x = GetNumber(request, "x");
+            const auto y = GetNumber(request, "y");
+            if (!x.has_value() || !y.has_value() ||
+                *x < (std::numeric_limits<int>::min)() || *x > (std::numeric_limits<int>::max)() ||
+                *y < (std::numeric_limits<int>::min)() || *y > (std::numeric_limits<int>::max)()) {
+                return BuildErrorResponse(id, L"resolveSpellingContextTarget requires integer client coordinates or keyboard=true.");
+            }
+            point = { static_cast<LONG>(*x), static_cast<LONG>(*y) };
+        }
+        classic_notepad::SpellingContextTarget target;
+        const bool found = app.AutomationResolveSpellingContextTarget(point, keyboardInvocation, target);
+        ResponseWriter response(id, true);
+        response.AddBool("found", found);
+        if (found) {
+            response.AddNumber("sessionId", static_cast<long long>(target.revision.session));
+            response.AddNumber("contentRevision", static_cast<long long>(target.revision.content));
+            response.AddNumber("layoutRevision", static_cast<long long>(target.revision.layout));
+            response.AddNumber("start", static_cast<long long>(target.start));
+            response.AddNumber("length", static_cast<long long>(target.length));
+            response.AddString("text", target.text);
+        }
+        return response.Finish();
+    }
+
+    if (name == L"getVisibleTextPositionPoint") {
+        const auto position = GetNumber(request, "position");
+        if (!position.has_value() || *position < 0) {
+            return BuildErrorResponse(id, L"getVisibleTextPositionPoint requires a non-negative UTF-16 position.");
+        }
+        POINT point{};
+        if (!app.AutomationGetTextPositionPoint(static_cast<std::uint64_t>(*position), point)) {
+            return BuildErrorResponse(id, L"The requested text position is not visible or cannot be mapped.");
+        }
+        ResponseWriter response(id, true);
+        response.AddNumber("x", point.x);
+        response.AddNumber("y", point.y);
+        return response.Finish();
+    }
+
+    if (name == L"sendEditorContextMenu") {
+        const bool keyboardInvocation = GetBool(request, "keyboard", false);
+        const auto x = GetNumber(request, "x").value_or(0);
+        const auto y = GetNumber(request, "y").value_or(0);
+        if (x < (std::numeric_limits<int>::min)() || x > (std::numeric_limits<int>::max)() ||
+            y < (std::numeric_limits<int>::min)() || y > (std::numeric_limits<int>::max)() ||
+            !app.AutomationSendEditorContextMenu(static_cast<int>(x), static_cast<int>(y), keyboardInvocation)) {
+            return BuildErrorResponse(id, L"The editor context menu could not be opened and dismissed.");
+        }
+        return ResponseWriter(id, true).Finish();
+    }
+
     if (name == L"getLargeFileRange") {
         const std::optional<long long> start = GetNumber(request, "start");
         const std::optional<long long> length = GetNumber(request, "length");
@@ -846,6 +1267,21 @@ std::string HandleCommand(
         }
         ResponseWriter response(id, true);
         response.AddString("text", text);
+        return response.Finish();
+    }
+
+    if (name == L"dragEditor") {
+        const auto startX = GetNumber(request, "startX");
+        const auto startY = GetNumber(request, "startY");
+        const auto endX = GetNumber(request, "endX");
+        const auto endY = GetNumber(request, "endY");
+        if (!startX.has_value() || !startY.has_value() || !endX.has_value() || !endY.has_value() ||
+            !app.AutomationSendEditorDrag(static_cast<int>(*startX), static_cast<int>(*startY),
+                static_cast<int>(*endX), static_cast<int>(*endY))) {
+            return BuildErrorResponse(id, L"Ordinary-editor drag input could not be delivered.");
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("selection", BuildSelectionObject(app.AutomationGetSelection()));
         return response.Finish();
     }
 
@@ -888,11 +1324,49 @@ std::string HandleCommand(
         return response.Finish();
     }
 
+    if (name == L"sendLargeFileVerticalScroll") {
+        const auto scrollCommand = GetNumber(request, "scrollCommand");
+        const auto trackPosition = GetNumber(request, "trackPosition").value_or(0);
+        if (!scrollCommand.has_value() || *scrollCommand < 0 || *scrollCommand > SB_ENDSCROLL ||
+            trackPosition < 0 || trackPosition > (std::numeric_limits<int>::max)() ||
+            !app.AutomationSendLargeFileVerticalScroll(
+                static_cast<UINT>(*scrollCommand), static_cast<int>(trackPosition))) {
+            return BuildErrorResponse(id, L"Large-file vertical scroll input could not be delivered.");
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("largeFile", BuildLargeFileStateObject(app.AutomationGetLargeFileState()));
+        return response.Finish();
+    }
+
+    if (name == L"sendLargeFileWheel") {
+        const auto delta = GetNumber(request, "delta");
+        if (!delta.has_value() || *delta < -32768 || *delta > 32767 ||
+            !app.AutomationSendLargeFileWheel(static_cast<int>(*delta))) {
+            return BuildErrorResponse(id, L"Large-file mouse-wheel input could not be delivered.");
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("largeFile", BuildLargeFileStateObject(app.AutomationGetLargeFileState()));
+        return response.Finish();
+    }
+
     if (name == L"sendLargeFileHorizontalScroll") {
         const auto scrollCommand = GetNumber(request, "scrollCommand");
         if (!scrollCommand.has_value() || *scrollCommand < 0 || *scrollCommand > SB_ENDSCROLL ||
             !app.AutomationSendLargeFileHorizontalScroll(static_cast<UINT>(*scrollCommand))) {
             return BuildErrorResponse(id, L"Large-file horizontal scroll input could not be delivered.");
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("largeFile", BuildLargeFileStateObject(app.AutomationGetLargeFileState()));
+        return response.Finish();
+    }
+
+    if (name == L"resizeLargeFileViewport") {
+        const auto width = GetNumber(request, "width");
+        const auto height = GetNumber(request, "height");
+        if (!width.has_value() || !height.has_value() || *width <= 0 || *height <= 0 ||
+            *width > 16384 || *height > 16384 ||
+            !app.AutomationSetLargeFileViewportSize(static_cast<int>(*width), static_cast<int>(*height))) {
+            return BuildErrorResponse(id, L"The large-file viewport could not be resized.");
         }
         ResponseWriter response(id, true);
         response.AddRaw("largeFile", BuildLargeFileStateObject(app.AutomationGetLargeFileState()));
@@ -982,9 +1456,44 @@ std::string HandleCommand(
         return ResponseWriter(id, true).Finish();
     }
 
+    if (name == L"setTextFromUtf16File") {
+        std::wstring path;
+        std::wstring text;
+        if (!RequireString(request, "path", path, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        const auto fileReadStarted = std::chrono::steady_clock::now();
+        if (!ReadUtf16LeFile(path, text, errorMessage)) return BuildErrorResponse(id, errorMessage);
+        const long long fileReadMicroseconds = ElapsedMicroseconds(fileReadStarted);
+        const long long units = static_cast<long long>(text.size());
+        const auto setTextStarted = std::chrono::steady_clock::now();
+        app.AutomationSetText(text);
+        ResponseWriter response(id, true);
+        response.AddNumber("sourceUnits", units);
+        response.AddNumber("sourceFileReadMicroseconds", fileReadMicroseconds);
+        response.AddNumber("setTextMicroseconds", ElapsedMicroseconds(setTextStarted));
+        return response.Finish();
+    }
+
     if (name == L"getText") {
         ResponseWriter response(id, true);
         response.AddString("text", app.AutomationGetText());
+        return response.Finish();
+    }
+
+    if (name == L"writeCurrentTextUtf16File") {
+        std::wstring path;
+        if (!RequireString(request, "path", path, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        const auto exportStarted = std::chrono::steady_clock::now();
+        const std::wstring text = app.AutomationGetText();
+        if (!WriteUtf16LeFile(path, text, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        ResponseWriter response(id, true);
+        response.AddNumber("storedUnits", static_cast<long long>(text.size()));
+        response.AddNumber("exportOperationMicroseconds", ElapsedMicroseconds(exportStarted));
         return response.Finish();
     }
 
@@ -1081,6 +1590,160 @@ std::string HandleCommand(
         return ResponseWriter(id, true).Finish();
     }
 
+    if (name == L"pasteThroughProductionHandler") {
+        std::wstring text;
+        if (!RequireString(request, "text", text, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        app.AutomationPasteTextThroughProductionHandler(text);
+        ResponseWriter response(id, true);
+        response.AddRaw("selection", BuildSelectionObject(app.AutomationGetSelection()));
+        response.AddRaw("editorWidth", BuildEditorWidthStateObject(app.AutomationGetEditorWidthState()));
+        response.AddString("outcome", app.AutomationGetLastPasteOutcome());
+        response.AddBool("modified", app.AutomationIsModified());
+        const ClassicNotepadApp::AutomationClipboardDiagnostics clipboard = app.AutomationGetLastClipboardDiagnostics();
+        std::ostringstream clipboardDiagnostics;
+        clipboardDiagnostics << "{"
+            << "\"openCalls\":" << clipboard.openCalls
+            << ",\"closeCalls\":" << clipboard.closeCalls
+            << ",\"unicodeAvailabilityChecks\":" << clipboard.unicodeAvailabilityChecks
+            << ",\"ansiAvailabilityChecks\":" << clipboard.ansiAvailabilityChecks
+            << ",\"unicodeGetDataCalls\":" << clipboard.unicodeGetDataCalls
+            << ",\"ansiGetDataCalls\":" << clipboard.ansiGetDataCalls
+            << ",\"sizeCalls\":" << clipboard.sizeCalls
+            << ",\"lockCalls\":" << clipboard.lockCalls
+            << ",\"unlockCalls\":" << clipboard.unlockCalls
+            << ",\"conversionCalls\":" << clipboard.conversionCalls
+            << ",\"lastAnsiSourceLength\":" << clipboard.lastAnsiSourceLength
+            << "}";
+        response.AddRaw("clipboardDiagnostics", clipboardDiagnostics.str());
+        response.AddNumber("nativeNotification", app.AutomationGetLastPasteNativeNotification());
+        return response.Finish();
+    }
+
+    if (name == L"setPrintFault") {
+        std::wstring stage;
+        if (!RequireString(request, "stage", stage, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        if (!app.AutomationSetPrintFaultStage(stage)) {
+            return BuildErrorResponse(id, L"Unsupported print fault stage or automation mode is unavailable.");
+        }
+        return ResponseWriter(id, true).Finish();
+    }
+
+    if (name == L"getPrintDiagnostics") {
+        const ClassicNotepadApp::AutomationPrintDiagnostics diagnostics = app.AutomationGetPrintDiagnostics();
+        ResponseWriter response(id, true);
+        response.AddBool("succeeded", diagnostics.succeeded);
+        response.AddBool("faultInjected", diagnostics.faultInjected);
+        response.AddString("injectedStage", diagnostics.injectedStage);
+        response.AddString("failureStage", diagnostics.failureStage);
+        response.AddString("errorMessage", diagnostics.errorMessage);
+        response.AddBool("abortDocCalled", diagnostics.abortDocCalled);
+        response.AddBool("abortDocSucceeded", diagnostics.abortDocSucceeded);
+        return response.Finish();
+    }
+
+    if (name == L"pasteThroughProductionHandlerFromUtf16File") {
+        std::wstring path;
+        std::wstring text;
+        if (!RequireString(request, "path", path, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        const auto fileReadStarted = std::chrono::steady_clock::now();
+        if (!ReadUtf16LeFile(path, text, errorMessage)) return BuildErrorResponse(id, errorMessage);
+        const long long fileReadMicroseconds = ElapsedMicroseconds(fileReadStarted);
+        const long long units = static_cast<long long>(text.size());
+        const auto helperStarted = std::chrono::steady_clock::now();
+        app.AutomationPasteTextThroughProductionHandler(text);
+        const long long helperMicroseconds = ElapsedMicroseconds(helperStarted);
+        const ClassicNotepadApp::AutomationPasteTiming pasteTiming = app.AutomationGetLastPasteTiming();
+        const auto widthStateStarted = std::chrono::steady_clock::now();
+        const ClassicNotepadApp::AutomationEditorWidthState widthState = app.AutomationGetEditorWidthState();
+        const long long widthStateMicroseconds = ElapsedMicroseconds(widthStateStarted);
+
+        ResponseWriter response(id, true);
+        response.AddNumber("sourceUnits", units);
+        response.AddNumber("sourceFileReadMicroseconds", fileReadMicroseconds);
+        response.AddNumber("providerSetupMicroseconds", pasteTiming.providerSetupMicroseconds);
+        response.AddNumber("productionDispatchMicroseconds", pasteTiming.productionDispatchMicroseconds);
+        response.AddNumber("providerCleanupMicroseconds", pasteTiming.providerCleanupMicroseconds);
+        response.AddNumber("pasteHelperWallMicroseconds", helperMicroseconds);
+        response.AddNumber("initialWidthStateReadMicroseconds", widthStateMicroseconds);
+        response.AddRaw("selection", BuildSelectionObject(app.AutomationGetSelection()));
+        response.AddRaw("editorWidth", BuildEditorWidthStateObject(widthState));
+        response.AddString("outcome", app.AutomationGetLastPasteOutcome());
+        response.AddBool("modified", app.AutomationIsModified());
+        response.AddNumber("nativeNotification", app.AutomationGetLastPasteNativeNotification());
+        const ClassicNotepadApp::AutomationClipboardDiagnostics clipboard = app.AutomationGetLastClipboardDiagnostics();
+        std::ostringstream clipboardDiagnostics;
+        clipboardDiagnostics << "{"
+            << "\"openCalls\":" << clipboard.openCalls
+            << ",\"closeCalls\":" << clipboard.closeCalls
+            << ",\"unicodeGetDataCalls\":" << clipboard.unicodeGetDataCalls
+            << ",\"lockCalls\":" << clipboard.lockCalls
+            << ",\"unlockCalls\":" << clipboard.unlockCalls
+            << "}";
+        response.AddRaw("clipboardDiagnostics", clipboardDiagnostics.str());
+        return response.Finish();
+    }
+
+    if (name == L"setPasteFault") {
+        std::wstring stage;
+        if (!RequireString(request, "stage", stage, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        if (!app.AutomationSetPasteFaultStage(stage)) {
+            return BuildErrorResponse(id, L"Unsupported paste fault stage.");
+        }
+        return ResponseWriter(id, true).Finish();
+    }
+
+    if (name == L"setEditorTextLimit") {
+        long long limit = 0;
+        if (!RequireNumber(request, "limit", limit, errorMessage) || limit < 0 ||
+            static_cast<unsigned long long>(limit) > (std::numeric_limits<DWORD>::max)()) {
+            return BuildErrorResponse(id, L"The editor text limit must be a non-negative 32-bit value.");
+        }
+        ResponseWriter response(id, true);
+        response.AddNumber("limit", app.AutomationSetEditorTextLimit(static_cast<DWORD>(limit)));
+        return response.Finish();
+    }
+
+    if (name == L"probeNativeReplace") {
+        std::wstring text;
+        std::wstring replacement;
+        long long start = 0;
+        long long end = 0;
+        long long limit = 0;
+        if (!RequireString(request, "text", text, errorMessage) ||
+            !RequireString(request, "replacement", replacement, errorMessage) ||
+            !RequireNumber(request, "start", start, errorMessage) ||
+            !RequireNumber(request, "end", end, errorMessage) ||
+            !RequireNumber(request, "limit", limit, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        if (start < 0 || end < 0 || limit < 0 ||
+            static_cast<unsigned long long>(start) > (std::numeric_limits<DWORD>::max)() ||
+            static_cast<unsigned long long>(end) > (std::numeric_limits<DWORD>::max)() ||
+            static_cast<unsigned long long>(limit) > (std::numeric_limits<DWORD>::max)()) {
+            return BuildErrorResponse(id, L"Native probe positions and limit must be non-negative 32-bit values.");
+        }
+        const auto result = app.AutomationProbeNativeReplace(
+            text,
+            static_cast<DWORD>(start),
+            static_cast<DWORD>(end),
+            replacement,
+            static_cast<DWORD>(limit));
+        ResponseWriter response(id, true);
+        response.AddString("textBefore", result.textBefore);
+        response.AddString("textAfter", result.textAfter);
+        response.AddNumber("textLimit", result.textLimit);
+        response.AddNumber("notificationMask", result.notificationMask);
+        return response.Finish();
+    }
+
     if (name == L"deleteSelection") {
         app.AutomationDeleteSelection();
         return ResponseWriter(id, true).Finish();
@@ -1111,6 +1774,26 @@ std::string HandleCommand(
         ResponseWriter response(id, true);
         response.AddBool("found", found);
         response.AddRaw("selection", BuildSelectionObject(app.AutomationGetSelection()));
+        return response.Finish();
+    }
+
+    if (name == L"productionFindReplace") {
+        std::wstring action;
+        std::wstring text;
+        std::wstring replacement;
+        if (!RequireString(request, "action", action, errorMessage) ||
+            !RequireString(request, "text", text, errorMessage) ||
+            !RequireString(request, "replacement", replacement, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        if (!app.AutomationDispatchFindReplace(action, text, replacement,
+                GetBool(request, "matchCase", false), GetBool(request, "wholeWord", false),
+                GetBool(request, "searchDown", true), errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        ResponseWriter response(id, true);
+        response.AddRaw("selection", BuildSelectionObject(app.AutomationGetSelection()));
+        response.AddRaw("largeFile", BuildLargeFileStateObject(app.AutomationGetLargeFileState()));
         return response.Finish();
     }
 
@@ -1170,6 +1853,15 @@ std::string HandleCommand(
         return response.Finish();
     }
 
+    if (name == L"probeGoToDialogDefault") {
+        if (app.AutomationGetLargeFileState().active) {
+            return BuildErrorResponse(id, L"The Go To dialog probe is for the ordinary native editor.");
+        }
+        ResponseWriter response(id, true);
+        response.AddString("initialLine", app.AutomationProbeGoToDialogDefault());
+        return response.Finish();
+    }
+
     if (name == L"insertTimeDate") {
         app.AutomationInsertTimeDate();
         return ResponseWriter(id, true).Finish();
@@ -1183,6 +1875,26 @@ std::string HandleCommand(
     if (name == L"getWordWrap") {
         ResponseWriter response(id, true);
         response.AddBool("enabled", app.AutomationGetWordWrap());
+        return response.Finish();
+    }
+
+    if (name == L"invokeWordWrapMenuCommand") {
+        app.AutomationInvokeWordWrapMenuCommand();
+        return ResponseWriter(id, true).Finish();
+    }
+
+    if (name == L"getWordWrapMenuState") {
+        bool enabled = false;
+        bool checked = false;
+        if (!app.AutomationGetWordWrapMenuState(enabled, checked)) {
+            return BuildErrorResponse(id, L"The Word Wrap menu item is unavailable.");
+        }
+        ResponseWriter response(id, true);
+        response.AddBool("enabled", enabled);
+        response.AddBool("checked", checked);
+        response.AddBool("activeEditorFocused", app.AutomationActiveEditorHasFocus());
+        response.AddBool("nativeEditorFocused", app.AutomationNativeEditorHasFocus());
+        response.AddBool("largeFileActive", app.AutomationGetLargeFileState().active);
         return response.Finish();
     }
 
@@ -1261,13 +1973,12 @@ std::string HandleCommand(
 
     if (name == L"checkSpelling") {
         const std::wstring text = GetString(request, "text").value_or(app.AutomationGetText());
+        const SpellCheckResult result = app.AutomationCheckSpelling(text);
         ResponseWriter response(id, true);
         response.AddBool("available", app.AutomationSpellCheckAvailable());
-        response.AddRaw(
-            "errors",
-            app.AutomationSpellCheckAvailable()
-                ? BuildSpellingErrorsArray(app.AutomationCheckSpelling(text), text)
-                : std::string("[]"));
+        AddSpellOperationFields(response, result.status, result.hresult);
+        response.AddRaw("errors", result.status == SpellOperationStatus::Success
+            ? BuildSpellingErrorsArray(result.value, text) : std::string("[]"));
         return response.Finish();
     }
 
@@ -1281,13 +1992,12 @@ std::string HandleCommand(
         const std::size_t limit = requestedLimit <= 0
             ? 0U
             : static_cast<std::size_t>(std::min<long long>(requestedLimit, 20));
+        const SpellSuggestResult result = app.AutomationSuggestSpelling(word, limit);
         ResponseWriter response(id, true);
         response.AddBool("available", app.AutomationSpellCheckAvailable());
-        response.AddRaw(
-            "suggestions",
-            app.AutomationSpellCheckAvailable()
-                ? BuildStringArray(app.AutomationSuggestSpelling(word, limit))
-                : std::string("[]"));
+        AddSpellOperationFields(response, result.status, result.hresult);
+        response.AddRaw("suggestions", result.status == SpellOperationStatus::Success
+            ? BuildStringArray(result.value) : std::string("[]"));
         return response.Finish();
     }
 
@@ -1297,13 +2007,11 @@ std::string HandleCommand(
             return BuildErrorResponse(id, errorMessage);
         }
 
-        const bool available = app.AutomationSpellCheckAvailable();
-        if (available && !app.AutomationIgnoreSpelling(word, errorMessage)) {
-            return BuildErrorResponse(id, errorMessage);
-        }
-
+        const SpellActionResult result = app.AutomationIgnoreSpelling(word);
         ResponseWriter response(id, true);
-        response.AddBool("available", available);
+        response.AddBool("available", app.AutomationSpellCheckAvailable());
+        AddSpellOperationFields(response, result.status, result.hresult);
+        response.AddBool("changed", result.status == SpellOperationStatus::Success && result.value);
         return response.Finish();
     }
 
@@ -1314,14 +2022,169 @@ std::string HandleCommand(
         }
 
         const bool dryRun = GetBool(request, "dryRun", true);
-        const bool available = app.AutomationSpellCheckAvailable();
-        if (available && !app.AutomationAddSpelling(word, dryRun, errorMessage)) {
+        const SpellActionResult result = app.AutomationAddSpelling(word, dryRun);
+        ResponseWriter response(id, true);
+        response.AddBool("available", app.AutomationSpellCheckAvailable());
+        AddSpellOperationFields(response, result.status, result.hresult);
+        response.AddBool("dryRun", dryRun);
+        response.AddBool("persisted", result.status == SpellOperationStatus::Success && !dryRun && result.value);
+        return response.Finish();
+    }
+
+    if (name == L"configureSpellingTestBackend") {
+        SpellTestBackendConfiguration configuration;
+        configuration.available = GetBool(request, "available", true);
+        if (const auto misspelledWord = GetString(request, "misspelledWord")) {
+            if (!misspelledWord->empty()) configuration.misspelledWords.push_back(*misspelledWord);
+        }
+        if (const auto suggestions = GetString(request, "suggestions")) {
+            std::size_t start = 0U;
+            while (start < suggestions->size()) {
+                const std::size_t separator = suggestions->find(L'|', start);
+                const std::size_t end = separator == std::wstring::npos ? suggestions->size() : separator;
+                if (end > start) configuration.suggestions.push_back(suggestions->substr(start, end - start));
+                if (separator == std::wstring::npos) break;
+                start = separator + 1U;
+            }
+        }
+        const auto parseStatusField = [&request, &errorMessage](const char* key, SpellOperationStatus& output) {
+            const std::optional<std::wstring> value = GetString(request, key);
+            if (!value.has_value()) return true;
+            const std::optional<SpellOperationStatus> parsed = ParseSpellOperationStatus(*value);
+            if (!parsed.has_value()) {
+                errorMessage = L"Invalid spelling test status for field: ";
+                errorMessage += Utf8ToWide(key);
+                return false;
+            }
+            output = *parsed;
+            return true;
+        };
+        const auto parseHRESULTField = [&request, &errorMessage](const char* key, HRESULT& output) {
+            const std::optional<long long> value = GetNumber(request, key);
+            if (!value.has_value()) return true;
+            if (*value < 0 || static_cast<unsigned long long>(*value) > 0xffffffffULL) {
+                errorMessage = L"Invalid HRESULT for spelling test field: ";
+                errorMessage += Utf8ToWide(key);
+                return false;
+            }
+            output = static_cast<HRESULT>(static_cast<std::uint32_t>(*value));
+            return true;
+        };
+        const auto parseFailAfter = [&request, &errorMessage](const char* key, std::size_t& output) {
+            const std::optional<long long> value = GetNumber(request, key);
+            if (!value.has_value()) return true;
+            if (*value < 0) {
+                errorMessage = L"Enumeration failure position must be non-negative.";
+                return false;
+            }
+            output = static_cast<std::size_t>(*value);
+            return true;
+        };
+        if (!parseStatusField("checkStatus", configuration.checkStatus) ||
+            !parseStatusField("suggestStatus", configuration.suggestStatus) ||
+            !parseStatusField("ignoreStatus", configuration.ignoreStatus) ||
+            !parseStatusField("addStatus", configuration.addStatus) ||
+            !parseHRESULTField("checkHresult", configuration.checkHresult) ||
+            !parseHRESULTField("suggestHresult", configuration.suggestHresult) ||
+            !parseHRESULTField("ignoreHresult", configuration.ignoreHresult) ||
+            !parseHRESULTField("addHresult", configuration.addHresult) ||
+            !parseFailAfter("failCheckAfter", configuration.failCheckAfter) ||
+            !parseFailAfter("failSuggestAfter", configuration.failSuggestAfter)) {
             return BuildErrorResponse(id, errorMessage);
         }
-
+        if (!app.AutomationConfigureSpellingTestBackend(configuration)) {
+            return BuildErrorResponse(id, L"The spelling test backend is available only in automation mode.");
+        }
         ResponseWriter response(id, true);
-        response.AddBool("available", available);
-        response.AddBool("persisted", available && !dryRun);
+        response.AddBool("available", app.AutomationSpellCheckAvailable());
+        response.AddString("status", configuration.available ? L"success" : L"unavailable");
+        return response.Finish();
+    }
+
+    if (name == L"clearSpellingTestBackend") {
+        if (!app.AutomationClearSpellingTestBackend()) {
+            return BuildErrorResponse(id, L"The spelling test backend is available only in automation mode.");
+        }
+        ResponseWriter response(id, true);
+        response.AddBool("available", app.AutomationSpellCheckAvailable());
+        return response.Finish();
+    }
+
+    if (name == L"getSpellingTestBackendCalls") {
+        ResponseWriter response(id, true);
+        response.AddNumber("check", static_cast<long long>(app.AutomationSpellingTestBackendCallCount(L"check")));
+        response.AddNumber("suggest", static_cast<long long>(app.AutomationSpellingTestBackendCallCount(L"suggest")));
+        response.AddNumber("ignore", static_cast<long long>(app.AutomationSpellingTestBackendCallCount(L"ignore")));
+        response.AddNumber("add", static_cast<long long>(app.AutomationSpellingTestBackendCallCount(L"add")));
+        return response.Finish();
+    }
+
+    if (name == L"refreshSpellCheckNow") {
+        if (!app.AutomationRefreshSpellCheckNow()) {
+            return BuildErrorResponse(id, L"Manual spelling refresh is available only in automation mode.");
+        }
+        const classic_notepad::SpellingAnnotationBatch batch = app.AutomationGetSpellingAnnotationBatch();
+        ResponseWriter response(id, true);
+        response.AddBool("valid", batch.valid);
+        response.AddNumber("sessionId", static_cast<long long>(batch.revision.session));
+        response.AddNumber("contentRevision", static_cast<long long>(batch.revision.content));
+        response.AddNumber("layoutRevision", static_cast<long long>(batch.revision.layout));
+        response.AddRaw("annotations", BuildSpellingAnnotationsArray(batch));
+        return response.Finish();
+    }
+
+    if (name == L"getSpellingAnnotations") {
+        const classic_notepad::SpellingAnnotationBatch batch = app.AutomationGetSpellingAnnotationBatch();
+        ResponseWriter response(id, true);
+        response.AddBool("valid", batch.valid);
+        response.AddNumber("sessionId", static_cast<long long>(batch.revision.session));
+        response.AddNumber("contentRevision", static_cast<long long>(batch.revision.content));
+        response.AddNumber("layoutRevision", static_cast<long long>(batch.revision.layout));
+        response.AddRaw("annotations", BuildSpellingAnnotationsArray(batch));
+        return response.Finish();
+    }
+
+    if (name == L"applySpellingAction") {
+        std::wstring action;
+        std::wstring targetText;
+        std::wstring suggestion;
+        long long parsedSession = 0;
+        long long parsedContent = 0;
+        long long parsedLayout = 0;
+        long long parsedStart = 0;
+        long long parsedLength = 0;
+        if (!RequireString(request, "action", action, errorMessage) ||
+            !RequireNumber(request, "sessionId", parsedSession, errorMessage) ||
+            !RequireNumber(request, "contentRevision", parsedContent, errorMessage) ||
+            !RequireNumber(request, "layoutRevision", parsedLayout, errorMessage) ||
+            !RequireNumber(request, "start", parsedStart, errorMessage) ||
+            !RequireNumber(request, "length", parsedLength, errorMessage) ||
+            !RequireString(request, "text", targetText, errorMessage)) {
+            return BuildErrorResponse(id, errorMessage);
+        }
+        if (parsedSession <= 0 || parsedContent <= 0 || parsedLayout < 0 || parsedStart < 0 || parsedLength <= 0) {
+            return BuildErrorResponse(id, L"Spelling action coordinates and revision tags must be positive and in range.");
+        }
+        suggestion = GetString(request, "suggestion").value_or(L"");
+        const bool injectMappedInsertFailureForTesting =
+            GetBool(request, "injectMappedInsertFailureForTesting", false);
+        classic_notepad::SpellingContextTarget target;
+        target.revision = {
+            static_cast<std::uint64_t>(parsedSession),
+            static_cast<std::uint64_t>(parsedContent),
+            static_cast<std::uint64_t>(parsedLayout)};
+        target.start = static_cast<std::uint64_t>(parsedStart);
+        target.length = static_cast<std::uint64_t>(parsedLength);
+        target.text = std::move(targetText);
+        const auto result = app.AutomationApplySpellingAction(
+            action, target, suggestion, injectMappedInsertFailureForTesting);
+        ResponseWriter response(id, true);
+        AddSpellOperationFields(response, result.status, result.hresult);
+        response.AddBool("changed", result.changed);
+        response.AddBool("partial", result.partial);
+        response.AddNumber("nativeNotification", result.nativeNotification);
+        response.AddString("verification", result.verification);
+        response.AddString("message", result.message);
         return response.Finish();
     }
 

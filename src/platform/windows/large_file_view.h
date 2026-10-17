@@ -4,6 +4,8 @@
 #include "large_document.h"
 #include "encoding.h"
 #include "line_endings.h"
+#include "spell_text_utils.h"
+#include "windows_save_transaction.h"
 
 #include <windows.h>
 
@@ -36,6 +38,8 @@ struct LargeFileViewInfo {
     std::uint64_t lfCount = 0;
     std::uint64_t crCount = 0;
     std::uint64_t characterCount = 0;
+    std::uint64_t displayedCharacterCount = 0;
+    bool displayedCharacterCountKnown = false;
     std::uint64_t caret = 0;
     std::uint64_t caretLine = 0;
     std::uint64_t caretColumn = 0;
@@ -48,14 +52,29 @@ struct LargeFileViewInfo {
     std::uint64_t saveProgressBytes = 0;
     bool saveInProgress = false;
     std::uint64_t paintGeneration = 0;
+    std::uint64_t callbackAllocationFailures = 0;
     std::uint64_t viewportGeneration = 0;
     bool wordWrap = false;
     std::uint64_t viewportVisualRows = 0;
     std::uint64_t wrappedContinuationRows = 0;
     std::uint64_t spellingIssueCount = 0;
+    std::uint64_t viewportCacheRebuilds = 0;
+    std::uint64_t viewportCacheHits = 0;
+    std::uint64_t viewportLastBuildDecodedCharacters = 0;
+    std::uint64_t viewportLastBuildMeasuredCharacters = 0;
+    std::uint64_t viewportLastLogicalAnchor = 0;
+    std::uint64_t viewportLastSegmentStart = 0;
+    std::uint64_t viewportLastSegmentEnd = 0;
     std::uint64_t maximumLineColumns = 0;
+    std::uint64_t maximumTopLine = 0;
+    int verticalScrollRangeMaximum = 0;
+    int verticalScrollPosition = 0;
+    std::uint32_t verticalScrollPage = 0;
+    std::uint64_t visibleLineCount = 0;
     int horizontalOffset = 0;
     int horizontalMaximumOffset = 0;
+    int viewportWidth = 0;
+    int viewportHeight = 0;
     RECT caretRectangle{};
     bool operationInProgress = false;
     bool operationCompleted = false;
@@ -63,7 +82,9 @@ struct LargeFileViewInfo {
     std::wstring operationName;
     std::wstring operationError;
     std::wstring operationTargetPath;
+    classic_notepad::SaveDiagnostics saveDiagnostics;
     std::uint64_t operationGeneration = 0;
+    std::uint64_t operationToken = 0;
     std::uint64_t operationProgress = 0;
     std::uint64_t operationResultCount = 0;
     classic_notepad::LargeFileEncoding encoding = classic_notepad::LargeFileEncoding::Utf8;
@@ -73,6 +94,8 @@ struct LargeFileSpellingRange {
     std::uint64_t start = 0;
     std::uint64_t length = 0;
 };
+
+using LargeFileVisibleTextWindow = classic_notepad::SpellingTextWindow;
 
 // An editable, mapped, line-addressable text surface. Workers publish
 // generation-tagged, coalesced messages; destruction joins them before the
@@ -96,22 +119,37 @@ public:
         const std::wstring& path,
         HFONT font,
         bool darkMode,
-        std::wstring& errorMessage);
+        std::wstring& errorMessage,
+        bool initiallyVisible = true,
+        std::uint64_t sessionId = 1U);
+    bool WaitForCompleteIndex(std::wstring& errorMessage);
     HWND Window() const;
     void SetBounds(const RECT& bounds);
+    bool SetViewportSizeForTesting(int width, int height);
     void SetTheme(HFONT font, bool darkMode);
     void SetWordWrap(bool enabled);
     bool WordWrap() const;
     bool GetVisibleText(std::wstring& text, std::uint64_t& rangeStart, std::wstring& errorMessage);
-    void SetSpellingRanges(std::vector<LargeFileSpellingRange> ranges);
-    void SetContextMenuHandler(std::function<bool(POINT, std::uint64_t)> handler);
-    void Focus();
+    bool GetVisibleTextWindows(
+        std::vector<LargeFileVisibleTextWindow>& windows,
+        std::wstring& errorMessage);
+    bool ResolveSpellingContextTargetAtPoint(
+        POINT clientPoint,
+        bool keyboardInvocation,
+        classic_notepad::SpellingContextTarget& target);
+    bool GetVisibleTextPositionPoint(std::uint64_t position, POINT& clientPoint);
+    void SetSpellingBatch(classic_notepad::SpellingAnnotationBatch batch);
+    classic_notepad::SpellingRevision GetSpellingRevision() const;
+    void SetContextMenuHandler(
+        std::function<bool(POINT, const classic_notepad::SpellingContextTarget&)> handler);
+    void Focus(int allocationFailureForTesting = 0);
     void SelectAll();
     bool CopySelection(std::wstring& errorMessage);
     bool CutSelection(std::wstring& errorMessage);
     bool PasteText(const std::wstring& text, std::wstring& errorMessage);
     bool DeleteSelection(bool backspace, std::wstring& errorMessage);
     bool InsertText(const std::wstring& text, std::wstring& errorMessage);
+    void InjectNextInsertFailureForTesting(std::wstring errorMessage);
     bool Undo(std::wstring& errorMessage);
     bool SetSelection(std::uint64_t start, std::uint64_t end, std::wstring& errorMessage);
     bool GetSelection(std::uint64_t& start, std::uint64_t& end) const;
@@ -122,6 +160,11 @@ public:
         bool wholeWord,
         bool forward,
         std::wstring& errorMessage);
+    bool SelectionMatches(
+        const std::wstring& text,
+        bool matchCase,
+        bool wholeWord,
+        std::wstring& errorMessage) const;
     std::uint64_t ReplaceAll(
         const std::wstring& text,
         const std::wstring& replacement,
@@ -140,6 +183,8 @@ public:
     bool SendClickInput(int x, int y, bool shift);
     bool SendDragInput(int startX, int startY, int endX, int endY);
     bool SendKeyInput(UINT virtualKey, bool shift, bool control);
+    bool SendVerticalScrollInput(UINT command, int trackPosition = 0);
+    bool SendMouseWheelInput(int delta);
     bool SendTextInput(const std::wstring& text);
     bool StartFindAsync(const std::wstring& text, bool matchCase, bool wholeWord, bool forward, std::wstring& errorMessage);
     bool StartReplaceAllAsync(const std::wstring& text, const std::wstring& replacement,
@@ -147,28 +192,55 @@ public:
     bool StartSaveAsync(const std::wstring& path, classic_notepad::TextEncoding encoding,
         classic_notepad::LineEndingStyle lineEnding, bool rebase, std::wstring& errorMessage);
     void CancelOperation();
+    void AcknowledgeOperationCompletion(std::uint64_t token);
 
 private:
+    enum class OperationKind : std::uint8_t { Find, ReplaceAll, Save };
+    struct OperationCompletion {
+        OperationKind kind = OperationKind::Find;
+        std::uint64_t token = 0;
+        std::uint64_t documentGeneration = 0;
+        std::uint64_t selectionRevision = 0;
+        bool succeeded = false;
+        bool found = false;
+        bool cancelled = false;
+        std::uint64_t resultCount = 0;
+        classic_notepad::LargeDocumentMatch match{};
+        std::unique_ptr<classic_notepad::LargeDocument> candidateDocument;
+        std::wstring error;
+        std::wstring targetPath;
+        std::wstring temporaryPath;
+        bool targetWasCurrentPath = false;
+        bool rebase = false;
+        classic_notepad::TextEncoding saveEncoding = classic_notepad::TextEncoding::Utf8NoBom;
+        classic_notepad::LineEndingStyle saveLineEnding = classic_notepad::LineEndingStyle::Crlf;
+        classic_notepad::SaveDiagnostics saveDiagnostics;
+    };
     static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
-    bool OpenMapping(const std::wstring& path, std::wstring& errorMessage);
+    bool OpenMapping(
+        const std::wstring& path,
+        std::wstring& errorMessage,
+        bool injectFailureAfterOpen = false);
     void CloseMapping();
     void StartIndexing();
     void StopIndexing();
     void IndexWorker();
-    bool BuildDocumentFromIndex(std::wstring& errorMessage);
     bool AppendIndexedDocument(
-        std::uint64_t endByte,
-        std::uint64_t endCharacter,
-        std::uint64_t totalLineBreaks,
+        const std::vector<classic_notepad::LargeFilePieceSummary>& pieces,
         std::wstring& errorMessage);
     bool EnsureEditable(std::wstring& errorMessage) const;
+    // documentMutex_ must be held. Whole-document operations use this gate so
+    // an editable prefix is never mistaken for a complete source document.
+    bool EnsureCompleteDocument(std::wstring& errorMessage) const;
+    void PublishOperationCompletion(std::unique_ptr<OperationCompletion> completion, HWND targetWindow);
+    void AdoptOperationCompletion(std::uint64_t token);
     bool ReplaceSelection(const std::wstring& text, std::wstring& errorMessage);
     void MarkModified(bool invalidateAll = true);
     void InvalidateDocumentLine(std::uint64_t line);
     bool WriteStreamToTemporaryFile(
         const classic_notepad::LargeDocument& source,
-        const std::wstring& temporaryPath,
+        classic_notepad::WindowsSaveTransaction& transaction,
         classic_notepad::TextEncoding encoding,
         classic_notepad::LineEndingStyle lineEnding,
         std::wstring& errorMessage);
@@ -189,7 +261,13 @@ private:
         std::uint64_t nextLineStart = 0;
         std::uint64_t segmentStart = 0;
         std::uint64_t segmentEnd = 0;
+        std::uint64_t logicalAnchor = 0;
         std::wstring text;
+        std::wstring displayText;
+        std::vector<std::size_t> displayBoundary;
+        std::vector<int> xBoundary;
+        std::vector<std::uint8_t> scalarBoundary;
+        int drawOriginX = 4;
         bool available = false;
     };
     void RebuildViewportCache(std::uint64_t rowCount);
@@ -198,10 +276,13 @@ private:
         std::uint64_t removedCharacters,
         std::uint64_t insertedCharacters);
     void InvalidateViewportCache();
+    bool ViewportCacheMatches(std::uint64_t generation, const RECT& client) const;
     void NotifyStateChanged();
     void UpdateCaret();
     void DestroyTextCaret();
-    bool HitTest(POINT point, std::uint64_t& position, int* visualX = nullptr);
+    void InjectPresentationAllocationFailureForTesting(bool painting);
+    bool HitTest(POINT point, std::uint64_t& position, int* visualX = nullptr,
+        bool characterAtPoint = false);
     bool FindCachedRowForPosition(std::uint64_t position, std::size_t& rowIndex) const;
     void MoveCaret(std::uint64_t position, bool extendSelection, bool preservePreferredX = false);
     void MoveHorizontal(bool right, bool byWord, bool extendSelection);
@@ -244,8 +325,8 @@ private:
     std::uint64_t topLine_ = 0;
     std::uint64_t topWrapOffset_ = 0;
     bool wordWrap_ = false;
-    std::vector<LargeFileSpellingRange> spellingRanges_;
-    std::function<bool(POINT, std::uint64_t)> contextMenuHandler_;
+    classic_notepad::SpellingAnnotationBatch spellingBatch_;
+    std::function<bool(POINT, const classic_notepad::SpellingContextTarget&)> contextMenuHandler_;
     std::uint64_t startedTick_ = 0;
     std::uint64_t appendedByte_ = 0;
     std::uint64_t appendedCharacter_ = 0;
@@ -256,12 +337,17 @@ private:
     std::vector<std::uint64_t> lineOffsets_;
     std::vector<std::uint64_t> lineCharacterOffsets_;
     std::unique_ptr<classic_notepad::LargeDocument> document_;
+    classic_notepad::LargeDocumentByteReader sourceReader_;
     mutable std::mutex documentMutex_;
     std::uint64_t selectionStart_ = 0;
     std::uint64_t selectionEnd_ = 0;
     std::uint64_t selectionAnchor_ = 0;
     std::uint64_t caretPosition_ = 0;
+    std::uint64_t selectionRevision_ = 0;
     bool focused_ = false;
+    int presentationAllocationFailureForTesting_ = 0;
+    std::wstring nextInsertFailureForTesting_;
+    std::uint64_t callbackAllocationFailures_ = 0;
     bool caretCreated_ = false;
     bool mouseSelecting_ = false;
     bool preferredXValid_ = false;
@@ -278,6 +364,23 @@ private:
     std::vector<CachedViewportRow> viewportRows_;
     std::uint64_t viewportCacheTopLine_ = 0;
     std::uint64_t viewportCacheGeneration_ = 0;
+    std::uint64_t viewportCacheLayoutRevision_ = 0;
+    std::uint64_t layoutRevision_ = 1;
+    std::uint64_t sessionId_ = 1;
+    std::uint64_t viewportCacheTopWrapOffset_ = 0;
+    int viewportCacheHorizontalOffset_ = 0;
+    int viewportCacheHorizontalMaximumOffset_ = 0;
+    LONG viewportCacheWidth_ = 0;
+    LONG viewportCacheHeight_ = 0;
+    HFONT viewportCacheFont_ = nullptr;
+    bool viewportCacheWordWrap_ = false;
+    std::uint64_t viewportCacheRebuilds_ = 0;
+    std::uint64_t viewportCacheHits_ = 0;
+    std::uint64_t viewportLastBuildDecodedCharacters_ = 0;
+    std::uint64_t viewportLastBuildMeasuredCharacters_ = 0;
+    std::uint64_t viewportLastLogicalAnchor_ = 0;
+    std::uint64_t viewportLastSegmentStart_ = 0;
+    std::uint64_t viewportLastSegmentEnd_ = 0;
     bool viewportCacheValid_ = false;
     std::atomic<bool> modified_{false};
     std::atomic<std::uint64_t> saveProgressBytes_{0};
@@ -292,11 +395,15 @@ private:
     std::wstring operationName_;
     std::wstring operationError_;
     std::wstring operationTargetPath_;
+    classic_notepad::SaveDiagnostics saveDiagnostics_;
     std::uint64_t operationGeneration_ = 0;
+    std::uint64_t operationToken_ = 0;
+    std::unique_ptr<OperationCompletion> pendingOperationCompletion_;
     std::uint64_t operationProgress_ = 0;
     std::uint64_t operationResultCount_ = 0;
     std::atomic<bool> cancel_{false};
     std::atomic<bool> indexingComplete_{false};
+    std::atomic<bool> sourceReady_{false};
     std::atomic<bool> encodingValid_{true};
     std::atomic<std::uint64_t> indexedBytes_{0};
     std::atomic<std::uint64_t> firstUsableMilliseconds_{0};

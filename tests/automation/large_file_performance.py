@@ -166,7 +166,10 @@ def main() -> int:
         parser.error("this test is Windows-only")
 
     os.environ["CLASSIC_NOTEPAD_AUTOMATION_VISIBLE"] = "1"
-    root = binary.parents[2] / "automation-large-file-tests"
+    # Keep generated fixtures inside the ignored build tree so repository
+    # scanners don't open the active destination during the replacement test.
+    repo_root = Path(__file__).resolve().parents[2]
+    root = repo_root / "build" / "automation-large-file-tests"
     root.mkdir(parents=True, exist_ok=True)
     with RetryingTemporaryDirectory(dir=root) as temp_root:
         temporary = Path(temp_root)
@@ -262,6 +265,8 @@ def main() -> int:
 
             _, measurements["saveAsMilliseconds"] = timed(app, "saveAs", path=str(saved))
             saved_state = wait_for_index(app, args.index_timeout_seconds, peak)
+            if not saved_state["saveCommitted"] or saved_state["saveFailureStage"] != "none":
+                raise AssertionError(f"large Save As did not report a committed save: {saved_state}")
             if app.command("isModified")["modified"]:
                 raise AssertionError("Save As did not clear modified state")
             if sha256(source) != source_hash:
@@ -287,6 +292,8 @@ def main() -> int:
             app.command("insertText", text="[NORMAL-SAVE]")
             _, measurements["normalSaveMilliseconds"] = timed(app, "save")
             normal_state = wait_for_index(app, args.index_timeout_seconds, peak)
+            if not normal_state["saveCommitted"] or normal_state["saveFailureStage"] != "none":
+                raise AssertionError(f"large in-place Save did not report a committed save: {normal_state}")
             normal_hash = sha256(saved)
             expected_normal_hash = expected_output_sha256(source, middle_source_offset, normal_save=True)
             if normal_hash != expected_normal_hash:

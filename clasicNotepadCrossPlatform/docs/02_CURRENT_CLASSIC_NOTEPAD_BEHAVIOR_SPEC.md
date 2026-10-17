@@ -1,5 +1,7 @@
 # Classic Notepad Current Behavior Spec (Baseline for Cross-Platform Port)
 
+> **Historical baseline specification:** this document records the behavior baseline used for the cross-platform port, not a current guarantee or qualification record. See the repository [README](../../README.md) for the present feature surface and [Windows reliability status](../../docs/WINDOWS_RELIABILITY_STATUS.md) for later evidence and open gates.
+
 Date: 2026-04-20  
 Baseline source: the finished `classicNotepad` repository behavior and docs.
 

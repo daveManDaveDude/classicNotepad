@@ -1,16 +1,50 @@
 #include "file_io.h"
+#include "windows_save_transaction.h"
 
 #include "win32_platform.h"
 
 #include <windows.h>
 
-#include <algorithm>
 #include <cstdint>
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace classic_notepad {
 namespace {
+
+class ScopedFileHandle {
+public:
+    explicit ScopedFileHandle(HANDLE handle) noexcept : handle_(handle) {}
+    ~ScopedFileHandle()
+    {
+        if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_);
+    }
+    ScopedFileHandle(const ScopedFileHandle&) = delete;
+    ScopedFileHandle& operator=(const ScopedFileHandle&) = delete;
+    HANDLE Get() const noexcept { return handle_; }
+
+private:
+    HANDLE handle_;
+};
+
+bool IsInjectedPreparationAllocationFailure() noexcept
+{
+    wchar_t stage[64]{};
+    const DWORD length = GetEnvironmentVariableW(
+        L"CLASSIC_NOTEPAD_TEST_ALLOCATION_FAILURE", stage, static_cast<DWORD>(std::size(stage)));
+    return length > 0U && length < std::size(stage) && wcscmp(stage, L"file-preparation") == 0;
+}
+
+void SetAllocationFailureMessage(std::wstring& errorMessage) noexcept
+{
+    try {
+        errorMessage.assign(L"The file could not be loaded because memory allocation failed.");
+    } catch (...) {
+        errorMessage.clear();
+    }
+}
 
 std::wstring GetLastErrorMessage(DWORD errorCode)
 {
@@ -43,38 +77,6 @@ void SetWindowsError(std::wstring& errorMessage, const std::wstring& action, DWO
     errorMessage = action + L"\n\n" + GetLastErrorMessage(errorCode);
 }
 
-bool WriteBytesToHandle(HANDLE file, const std::vector<std::uint8_t>& bytes, std::wstring& errorMessage)
-{
-    std::size_t totalWritten = 0;
-    while (totalWritten < bytes.size()) {
-        const DWORD chunkSize = static_cast<DWORD>(
-            std::min<std::size_t>(bytes.size() - totalWritten, static_cast<std::size_t>(0xFFFFFFFFUL)));
-
-        DWORD bytesWritten = 0;
-        const BOOL writeOk = WriteFile(file, bytes.data() + totalWritten, chunkSize, &bytesWritten, nullptr);
-        if (!writeOk) {
-            SetWindowsError(errorMessage, L"Could not write the file.", GetLastError());
-            return false;
-        }
-
-        if (bytesWritten == 0) {
-            SetWindowsError(errorMessage, L"Could not write the complete file.", ERROR_WRITE_FAULT);
-            return false;
-        }
-
-        totalWritten += bytesWritten;
-    }
-
-    return true;
-}
-
-std::wstring BuildTempSavePath(const std::wstring& path, int attempt)
-{
-    const std::wstring suffix = L".classic-notepad.tmp." + std::to_wstring(GetCurrentProcessId()) + L"." +
-        std::to_wstring(GetTickCount64()) + L"." + std::to_wstring(attempt);
-    return path + suffix;
-}
-
 } // namespace
 
 bool ReadFileBytes(const std::wstring& path, std::vector<std::uint8_t>& bytes, std::wstring& errorMessage)
@@ -92,115 +94,78 @@ bool ReadFileBytes(const std::wstring& path, std::vector<std::uint8_t>& bytes, s
         SetWindowsError(errorMessage, L"Could not open the file.", GetLastError());
         return false;
     }
+    ScopedFileHandle scopedFile(file);
 
-    LARGE_INTEGER fileSize{};
-    if (!GetFileSizeEx(file, &fileSize)) {
-        const DWORD error = GetLastError();
-        CloseHandle(file);
-        SetWindowsError(errorMessage, L"Could not read the file size.", error);
-        return false;
-    }
-
-    if (fileSize.QuadPart < 0) {
-        CloseHandle(file);
-        errorMessage = L"Could not read the file size.";
-        return false;
-    }
-
-    if (static_cast<ULONGLONG>(fileSize.QuadPart) > static_cast<ULONGLONG>(SIZE_MAX)) {
-        CloseHandle(file);
-        errorMessage = L"This file is too large for this build.";
-        return false;
-    }
-
-    bytes.resize(static_cast<std::size_t>(fileSize.QuadPart));
-    std::size_t totalRead = 0;
-    while (totalRead < bytes.size()) {
-        const DWORD chunkSize = static_cast<DWORD>(
-            std::min<std::size_t>(bytes.size() - totalRead, static_cast<std::size_t>(0xFFFFFFFFUL)));
-
-        DWORD bytesRead = 0;
-        const BOOL readOk = ReadFile(file, bytes.data() + totalRead, chunkSize, &bytesRead, nullptr);
-        if (!readOk) {
+    try {
+        LARGE_INTEGER fileSize{};
+        if (!GetFileSizeEx(scopedFile.Get(), &fileSize)) {
             const DWORD error = GetLastError();
-            CloseHandle(file);
-            SetWindowsError(errorMessage, L"Could not read the file.", error);
+            SetWindowsError(errorMessage, L"Could not read the file size.", error);
             return false;
         }
 
-        if (bytesRead == 0) {
-            CloseHandle(file);
-            SetWindowsError(errorMessage, L"Could not read the complete file.", ERROR_READ_FAULT);
+        if (fileSize.QuadPart < 0) {
+            errorMessage = L"Could not read the file size.";
             return false;
         }
 
-        totalRead += bytesRead;
+        if (static_cast<ULONGLONG>(fileSize.QuadPart) > static_cast<ULONGLONG>(SIZE_MAX)) {
+            errorMessage = L"This file is too large for this build.";
+            return false;
+        }
+
+        if (IsInjectedPreparationAllocationFailure()) throw std::bad_alloc();
+        bytes.resize(static_cast<std::size_t>(fileSize.QuadPart));
+        std::size_t totalRead = 0;
+        while (totalRead < bytes.size()) {
+            const DWORD chunkSize = static_cast<DWORD>(
+                std::min<std::size_t>(bytes.size() - totalRead, static_cast<std::size_t>(0xFFFFFFFFUL)));
+
+            DWORD bytesRead = 0;
+            const BOOL readOk = ReadFile(scopedFile.Get(), bytes.data() + totalRead, chunkSize, &bytesRead, nullptr);
+            if (!readOk) {
+                const DWORD error = GetLastError();
+                SetWindowsError(errorMessage, L"Could not read the file.", error);
+                return false;
+            }
+
+            if (bytesRead == 0) {
+                SetWindowsError(errorMessage, L"Could not read the complete file.", ERROR_READ_FAULT);
+                return false;
+            }
+
+            totalRead += bytesRead;
+        }
+
+        return true;
+    } catch (const std::bad_alloc&) {
+        bytes.clear();
+        SetAllocationFailureMessage(errorMessage);
+        return false;
+    } catch (const std::length_error&) {
+        bytes.clear();
+        SetAllocationFailureMessage(errorMessage);
+        return false;
     }
-
-    CloseHandle(file);
-    return true;
 }
 
 bool WriteFileBytesAtomically(
     const std::wstring& path,
     const std::vector<std::uint8_t>& bytes,
-    std::wstring& errorMessage)
+    std::wstring& errorMessage,
+    SaveDiagnostics* diagnostics)
 {
-    constexpr int kTempPathAttempts = 64;
-    std::wstring tempPath;
-    HANDLE file = INVALID_HANDLE_VALUE;
-    for (int attempt = 0; attempt < kTempPathAttempts; ++attempt) {
-        tempPath = BuildTempSavePath(path, attempt);
-        file = CreateFileW(
-            tempPath.c_str(),
-            GENERIC_WRITE,
-            0,
-            nullptr,
-            CREATE_NEW,
-            FILE_ATTRIBUTE_TEMPORARY,
-            nullptr);
-
-        if (file != INVALID_HANDLE_VALUE) {
-            break;
-        }
-
-        const DWORD error = GetLastError();
-        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) {
-            SetWindowsError(errorMessage, L"Could not create a temporary save file.", error);
-            return false;
-        }
+    WindowsSaveTransaction transaction;
+    bool okay = transaction.Create(path) && transaction.Write(bytes.data(), bytes.size()) && transaction.Flush();
+    if (okay) okay = transaction.Commit(path);
+    if (!okay) {
+        if (!transaction.Diagnostics().outputComplete) transaction.DeleteTemporary();
+        errorMessage = transaction.ErrorMessage();
+    } else {
+        errorMessage.clear();
     }
-
-    if (file == INVALID_HANDLE_VALUE) {
-        errorMessage = L"Could not allocate a temporary save file.";
-        return false;
-    }
-
-    const bool wroteAllBytes = WriteBytesToHandle(file, bytes, errorMessage);
-    if (!wroteAllBytes) {
-        CloseHandle(file);
-        DeleteFileW(tempPath.c_str());
-        return false;
-    }
-
-    if (!FlushFileBuffers(file)) {
-        const DWORD error = GetLastError();
-        CloseHandle(file);
-        DeleteFileW(tempPath.c_str());
-        SetWindowsError(errorMessage, L"Could not flush the temporary save file.", error);
-        return false;
-    }
-
-    CloseHandle(file);
-
-    if (!MoveFileExW(tempPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        const DWORD error = GetLastError();
-        DeleteFileW(tempPath.c_str());
-        SetWindowsError(errorMessage, L"Could not replace the destination file.", error);
-        return false;
-    }
-
-    return true;
+    if (diagnostics != nullptr) *diagnostics = transaction.Diagnostics();
+    return okay;
 }
 
 } // namespace classic_notepad

@@ -1,5 +1,7 @@
 # Performance & Security Code Review (Classic Notepad)
 
+> **Historical static review:** this review is dated 19 April 2026 and records the source paths, implementation state, and recommendations inspected at that time. Its “resolved” labels describe that review's findings; they are not a substitute for current failure-mode qualification. See [Windows reliability status](WINDOWS_RELIABILITY_STATUS.md) for the later Windows evidence and remaining open gates.
+
 Date: 2026-04-19 (updated after implementation)
 Scope: `src/` and `tests/` (manual static review; no dynamic profiling in this environment).
 

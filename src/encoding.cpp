@@ -63,8 +63,17 @@ bool ReadWideCodePoint(const std::wstring& text, std::size_t& index, std::uint32
         codePoint = first;
         return true;
     } else {
-        codePoint = static_cast<std::uint32_t>(text[index++]);
-        return codePoint <= 0x10FFFFU && (codePoint < 0xD800U || codePoint > 0xDFFFU);
+        const std::uint32_t first = static_cast<std::uint32_t>(text[index++]);
+        if (first >= 0xD800U && first <= 0xDBFFU) {
+            if (index >= text.size()) return false;
+            const std::uint32_t second = static_cast<std::uint32_t>(text[index++]);
+            if (second < 0xDC00U || second > 0xDFFFU) return false;
+            codePoint = 0x10000U + (((first - 0xD800U) << 10U) | (second - 0xDC00U));
+            return true;
+        }
+        if (first >= 0xDC00U && first <= 0xDFFFU) return false;
+        codePoint = first;
+        return codePoint <= 0x10FFFFU;
     }
 }
 
@@ -194,29 +203,30 @@ bool DecodeUtf16Le(const std::uint8_t* data, std::size_t size, std::wstring& tex
     for (std::size_t index = 0; index < size; index += 2U) {
         const std::uint32_t first = data[index] | (static_cast<std::uint32_t>(data[index + 1U]) << 8U);
 
-        if constexpr (sizeof(wchar_t) == 2U) {
-            text.push_back(static_cast<wchar_t>(first));
-        } else {
-            if (first >= 0xD800U && first <= 0xDBFFU) {
-                if (index + 3U >= size) {
-                    return false;
-                }
+        if (first >= 0xD800U && first <= 0xDBFFU) {
+            if (index + 3U >= size) {
+                return false;
+            }
 
-                const std::uint32_t second =
-                    data[index + 2U] | (static_cast<std::uint32_t>(data[index + 3U]) << 8U);
-                if (second < 0xDC00U || second > 0xDFFFU) {
-                    return false;
-                }
+            const std::uint32_t second =
+                data[index + 2U] | (static_cast<std::uint32_t>(data[index + 3U]) << 8U);
+            if (second < 0xDC00U || second > 0xDFFFU) {
+                return false;
+            }
 
+            if constexpr (sizeof(wchar_t) == 2U) {
+                text.push_back(static_cast<wchar_t>(first));
+                text.push_back(static_cast<wchar_t>(second));
+            } else {
                 const std::uint32_t codePoint =
                     0x10000U + (((first - 0xD800U) << 10U) | (second - 0xDC00U));
                 text.push_back(static_cast<wchar_t>(codePoint));
-                index += 2U;
-            } else if (first >= 0xDC00U && first <= 0xDFFFU) {
-                return false;
-            } else {
-                text.push_back(static_cast<wchar_t>(first));
             }
+            index += 2U;
+        } else if (first >= 0xDC00U && first <= 0xDFFFU) {
+            return false;
+        } else {
+            text.push_back(static_cast<wchar_t>(first));
         }
     }
 
@@ -263,10 +273,13 @@ bool EncodeUtf16Le(
 
 } // namespace
 
-bool DecodeTextBytes(
+namespace {
+
+bool DecodeTextBytesImpl(
     const std::vector<std::uint8_t>& bytes,
     DecodeTextResult& result,
-    std::wstring& errorMessage)
+    std::wstring& errorMessage,
+    std::uint32_t ansiCodePage)
 {
     result = {};
     errorMessage.clear();
@@ -295,13 +308,48 @@ bool DecodeTextBytes(
     }
 
     result.encoding = TextEncoding::Ansi;
-    if (!DecodeAnsiBytes(bytes.data(), bytes.size(), result.text)) {
+    bool decodedAsAnsi = false;
+    if (ansiCodePage == 0U) {
+        decodedAsAnsi = DecodeAnsiBytes(bytes.data(), bytes.size(), result.text);
+    } else {
+#if defined(_WIN32) && !defined(CLASSIC_NOTEPAD_PORTABLE_CORE_SMOKE)
+        decodedAsAnsi = DecodeAnsiBytesForCodePage(bytes.data(), bytes.size(), ansiCodePage, result.text);
+#endif
+    }
+    if (!decodedAsAnsi) {
+        result = {};
         errorMessage = L"The file could not be decoded as text.";
         return false;
     }
 
     return true;
 }
+
+} // namespace
+
+bool DecodeTextBytes(
+    const std::vector<std::uint8_t>& bytes,
+    DecodeTextResult& result,
+    std::wstring& errorMessage)
+{
+    return DecodeTextBytesImpl(bytes, result, errorMessage, 0U);
+}
+
+#if defined(_WIN32) && !defined(CLASSIC_NOTEPAD_PORTABLE_CORE_SMOKE)
+bool DecodeTextBytesWithAnsiCodePage(
+    const std::vector<std::uint8_t>& bytes,
+    DecodeTextResult& result,
+    std::wstring& errorMessage,
+    std::uint32_t ansiCodePage)
+{
+    if (ansiCodePage == 0U) {
+        result = {};
+        errorMessage = L"An explicit ANSI code page must be nonzero.";
+        return false;
+    }
+    return DecodeTextBytesImpl(bytes, result, errorMessage, ansiCodePage);
+}
+#endif
 
 bool EncodeTextBytes(
     const std::wstring& text,

@@ -36,11 +36,19 @@ set(CLASSIC_NOTEPAD_SHARED_CORE_SOURCES
     src/appearance.h
     src/document.cpp
     src/document.h
+    src/document_transition_coordinator.cpp
+    src/document_transition_coordinator.h
+    src/editor_text_semantics.h
     src/encoding.cpp
     src/encoding.h
     src/file_io.h
+    src/inserted_text_validation.h
     src/line_endings.cpp
     src/line_endings.h
+    src/large_text_width_summary.cpp
+    src/large_text_width_summary.h
+    src/large_text_summary.cpp
+    src/large_text_summary.h
     src/large_file_index.cpp
     src/large_file_index.h
     src/large_document.cpp
@@ -63,6 +71,16 @@ set(CLASSIC_NOTEPAD_WINDOWS_PLATFORM_SOURCES
     src/platform/windows/file_io_win32.cpp
     src/platform/windows/large_file_view.cpp
     src/platform/windows/large_file_view.h
+    src/platform/windows/windows_save_transaction.cpp
+    src/platform/windows/windows_save_transaction.h
+    src/platform/windows/windows_mapped_source.cpp
+    src/platform/windows/windows_mapped_source.h
+    src/platform/windows/windows_text_boundary.cpp
+    src/platform/windows/windows_text_boundary.h
+    src/platform/windows/windows_spelling_occurrence.cpp
+    src/platform/windows/windows_spelling_occurrence.h
+    src/platform/windows/windows_menu_text.cpp
+    src/platform/windows/windows_menu_text.h
 )
 
 set(CLASSIC_NOTEPAD_CORE_PLATFORM_SOURCES
@@ -340,7 +358,169 @@ endif()
 
 add_test(NAME TextConversionTests COMMAND $<TARGET_FILE:TextConversionTests>)
 
+add_executable(DocumentTransitionCoordinatorTests
+    tests/document_transition_coordinator_tests.cpp
+)
+
+target_link_libraries(DocumentTransitionCoordinatorTests PRIVATE
+    ClassicNotepadCore
+)
+
+if(MSVC)
+    target_compile_options(DocumentTransitionCoordinatorTests PRIVATE
+        /W4
+        /permissive-
+        /utf-8
+    )
+endif()
+
+add_test(NAME DocumentTransitionCoordinatorTests COMMAND $<TARGET_FILE:DocumentTransitionCoordinatorTests>)
+
+add_executable(LargeTextWidthSummaryTests
+    tests/large_text_width_summary_tests.cpp
+)
+
+target_link_libraries(LargeTextWidthSummaryTests PRIVATE
+    ClassicNotepadCore
+)
+
+if(MSVC)
+    target_compile_options(LargeTextWidthSummaryTests PRIVATE
+        /W4
+        /permissive-
+        /utf-8
+    )
+endif()
+
+add_test(NAME LargeTextWidthSummaryTests COMMAND $<TARGET_FILE:LargeTextWidthSummaryTests>)
+
+add_executable(LargeTextSummaryTests
+    tests/large_text_summary_tests.cpp
+)
+
+target_link_libraries(LargeTextSummaryTests PRIVATE
+    ClassicNotepadCore
+)
+
+if(MSVC)
+    target_compile_options(LargeTextSummaryTests PRIVATE
+        /W4
+        /permissive-
+        /utf-8
+    )
+endif()
+
+add_test(NAME LargeTextSummaryTests COMMAND $<TARGET_FILE:LargeTextSummaryTests>)
+
+add_executable(InsertedTextValidationTests
+    tests/inserted_text_validation_tests.cpp
+)
+
+target_link_libraries(InsertedTextValidationTests PRIVATE
+    ClassicNotepadCore
+)
+
+if(MSVC)
+    target_compile_options(InsertedTextValidationTests PRIVATE
+        /W4
+        /permissive-
+        /utf-8
+    )
+endif()
+
+add_test(NAME InsertedTextValidationTests COMMAND $<TARGET_FILE:InsertedTextValidationTests>)
+
 if(WIN32)
+    add_executable(WindowsAnsiEncodingTests
+        tests/windows/ansi_encoding_win32_tests.cpp
+    )
+
+    target_link_libraries(WindowsAnsiEncodingTests PRIVATE
+        ClassicNotepadCore
+    )
+
+    if(MSVC)
+        target_compile_options(WindowsAnsiEncodingTests PRIVATE
+            /W4
+            /permissive-
+            /utf-8
+        )
+    endif()
+
+    add_test(NAME WindowsAnsiEncodingTests COMMAND $<TARGET_FILE:WindowsAnsiEncodingTests>)
+
+    add_executable(WindowsMappedSourceTests
+        tests/windows/mapped_source_win32_tests.cpp
+    )
+
+    target_link_libraries(WindowsMappedSourceTests PRIVATE
+        ClassicNotepadCore
+    )
+
+    if(MSVC)
+        target_compile_options(WindowsMappedSourceTests PRIVATE
+            /W4
+            /permissive-
+            /utf-8
+        )
+    endif()
+
+    add_test(NAME WindowsMappedSourceTests COMMAND $<TARGET_FILE:WindowsMappedSourceTests>)
+
+    add_executable(WindowsTextBoundaryTests
+        tests/windows/text_boundary_win32_tests.cpp
+    )
+
+    target_link_libraries(WindowsTextBoundaryTests PRIVATE
+        ClassicNotepadCore
+    )
+
+    if(MSVC)
+        target_compile_options(WindowsTextBoundaryTests PRIVATE
+            /W4
+            /permissive-
+            /utf-8
+        )
+    endif()
+
+    add_test(NAME WindowsTextBoundaryTests COMMAND $<TARGET_FILE:WindowsTextBoundaryTests>)
+
+    add_executable(WindowsSpellingOccurrenceTests
+        tests/windows/spelling_occurrence_win32_tests.cpp
+    )
+
+    target_link_libraries(WindowsSpellingOccurrenceTests PRIVATE
+        ClassicNotepadCore
+    )
+
+    if(MSVC)
+        target_compile_options(WindowsSpellingOccurrenceTests PRIVATE
+            /W4
+            /permissive-
+            /utf-8
+        )
+    endif()
+
+    add_test(NAME WindowsSpellingOccurrenceTests COMMAND $<TARGET_FILE:WindowsSpellingOccurrenceTests>)
+
+    add_executable(WindowsMenuTextTests
+        tests/windows/menu_text_win32_tests.cpp
+    )
+
+    target_link_libraries(WindowsMenuTextTests PRIVATE
+        ClassicNotepadCore
+    )
+
+    if(MSVC)
+        target_compile_options(WindowsMenuTextTests PRIVATE
+            /W4
+            /permissive-
+            /utf-8
+        )
+    endif()
+
+    add_test(NAME WindowsMenuTextTests COMMAND $<TARGET_FILE:WindowsMenuTextTests>)
+
     add_library(ClassicNotepadPortableCoreSmoke STATIC
         ${CLASSIC_NOTEPAD_SHARED_CORE_SOURCES}
         ${CLASSIC_NOTEPAD_PORTABLE_PLATFORM_SOURCES}
@@ -350,6 +530,10 @@ if(WIN32)
 
     target_include_directories(ClassicNotepadPortableCoreSmoke PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+
+    target_compile_definitions(ClassicNotepadPortableCoreSmoke PUBLIC
+        CLASSIC_NOTEPAD_PORTABLE_CORE_SMOKE=1
     )
 
     if(MSVC)

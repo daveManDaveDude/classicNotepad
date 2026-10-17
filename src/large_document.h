@@ -1,9 +1,11 @@
 #pragma once
 
 #include "large_file_index.h"
+#include "large_text_summary.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <string>
@@ -23,10 +25,17 @@ struct LargeDocumentOriginalPiece {
     std::uint64_t byteOffset = 0;
     std::uint64_t byteLength = 0;
     std::uint64_t characterLength = 0; // UTF-16 code units (the Win32 coordinate system).
+    // Counted within this descriptor. Adjacent descriptors may end/start with
+    // CR/LF; the tree combines that pair as one logical line break.
     std::uint64_t logicalLineBreaks = 0;
     wchar_t firstCharacter = 0;
     wchar_t lastCharacter = 0;
     bool summaryKnown = false;
+    LargeFileWidthSummary widthSummary{};
+    bool widthSummaryKnown = false;
+    // Exact count using status display semantics (surrogate pair=1, CRLF=1).
+    std::uint64_t displayedCharacterCount = 0;
+    bool displayedCharacterCountKnown = false;
 };
 
 struct LargeDocumentLineColumn {
@@ -39,15 +48,15 @@ struct LargeDocumentMatch {
     std::uint64_t length = 0;
 };
 
-// A scalable editable sequence.  The original file is immutable and is read
-// through byte ranges; inserted text is retained in append-only buffers.  The
-// tree aggregates logical UTF-16 positions, so edits do not copy the unchanged
-// suffix of a large document.
+// A scalable editable sequence. The original file is immutable and is read
+// through byte ranges; inserted text lives in immutable bounded chunks shared
+// by pieces, undo records, and snapshots. The tree aggregates logical UTF-16
+// positions, so edits do not copy the unchanged suffix of a large document.
 class LargeDocument {
 public:
     static constexpr std::uint64_t kDefaultUndoByteLimit = 64ULL * 1024ULL * 1024ULL;
 
-    struct TextSummary;
+    using TextSummary = LargeTextSummary;
 
     LargeDocument(LargeFileEncoding encoding, LargeDocumentByteReader reader);
     ~LargeDocument();
@@ -64,8 +73,15 @@ public:
     void Clear();
 
     std::uint64_t CharacterCount() const;
+    std::uint64_t DisplayedCharacterCount() const;
+    bool HasExactDisplayedCharacterCount() const;
     std::uint64_t LineCount() const;
+    std::uint64_t MaximumLineColumns() const;
     std::uint64_t PieceCount() const;
+    // Bytes of live immutable inserted-chunk capacity retained by this
+    // document's snapshot family. This counts each owner once, including
+    // chunks kept only by Undo history or another shared snapshot; it is a
+    // model-storage measure, not allocator-exact process memory.
     std::uint64_t InsertedBufferBytes() const;
     bool IsModified() const;
     std::uint64_t Generation() const;
@@ -112,6 +128,9 @@ public:
         std::wstring& errorMessage);
     bool CanUndo() const;
     void SetUndoByteLimit(std::uint64_t bytes);
+    // Conservative logical history-retention charge, separate from the live
+    // owner-capacity counter above (the estimates can overlap). This is not
+    // an allocator-exact RSS measurement.
     std::uint64_t UndoBytes() const;
 
     bool Find(
@@ -124,6 +143,12 @@ public:
         std::wstring& errorMessage,
         const std::function<bool()>& shouldCancel = {},
         const std::function<void(std::uint64_t)>& onProgress = {}) const;
+    bool MatchesAt(
+        std::uint64_t start,
+        const std::wstring& needle,
+        bool matchCase,
+        bool wholeWord,
+        std::wstring& errorMessage) const;
     std::uint64_t ReplaceAll(
         const std::wstring& needle,
         const std::wstring& replacement,
@@ -143,24 +168,27 @@ public:
     std::unique_ptr<LargeDocument> Clone() const;
 
 private:
+    struct InsertedStorageLedger;
+    struct InsertedBuffer;
     struct Piece;
     struct Node;
     struct UndoRecord;
 
-    using NodePtr = std::unique_ptr<Node>;
+    using NodePtr = std::shared_ptr<Node>;
 
     static std::uint64_t CharacterLength(const NodePtr& node);
     static TextSummary SummaryOf(const NodePtr& node);
     static std::uint64_t PieceLength(const Piece& piece);
     static void Update(Node* node);
-    static NodePtr Merge(NodePtr left, NodePtr right);
-    bool Split(NodePtr root, std::uint64_t position, NodePtr& left, NodePtr& right, std::wstring& errorMessage);
+    static NodePtr Merge(NodePtr left, NodePtr right, std::uint64_t& randomState);
+    bool Split(const NodePtr& root, std::uint64_t position, NodePtr& left, NodePtr& right,
+        std::uint64_t& randomState, std::wstring& errorMessage) const;
     bool SplitPiece(const Piece& piece, std::uint64_t position, Piece& left, Piece& right, std::wstring& errorMessage) const;
-    NodePtr MakeNode(Piece piece);
-    NodePtr BuildTree(std::vector<Piece> pieces);
-    static void CollectPieces(NodePtr root, std::vector<Piece>& pieces);
+    static NodePtr MakeNode(Piece piece, std::uint64_t& randomState);
+    static NodePtr CloneWithChildren(const NodePtr& node, NodePtr left, NodePtr right);
+    static NodePtr BuildTree(std::vector<Piece> pieces, std::uint64_t& randomState);
+    static void CollectPieces(const NodePtr& root, std::vector<Piece>& pieces);
     static void CountNodes(const NodePtr& node, std::uint64_t& count);
-    static NodePtr CloneNode(const NodePtr& node);
     bool Locate(std::uint64_t position, const Node*& node, std::uint64_t& offset) const;
     bool ReadPiece(
         const Piece& piece,
@@ -172,6 +200,13 @@ private:
         const Piece& piece,
         std::uint64_t characterOffset,
         std::uint64_t& byteOffset,
+        std::wstring& errorMessage,
+        std::uint64_t* codeUnitsIntoScalar = nullptr,
+        const std::function<bool()>& shouldCancel = {}) const;
+    bool StreamOriginal(
+        const Piece& piece,
+        const std::function<bool(const std::wstring&)>& visitor,
+        const std::function<bool()>& shouldCancel,
         std::wstring& errorMessage) const;
     bool DecodeOriginal(
         const Piece& piece,
@@ -180,6 +215,15 @@ private:
         std::wstring& text,
         std::wstring& errorMessage) const;
     bool ValidateRange(std::uint64_t start, std::uint64_t end, std::wstring& errorMessage) const;
+    bool PrepareReplace(
+        const NodePtr& root,
+        std::uint64_t start,
+        std::uint64_t end,
+        const std::wstring& replacement,
+        std::uint64_t& randomState,
+        NodePtr& candidateRoot,
+        UndoRecord& record,
+        std::wstring& errorMessage) const;
     bool SummarizePrefix(std::uint64_t length, TextSummary& summary, std::wstring& errorMessage) const;
     bool SummarizePiece(
         const Piece& piece,
@@ -195,9 +239,8 @@ private:
     LargeFileEncoding encoding_;
     LargeDocumentByteReader reader_;
     NodePtr root_;
-    std::vector<std::wstring> insertedBuffers_;
-    std::vector<UndoRecord> undo_;
-    std::uint64_t insertedBytes_ = 0;
+    std::shared_ptr<InsertedStorageLedger> insertedStorageLedger_;
+    std::deque<std::shared_ptr<const UndoRecord>> undo_;
     std::uint64_t undoBytes_ = 0;
     std::uint64_t undoByteLimit_ = kDefaultUndoByteLimit;
     std::uint64_t generation_ = 1;
